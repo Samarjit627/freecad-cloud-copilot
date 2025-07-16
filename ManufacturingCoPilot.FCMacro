@@ -1,0 +1,128 @@
+"""
+Manufacturing Co-Pilot - Advanced CAD Manufacturing Assistant
+with Cloud Connectivity
+
+A FreeCAD macro that provides AI-powered manufacturing intelligence
+with enhanced UI and cloud backend integration.
+
+Author: Samarjit
+License: MIT
+Version: 2.0.0
+"""
+
+import os
+import sys
+import json
+import time
+import traceback
+from datetime import datetime
+
+# Add macro directory to path for imports
+MACRO_DIR = os.path.dirname(os.path.realpath(__file__))
+MODULES_DIR = os.path.join(MACRO_DIR, "macro")
+if MODULES_DIR not in sys.path:
+    sys.path.append(MODULES_DIR)
+
+# Try to import required modules
+try:
+    import FreeCAD
+    import FreeCADGui
+    from PySide2 import QtWidgets, QtCore, QtGui
+except ImportError:
+    print("Error: This macro requires FreeCAD with PySide2 support")
+    raise
+
+# Import local modules
+try:
+    from macro import config
+    from macro import cloud_client
+    from macro import cad_analyzer
+    from macro import ai_engine
+    from macro import questionnaire
+    from macro import ui_components
+    from macro import chat_interface
+except ImportError as e:
+    # Show detailed error for debugging
+    print(f"Error importing modules: {e}")
+    traceback.print_exc()
+    
+    # Check if modules directory exists
+    if not os.path.exists(MODULES_DIR):
+        os.makedirs(MODULES_DIR)
+        print(f"Created modules directory: {MODULES_DIR}")
+        
+        # Show error message with instructions
+        QtWidgets.QMessageBox.critical(
+            None, 
+            "Missing Modules",
+            f"The Manufacturing Co-Pilot modules are missing.\n\n"
+            f"Please ensure all required modules are installed in:\n{MODULES_DIR}\n\n"
+            f"See README.md for installation instructions."
+        )
+    raise
+
+class ManufacturingCoPilotMacro:
+    """Main macro class for the Manufacturing Co-Pilot"""
+    
+    def __init__(self):
+        """Initialize the macro"""
+        self.chat_interface_instance = None
+        
+        # Check for required modules
+        self.check_requirements()
+        
+        # Initialize the chat interface
+        self.initialize_chat_interface()
+    
+    def check_requirements(self):
+        """Check for required modules and dependencies"""
+        missing_modules = []
+        
+        # Check for required Python modules
+        try:
+            import requests
+        except ImportError:
+            missing_modules.append("requests")
+        
+        # Warn about missing modules
+        if missing_modules:
+            print(f"Warning: Missing recommended modules: {', '.join(missing_modules)}")
+            print("Some features may not work correctly.")
+            print("Consider installing these modules with pip.")
+    
+    def initialize_chat_interface(self):
+        """Initialize and show the chat interface"""
+        try:
+            # Create and show the chat interface
+            self.chat_interface_instance = chat_interface.show_chat_interface()
+            
+            # Keep a reference to prevent garbage collection
+            self._keep_alive = self.chat_interface_instance
+        except Exception as e:
+            print(f"Error initializing chat interface: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Manufacturing Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create and run the macro
+if __name__ == "__main__":
+    # Print cloud connection status
+    try:
+        from macro import cloud_client, config
+        client = cloud_client.get_client()
+        print(f"\n\n===== MANUFACTURING CO-PILOT CLOUD STATUS =====")
+        print(f"Cloud URL: {config.CLOUD_API_URL}")
+        print(f"Connected: {client.connected}")
+        if client.connected:
+            print("✅ Successfully connected to Manufacturing Co-Pilot Cloud Service")
+        else:
+            print(f"❌ Connection failed: {client.last_error}")
+        print("=============================================\n\n")
+    except Exception as e:
+        print(f"Error checking cloud connection: {e}")
+    ManufacturingCoPilotMacro()

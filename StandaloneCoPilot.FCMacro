@@ -1,0 +1,1528 @@
+"""
+StandaloneCoPilot - Manufacturing Co-Pilot with Standalone Implementation
+A FreeCAD macro that provides AI-powered manufacturing intelligence
+with enhanced UI and cloud backend integration.
+
+This version is completely standalone and doesn't rely on the existing modules,
+implementing a strict singleton pattern to prevent multiple instances.
+
+Author: Samarjit
+License: MIT
+Version: 1.0.0
+"""
+
+import os
+import sys
+import traceback
+import json
+import time
+import re
+import math
+import random
+import requests
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+
+# Try to import FreeCAD modules
+try:
+    import FreeCAD
+    import Part
+    import FreeCADGui
+except ImportError:
+    print("Warning: FreeCAD modules not available in this context")
+
+# Try to import required modules
+try:
+    from PySide2 import QtWidgets, QtCore, QtGui
+    import FreeCADGui
+except ImportError:
+    print("Error: Required modules not found. This macro requires PySide2 and FreeCAD.")
+    raise
+
+# Global singleton instance tracker
+_STANDALONE_INSTANCE = None
+
+# Context manager for design context
+class DesignContextManager:
+    """Manage design context for natural language CAD"""
+    
+    def __init__(self):
+        self.context = {
+            'project': 'default',
+            'process': 'any',
+            'material': 'any',
+            'units': 'mm',
+            'current_objects': []
+        }
+    
+    def update_context(self, key, value):
+        """Update a context value"""
+        self.context[key] = value
+    
+    def get_context(self):
+        """Get the current context"""
+        return self.context
+    
+    def add_object(self, obj):
+        """Add an object to the current context"""
+        if obj not in self.context['current_objects']:
+            self.context['current_objects'].append(obj)
+    
+    def clear_objects(self):
+        """Clear the current objects"""
+        self.context['current_objects'] = []
+
+# Cloud AI processor for natural language processing
+class CloudAIProcessor:
+    """Process natural language using cloud AI"""
+    
+    def __init__(self, cloud_client=None):
+        self.cloud_client = cloud_client
+        self.context_memory = []
+        print(f"Debug: CloudAIProcessor initialized with client: {cloud_client is not None}")
+    
+    def process_advanced_command(self, text, context=None):
+        """Process command with cloud AI"""
+        if self.cloud_client and self.cloud_client.connected:
+            return self.cloud_process(text, context)
+        else:
+            return self.local_process(text, context)
+    
+    def cloud_process(self, text, context):
+        """Use cloud AI for processing"""
+        try:
+            if not self.cloud_client:
+                print("Debug: No cloud client available, falling back to local processing")
+                return self.local_process(text, context)
+            
+            # Build prompt with context
+            prompt = self.build_ai_prompt(text, context)
+            
+            # Query cloud AI
+            print(f"Debug: Using cloud client to process: {text}")
+            response = self.cloud_client.get_chat_response(prompt)
+            
+            # Extract response text
+            if "response" in response:
+                response_text = response["response"]
+                try:
+                    # Try to parse as JSON
+                    if '{' in response_text and '}' in response_text:
+                        json_str = response_text[response_text.find('{'):response_text.rfind('}')+1]
+                        parsed = json.loads(json_str)
+                        return parsed
+                    else:
+                        return self.parse_text_response(response_text)
+                except json.JSONDecodeError:
+                    return self.parse_text_response(response_text)
+            else:
+                return self.local_process(text, context)
+        except Exception as e:
+            print(f"Cloud AI error: {e}")
+            return self.local_process(text, context)
+    
+    def build_ai_prompt(self, text, context):
+        """Build comprehensive prompt for AI"""
+        ctx = context or {}
+        prompt = f"""I need to create a CAD model based on this description: \"{text}\". 
+        Please analyze this request and provide a structured response with the following information:
+        
+        1. What type of object should be created (e.g., bracket, gear, housing)
+        2. The key dimensions and parameters needed
+        3. Any specific features that should be added (e.g., holes, fillets)
+        4. Any manufacturing constraints to consider
+        
+        Format your response as a JSON object with these keys: intent, object_type, parameters, features, constraints.
+        For example: {{"intent": "create", "object_type": "bracket", "parameters": {{"length": 100, "width": 50, "height": 20}}, "features": ["mounting_holes", "fillets"], "constraints": ["3d_printable"]}}
+        """
+        
+        return prompt
+    
+    def local_process(self, text, context):
+        """Local processing with pattern matching"""
+        text_lower = text.lower()
+        print(f"Debug: Using local processing for: {text}")
+        
+        # Basic pattern matching
+        result = {
+            'intent': 'create',
+            'object_type': self.extract_object_type(text),
+            'parameters': self.extract_parameters(text),
+            'features': [],
+            'constraints': []
+        }
+        
+        # Extract features
+        if 'hole' in text_lower or 'drill' in text_lower:
+            result['features'].append('holes')
+        if 'fillet' in text_lower or 'round' in text_lower:
+            result['features'].append('fillets')
+        if 'chamfer' in text_lower or 'bevel' in text_lower:
+            result['features'].append('chamfers')
+        
+        return result
+    
+    def extract_object_type(self, text):
+        """Extract what type of object to create"""
+        objects = ['bracket', 'gear', 'housing', 'enclosure', 'mount', 
+                  'plate', 'shaft', 'spacer', 'frame', 'support', 'box', 'cylinder']
+        
+        text_lower = text.lower()
+        for obj in objects:
+            if obj in text_lower:
+                return obj
+        return 'box'  # Default to box
+    
+    def extract_parameters(self, text):
+        """Extract dimensional parameters"""
+        params = {}
+        
+        # Extract dimensions (100x50x20 format)
+        dim_match = re.search(r'(\d+)\s*x\s*(\d+)(?:\s*x\s*(\d+))?', text)
+        if dim_match:
+            params['length'] = float(dim_match.group(1))
+            params['width'] = float(dim_match.group(2))
+            if dim_match.group(3):
+                params['height'] = float(dim_match.group(3))
+        else:
+            # Default dimensions
+            params['length'] = 100.0
+            params['width'] = 50.0
+            params['height'] = 20.0
+        
+        return params
+    
+    def parse_text_response(self, response):
+        """Parse text response when JSON parsing fails"""
+        result = {
+            'intent': 'create',
+            'object_type': 'box',
+            'parameters': {'length': 100.0, 'width': 50.0, 'height': 20.0},
+            'features': [],
+            'constraints': []
+        }
+        
+        # Try to extract key information from text
+        object_match = re.search(r'object_?type:?\s*(\w+)', response, re.IGNORECASE)
+        if object_match:
+            result['object_type'] = object_match.group(1).lower()
+        
+        # Look for dimensions
+        length_match = re.search(r'length:?\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
+        if length_match:
+            result['parameters']['length'] = float(length_match.group(1))
+            
+        width_match = re.search(r'width:?\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
+        if width_match:
+            result['parameters']['width'] = float(width_match.group(1))
+            
+        height_match = re.search(r'height:?\s*(\d+(?:\.\d+)?)', response, re.IGNORECASE)
+        if height_match:
+            result['parameters']['height'] = float(height_match.group(1))
+            
+        return result
+
+# Natural Language CAD Editor
+class NaturalLanguageCADEditor:
+    """Natural Language CAD Editor"""
+    
+    def __init__(self, cloud_client=None):
+        """Initialize the NL CAD editor"""
+        self.cloud_client = cloud_client
+        self.ai_processor = CloudAIProcessor(cloud_client)
+        self.context = DesignContextManager()
+        self.command_handlers = {}
+        
+        # Register command handlers
+        self.register_command_handler('create', self.handle_create)
+        self.register_command_handler('make', self.handle_create)
+        self.register_command_handler('add', self.handle_create)
+        self.register_command_handler('generate', self.handle_create)
+        
+        # Register advanced CAD handlers
+        self.register_command_handler('gear', self.handle_gear)
+        self.register_command_handler('extrude', self.handle_extrude)
+        self.register_command_handler('fillet', self.handle_fillet)
+        self.register_command_handler('cylinder', self.handle_cylinder)
+    
+    def register_command_handler(self, keyword, handler):
+        """Register a command handler for a keyword"""
+        self.command_handlers[keyword.lower()] = handler
+    
+    def process_command(self, text):
+        """Process command with AI enhancement"""
+        print(f"Processing CAD command: {text}")
+        
+        # Check if this is a complex command that needs AI processing
+        if self.is_complex_command(text):
+            # Use AI processor
+            ai_spec = self.ai_processor.process_advanced_command(text, self.context.get_context())
+            return self.create_from_ai_spec(ai_spec)
+        
+        # Simple command processing
+        text_lower = text.lower()
+        
+        # Check for specific advanced commands first
+        if 'extrude' in text_lower or 'extend' in text_lower or 'pull' in text_lower:
+            print(f"Debug: Detected extrude command: {text}")
+            return self.handle_extrude(text)
+            
+        if 'fillet' in text_lower or 'round' in text_lower or 'corner' in text_lower:
+            print(f"Debug: Detected fillet command: {text}")
+            return self.handle_fillet(text)
+            
+        if 'gear' in text_lower or 'cog' in text_lower:
+            print(f"Debug: Detected gear command: {text}")
+            return self.handle_gear(text)
+            
+        # Find matching handler for other commands
+        for keyword, handler in self.command_handlers.items():
+            if keyword in text_lower:
+                print(f"Debug: Found handler for keyword: {keyword}")
+                return handler(text)
+        
+        # Default to create handler if no match
+        return self.handle_create(text)
+    
+    def handle_create(self, text):
+        """Handle create commands"""
+        try:
+            # Extract parameters using AI processor
+            params = self.ai_processor.local_process(text, self.context.get_context())
+            
+            # Get object type
+            obj_type = params['object_type']
+            dimensions = params['parameters']
+            
+            # Check for specific object types that need special handling
+            if obj_type in ['gear']:
+                return self.handle_gear(text)
+                
+            # Create the basic shape
+            obj = None
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
+            
+            if obj_type in ['box', 'cube', 'block']:
+                length = dimensions.get('length', 100)
+                width = dimensions.get('width', 50)
+                height = dimensions.get('height', 20)
+                
+                box = Part.makeBox(length, width, height)
+                obj = doc.addObject("Part::Feature", "Box")
+                obj.Shape = box
+            
+            elif obj_type in ['cylinder', 'tube', 'rod', 'shaft']:
+                radius = dimensions.get('radius', 10)
+                if 'diameter' in dimensions:
+                    radius = dimensions['diameter'] / 2
+                height = dimensions.get('height', 50)
+                
+                cylinder = Part.makeCylinder(radius, height)
+                obj = doc.addObject("Part::Feature", "Cylinder")
+                obj.Shape = cylinder
+            
+            elif obj_type in ['sphere', 'ball']:
+                radius = dimensions.get('radius', 25)
+                if 'diameter' in dimensions:
+                    radius = dimensions['diameter'] / 2
+                
+                sphere = Part.makeSphere(radius)
+                obj = doc.addObject("Part::Feature", "Sphere")
+                obj.Shape = sphere
+            
+            else:  # Default to box
+                length = dimensions.get('length', 100)
+                width = dimensions.get('width', 50)
+                height = dimensions.get('height', 20)
+                
+                box = Part.makeBox(length, width, height)
+                obj = doc.addObject("Part::Feature", obj_type.capitalize())
+                obj.Shape = box
+            
+            # Commit changes
+            doc.recompute()
+            
+            # Add features if specified
+            if 'features' in params:
+                for feature in params['features']:
+                    if feature == 'holes':
+                        # Add holes - simplified implementation
+                        pass
+                    elif feature == 'fillets':
+                        self.add_fillets_to_object(obj, 2.0)  # Default 2mm radius
+            
+            return {'success': True, 'message': f"Created {obj_type}", 'object': obj}
+            
+        except Exception as e:
+            print(f"Error creating object: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error: {str(e)}"}
+    
+    def is_complex_command(self, text):
+        """Determine if command needs AI processing"""
+        complex_indicators = [
+            'with', 'that has', 'including', 'having',
+            'assembly', 'mechanism', 'system',
+            'compatible', 'optimized', 'analyze'
+        ]
+        
+        text_lower = text.lower()
+        return any(indicator in text_lower for indicator in complex_indicators)
+    
+    def create_from_ai_spec(self, ai_spec):
+        """Create part from AI specification"""
+        try:
+            # Check if we have a valid spec
+            if not ai_spec or not isinstance(ai_spec, dict):
+                return {'success': False, 'message': "Invalid AI specification"}
+                
+            # Get object type
+            obj_type = ai_spec.get('object_type', 'box')
+            params = ai_spec.get('parameters', {})
+            
+            # Create the object
+            result = None
+            
+            if obj_type == 'box':
+                length = params.get('length', 100)
+                width = params.get('width', 50)
+                height = params.get('height', 20)
+                
+                doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
+                box = Part.makeBox(length, width, height)
+                obj = doc.addObject("Part::Feature", "Box")
+                obj.Shape = box
+                doc.recompute()
+                
+                result = {'success': True, 'message': f"Created box with AI specifications", 'object': obj}
+            
+            elif obj_type == 'gear':
+                teeth = params.get('teeth', 20)
+                module = params.get('module', 2.0)
+                width = params.get('width', 10.0)
+                
+                result = self.create_gear(teeth, module, width)
+                
+            elif obj_type == 'cylinder':
+                radius = params.get('radius', 10.0)
+                if 'diameter' in params:
+                    radius = params['diameter'] / 2
+                height = params.get('height', 50.0)
+                
+                doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
+                cylinder = Part.makeCylinder(radius, height)
+                obj = doc.addObject("Part::Feature", "Cylinder")
+                obj.Shape = cylinder
+                doc.recompute()
+                
+                result = {'success': True, 'message': f"Created cylinder with AI specifications", 'object': obj}
+                
+            # Add more object types here
+                
+            if not result:
+                return {'success': False, 'message': f"Unsupported object type: {obj_type}"}
+                
+            return result
+            
+        except Exception as e:
+            print(f"Error creating from AI spec: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error: {str(e)}"}
+            
+    def handle_gear(self, text):
+        """Create a gear based on text description"""
+        try:
+            print(f"Creating gear from: {text}")
+            
+            # Extract teeth count
+            teeth_match = re.search(r'(\d+)\s*(?:tooth|teeth|toothed)', text, re.IGNORECASE)
+            teeth = int(teeth_match.group(1)) if teeth_match else 20
+            
+            # Extract module if specified
+            module_match = re.search(r'module\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            module = float(module_match.group(1)) if module_match else 2.0
+            
+            # Extract width if specified
+            width_match = re.search(r'width\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            width = float(width_match.group(1)) if width_match else 10.0
+            
+            return self.create_gear(teeth, module, width)
+            
+        except Exception as e:
+            print(f"Error creating gear: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error creating gear: {str(e)}"}
+    
+    def create_gear(self, teeth=20, module=2.0, width=10.0):
+        """Create a gear with the specified parameters"""
+        try:
+            # Ensure we have an active document
+            doc = FreeCAD.ActiveDocument
+            if not doc:
+                doc = FreeCAD.newDocument("Gear")
+            
+            # Calculate gear dimensions
+            pitch_diameter = teeth * module
+            outer_diameter = pitch_diameter + 2 * module  # Addendum
+            root_diameter = pitch_diameter - 2.5 * module  # Dedendum
+            
+            # Create the base cylinder at the root diameter
+            base_cylinder = Part.makeCylinder(root_diameter/2, width)
+            
+            # Create the teeth by adding blocks around the perimeter
+            tooth_angle = 360.0 / teeth  # Angle between teeth
+            tooth_width_angle = tooth_angle * 0.4  # Width of each tooth in degrees
+            
+            # Create a compound shape to hold all teeth
+            all_teeth = []
+            
+            for i in range(teeth):
+                # Calculate the angle for this tooth
+                angle = i * tooth_angle
+                
+                # Create a tooth as a box
+                tooth_height = (outer_diameter - root_diameter) / 2  # Radial height of tooth
+                tooth_width = root_diameter * math.sin(math.radians(tooth_width_angle))  # Arc width at root diameter
+                
+                # Create the tooth as a box
+                tooth = Part.makeBox(tooth_height, tooth_width, width)
+                
+                # Position the tooth at the edge of the root cylinder
+                tooth.translate(FreeCAD.Vector(root_diameter/2, -tooth_width/2, 0))
+                
+                # Rotate the tooth to its position
+                tooth.rotate(FreeCAD.Vector(0, 0, 0), FreeCAD.Vector(0, 0, 1), angle)
+                
+                # Add to our collection
+                all_teeth.append(tooth)
+            
+            # Fuse all teeth with the base cylinder
+            gear_shape = base_cylinder
+            for tooth in all_teeth:
+                gear_shape = gear_shape.fuse(tooth)
+            
+            # Create a center bore
+            bore = module * 5  # Reasonable bore size based on module
+            center_hole = Part.makeCylinder(bore/2, width)
+            gear_shape = gear_shape.cut(center_hole)
+            
+            # Create the final object
+            gear_obj = doc.addObject("Part::Feature", f"Gear_T{teeth}_M{module}")
+            gear_obj.Shape = gear_shape
+            
+            doc.recompute()
+            
+            return {
+                'success': True,
+                'message': f'Created gear: {teeth} teeth, module {module}, \u00f8{pitch_diameter:.1f}mm pitch diameter',
+                'object': gear_obj,
+                'specs': {
+                    'teeth': teeth,
+                    'module': module,
+                    'pitch_diameter': pitch_diameter,
+                    'outer_diameter': outer_diameter,
+                    'root_diameter': root_diameter,
+                    'width': width
+                }
+            }
+            
+        except Exception as e:
+            print(f"Error creating gear: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error creating gear: {str(e)}"}
+    
+    def handle_cylinder(self, text):
+        """Create a cylinder based on text description"""
+        try:
+            # Extract diameter/radius
+            diameter_match = re.search(r'diameter\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            radius_match = re.search(r'radius\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            
+            radius = 10.0  # Default
+            if diameter_match:
+                radius = float(diameter_match.group(1)) / 2
+            elif radius_match:
+                radius = float(radius_match.group(1))
+            
+            # Extract height/length
+            height_match = re.search(r'(?:height|length)\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            height = float(height_match.group(1)) if height_match else 50.0
+            
+            # Create cylinder
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
+            cylinder = Part.makeCylinder(radius, height)
+            obj = doc.addObject("Part::Feature", "Cylinder")
+            obj.Shape = cylinder
+            doc.recompute()
+            
+            return {'success': True, 'message': f"Created cylinder with radius {radius}mm and height {height}mm", 'object': obj}
+            
+        except Exception as e:
+            print(f"Error creating cylinder: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error creating cylinder: {str(e)}"}
+    
+    def handle_extrude(self, text):
+        """Handle extrusion commands with improved reliability"""
+        try:
+            print(f"Handling extrusion: {text}")
+            print("Debug: ===== EXTRUDE OPERATION START =====")
+            
+            # Extract distance with better pattern matching
+            distance_patterns = [
+                r'(?:by|to|of)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?',
+                r'(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)',
+                r'extrude.*?(\d+(?:\.\d+)?)',
+            ]
+            
+            distance = 10.0  # Default
+            for pattern in distance_patterns:
+                distance_match = re.search(pattern, text, re.IGNORECASE)
+                if distance_match:
+                    distance = float(distance_match.group(1))
+                    break
+            
+            print(f"Debug: Extrusion distance = {distance}mm")
+            
+            # Extract direction
+            direction = 'up'  # Default direction
+            if any(word in text.lower() for word in ['down', 'negative', 'inward', 'into']):
+                direction = 'down'
+            print(f"Debug: Extrusion direction = {direction}")
+            
+            # Ensure we have an active document
+            if not FreeCAD.ActiveDocument:
+                print("Debug: No active document, creating one")
+                FreeCAD.newDocument("CADPart")
+            
+            doc = FreeCAD.ActiveDocument
+            print(f"Debug: Active document is {doc.Name}")
+            
+            # Get selection
+            try:
+                selection = FreeCADGui.Selection.getSelectionEx()
+                print(f"Debug: Found {len(selection)} selected objects")
+                
+                if not selection:
+                    print("Debug: No selection found")
+                    return {'success': False, 'message': 'Please select a face, sketch, or object to extrude first'}
+                
+            except Exception as sel_err:
+                print(f"Debug: Selection error: {str(sel_err)}")
+                return {'success': False, 'message': f'Selection error: {str(sel_err)}'}
+            
+            # Create extrusion vector
+            if direction == 'down':
+                extrude_vector = FreeCAD.Vector(0, 0, -distance)
+            else:
+                extrude_vector = FreeCAD.Vector(0, 0, distance)
+            
+            print(f"Debug: Extrusion vector: {extrude_vector}")
+            
+            # Process the selection
+            success_count = 0
+            error_messages = []
+            
+            for sel_item in selection:
+                try:
+                    obj = sel_item.Object
+                    print(f"Debug: Processing object: {obj.Name} (Type: {obj.TypeId})")
+                    
+                    result_obj = None
+                    
+                    # Case 1: Face selection (most common for extrude commands)
+                    if hasattr(sel_item, 'SubObjects') and sel_item.SubObjects:
+                        print(f"Debug: Found {len(sel_item.SubObjects)} sub-objects")
+                        
+                        # Look for faces in the selection
+                        faces = []
+                        for sub_obj in sel_item.SubObjects:
+                            if hasattr(sub_obj, 'Surface'):  # It's a face
+                                faces.append(sub_obj)
+                        
+                        if faces:
+                            print(f"Debug: Found {len(faces)} face(s) to extrude")
+                            face = faces[0]  # Use the first face
+                            
+                            try:
+                                print("Debug: Attempting direct face extrusion")
+                                extruded_shape = face.extrude(extrude_vector)
+                                
+                                # Create new object
+                                extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
+                                result_obj = doc.addObject("Part::Feature", extrude_name)
+                                result_obj.Shape = extruded_shape
+                                result_obj.ViewObject.Visibility = True
+                                
+                                print(f"Debug: Successfully created face extrusion: {extrude_name}")
+                                success_count += 1
+                                
+                            except Exception as face_err:
+                                print(f"Debug: Direct face extrusion failed: {str(face_err)}")
+                                error_messages.append(f"Face extrusion failed: {str(face_err)}")
+                    
+                    # Case 2: Sketch object
+                    elif obj.TypeId == "Sketcher::SketchObject":
+                        print("Debug: Processing sketch object")
+                        try:
+                            # Try to create a face from the sketch and extrude it
+                            sketch_wires = obj.Shape.Wires
+                            if sketch_wires:
+                                wire = sketch_wires[0]
+                                if wire.isClosed():
+                                    face = Part.Face(wire)
+                                    extruded_shape = face.extrude(extrude_vector)
+                                    
+                                    extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
+                                    result_obj = doc.addObject("Part::Feature", extrude_name)
+                                    result_obj.Shape = extruded_shape
+                                    result_obj.ViewObject.Visibility = True
+                                    
+                                    print(f"Debug: Successfully created sketch extrusion: {extrude_name}")
+                                    success_count += 1
+                                else:
+                                    error_messages.append(f"Sketch {obj.Name} is not closed")
+                            else:
+                                error_messages.append(f"Sketch {obj.Name} has no wires")
+                                
+                        except Exception as sketch_err:
+                            print(f"Debug: Sketch processing failed: {str(sketch_err)}")
+                            error_messages.append(f"Sketch processing failed: {str(sketch_err)}")
+                    
+                    # Case 3: Objects with faces (try to extrude the largest face)
+                    elif hasattr(obj, 'Shape') and obj.Shape.Faces:
+                        print("Debug: Processing object with faces")
+                        try:
+                            # Get the largest face (most likely the one to extrude)
+                            largest_face = max(obj.Shape.Faces, key=lambda f: f.Area)
+                            print(f"Debug: Using largest face with area {largest_face.Area}")
+                            
+                            extruded_shape = largest_face.extrude(extrude_vector)
+                            
+                            extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
+                            result_obj = doc.addObject("Part::Feature", extrude_name)
+                            result_obj.Shape = extruded_shape
+                            result_obj.ViewObject.Visibility = True
+                            
+                            print(f"Debug: Successfully created object face extrusion: {extrude_name}")
+                            success_count += 1
+                            
+                        except Exception as obj_err:
+                            print(f"Debug: Object face extrusion failed: {str(obj_err)}")
+                            error_messages.append(f"Object extrusion failed: {str(obj_err)}")
+                    
+                    else:
+                        error_messages.append(f"Object {obj.Name} cannot be extruded (type: {obj.TypeId})")
+                    
+                except Exception as item_err:
+                    print(f"Debug: Error processing selection item: {str(item_err)}")
+                    error_messages.append(f"Processing error: {str(item_err)}")
+            
+            # Recompute document
+            doc.recompute()
+            
+            # Update view
+            if FreeCADGui.ActiveDocument:
+                try:
+                    FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
+                    FreeCADGui.updateGui()
+                except:
+                    pass  # View update is not critical
+            
+            # Return results
+            if success_count > 0:
+                message = f"Successfully extruded {success_count} item(s) by {distance}mm {direction}"
+                if error_messages:
+                    message += f" (with {len(error_messages)} errors)"
+                
+                print(f"Debug: {message}")
+                print("Debug: ===== EXTRUDE OPERATION COMPLETE =====")
+                return {'success': True, 'message': message}
+            else:
+                error_summary = "; ".join(error_messages) if error_messages else "Unknown error"
+                print(f"Debug: No extrusions created. Errors: {error_summary}")
+                print("Debug: ===== EXTRUDE OPERATION FAILED =====")
+                return {'success': False, 'message': f'No extrusions created. {error_summary}'}
+                
+        except Exception as e:
+            print(f"Error during extrusion: {str(e)}")
+            traceback.print_exc()
+            print("Debug: ===== EXTRUDE OPERATION FAILED =====")
+            return {'success': False, 'message': f"Error during extrusion: {str(e)}"}
+    
+    def handle_fillet(self, text):
+        """Handle fillet commands"""
+        try:
+            print(f"Handling fillet: {text}")
+            
+            # Extract radius
+            radius_match = re.search(r'(?:radius|of)\s*(\d+(?:\.\d+)?)\s*(?:mm)?', text, re.IGNORECASE)
+            radius = float(radius_match.group(1)) if radius_match else 2.0
+            print(f"Debug: Fillet radius = {radius}mm")
+            
+            # Check if edges are selected
+            try:
+                selection = FreeCADGui.Selection.getSelectionEx()
+                print(f"Debug: Found {len(selection)} selected objects")
+                
+                if not selection:
+                    # If no selection, try to select the most recently created object
+                    doc = FreeCAD.ActiveDocument
+                    if doc and len(doc.Objects) > 0:
+                        # Get the last created object
+                        last_obj = doc.Objects[-1]
+                        print(f"Debug: Auto-selecting last created object: {last_obj.Name}")
+                        FreeCADGui.Selection.addSelection(last_obj)
+                        selection = FreeCADGui.Selection.getSelectionEx()
+                    else:
+                        print("Debug: No objects in document to select")
+                        return {'success': False, 'message': 'Please select an object or edges first'}
+            except Exception as sel_err:
+                print(f"Debug: Error during selection: {str(sel_err)}")
+                traceback.print_exc()
+                return {'success': False, 'message': f"Selection error: {str(sel_err)}"}
+            
+            results = []
+            for sel_obj in selection:
+                obj = sel_obj.Object
+                print(f"Debug: Processing object for fillet: {obj.Name}")
+                
+                if not hasattr(obj, 'Shape') or not hasattr(obj.Shape, 'Edges') or len(obj.Shape.Edges) == 0:
+                    print(f"Debug: Object {obj.Name} has no edges to fillet")
+                    continue
+                    
+                print(f"Debug: Object has {len(obj.Shape.Edges)} edges")
+                
+                # Check if specific edges are selected
+                selected_edges = []
+                if hasattr(sel_obj, 'SubElementNames') and sel_obj.SubElementNames:
+                    print(f"Debug: Found {len(sel_obj.SubElementNames)} sub-elements")
+                    for sub in sel_obj.SubElementNames:
+                        if sub.startswith('Edge'):
+                            edge_idx = int(sub.replace('Edge', '')) - 1
+                            selected_edges.append(edge_idx)
+                            print(f"Debug: Selected edge {edge_idx}")
+                
+                # If no specific edges selected, use all edges
+                if not selected_edges:
+                    print("Debug: No specific edges selected, using all edges")
+                    selected_edges = list(range(len(obj.Shape.Edges)))
+                
+                if not selected_edges:
+                    print(f"Debug: No edges found for object {obj.Name}")
+                    continue
+                
+                try:
+                    # Create fillet
+                    fillet_name = f"Fillet_{obj.Name}"
+                    print(f"Debug: Creating fillet object {fillet_name}")
+                    fillet = FreeCAD.ActiveDocument.addObject("Part::Fillet", fillet_name)
+                    fillet.Base = obj
+                    
+                    # Add edges to fillet
+                    edge_strings = []
+                    for edge_idx in selected_edges:
+                        if edge_idx < len(obj.Shape.Edges):
+                            edge_strings.append((edge_idx+1, radius, radius))
+                    
+                    print(f"Debug: Adding {len(edge_strings)} edges to fillet")
+                    fillet.Edges = edge_strings
+                    
+                    # Hide original object
+                    if hasattr(FreeCADGui, "ActiveDocument") and FreeCADGui.ActiveDocument:
+                        try:
+                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                            print(f"Debug: Set original object {obj.Name} visibility to False")
+                        except Exception as vis_err:
+                            print(f"Debug: Error setting visibility: {str(vis_err)}")
+                    
+                    results.append({
+                        'object': fillet,
+                        'radius': radius,
+                        'edges': len(edge_strings)
+                    })
+                    print(f"Debug: Successfully added fillet to results")
+                except Exception as fillet_err:
+                    print(f"Debug: Error creating fillet: {str(fillet_err)}")
+                    traceback.print_exc()
+            
+            # Recompute document
+            FreeCAD.ActiveDocument.recompute()
+            
+            if not results:
+                return {'success': False, 'message': 'No fillets were created'}
+                
+            return {
+                'success': True,
+                'message': f'Created {len(results)} fillet(s) with radius {radius}mm',
+                'fillets': results
+            }
+            
+        except Exception as e:
+            print(f"Error creating fillet: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error creating fillet: {str(e)}"}
+    
+    def add_fillets_to_object(self, obj, radius=2.0):
+        """Add fillets to all edges of an object"""
+        try:
+            if not obj or not hasattr(obj, 'Shape') or not hasattr(obj.Shape, 'Edges'):
+                return False
+                
+            # Create fillet
+            fillet_name = f"Fillet_{obj.Name}"
+            fillet = FreeCAD.ActiveDocument.addObject("Part::Fillet", fillet_name)
+            fillet.Base = obj
+            
+            # Add all edges to fillet
+            edge_strings = []
+            for i in range(len(obj.Shape.Edges)):
+                edge_strings.append((i+1, radius, radius))
+            
+            fillet.Edges = edge_strings
+            
+            # Hide original object
+            if hasattr(FreeCADGui, "ActiveDocument") and FreeCADGui.ActiveDocument:
+                FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+            
+            # Recompute document
+            FreeCAD.ActiveDocument.recompute()
+            
+            return True
+            
+        except Exception as e:
+            print(f"Error adding fillets: {str(e)}")
+            return False
+
+class CloudApiClient:
+    """Client for communicating with the Manufacturing Co-Pilot Cloud API"""
+    
+    # Default endpoint for CAD analysis
+    default_analysis_endpoint = "/api/analysis/cad"
+    
+    @classmethod
+    def load_cloud_config(cls):
+        """Load cloud configuration from JSON file if available"""
+        try:
+            # Check for config file in the same directory as this script
+            script_dir = os.path.dirname(os.path.realpath(__file__))
+            config_file = os.path.join(script_dir, "cloud_config.json")
+            
+            if os.path.exists(config_file):
+                print(f"Loading cloud configuration from {config_file}")
+                with open(config_file, "r") as f:
+                    cloud_config = json.load(f)
+                
+                # Update default endpoint if specified
+                if "default_analysis_endpoint" in cloud_config:
+                    cls.default_analysis_endpoint = cloud_config["default_analysis_endpoint"]
+                    print(f"Using custom analysis endpoint: {cls.default_analysis_endpoint}")
+                
+                return cloud_config
+            else:
+                print("No cloud_config.json file found, using defaults")
+                return {}
+        except Exception as e:
+            print(f"Error loading cloud configuration: {e}")
+            return {}
+    
+    def __init__(self, api_url: str = None, api_key: str = None):
+        """Initialize the cloud API client"""
+        # Load cloud configuration
+        cloud_config = self.load_cloud_config()
+        
+        # Set API URL and key from config or parameters
+        self.api_url = api_url or cloud_config.get("cloud_api_url", "https://freecad-copilot-service-501520737043.asia-south1.run.app")
+        self.api_key = api_key or cloud_config.get("cloud_api_key", "dev_api_key_for_testing")
+        
+        # Set other properties
+        self.timeout = 30  # seconds
+        self.last_error = None
+        self.connected = False
+        
+        # Test connection on init
+        self.test_connection()
+    
+    def test_connection(self) -> bool:
+        """Test connection to the cloud API"""
+        try:
+            response = self._make_request("/health", method="GET")
+            self.connected = True
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            self.connected = False
+            return False
+    
+    def get_chat_response(self, message: str) -> Dict[str, Any]:
+        """Get a response from the cloud API for a chat message"""
+        try:
+            # Get active document info if available
+            cad_data = self._get_cad_data()
+            
+            # Prepare payload for analysis endpoint
+            payload = {
+                "message": message,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                "mode": "general",
+                "cad_data": cad_data
+            }
+            
+            # Try the default analysis endpoint first
+            try:
+                response = self._make_request(self.default_analysis_endpoint, payload=payload)
+                return response
+            except Exception as first_error:
+                print(f"Primary endpoint failed: {str(first_error)}")
+                
+                # Try fallback endpoints if available
+                if hasattr(self, 'config') and 'fallback_endpoints' in self.config:
+                    for endpoint in self.config['fallback_endpoints']:
+                        try:
+                            print(f"Trying fallback endpoint: {endpoint}")
+                            response = self._make_request(endpoint, payload=payload)
+                            return response
+                        except Exception as e:
+                            print(f"Fallback endpoint {endpoint} failed: {str(e)}")
+                
+                # If all endpoints fail, try the /api/chat endpoint as last resort
+                try:
+                    print("Trying generic chat endpoint: /api/chat")
+                    chat_payload = {"message": message}
+                    response = self._make_request("/api/chat", payload=chat_payload)
+                    return response
+                except Exception as e:
+                    print(f"Chat endpoint failed: {str(e)}")
+                    
+                # If we get here, all endpoints failed
+                raise Exception(f"All endpoints failed. Primary error: {str(first_error)}")
+        except Exception as e:
+            self.last_error = str(e)
+            return {
+                "error": str(e),
+                "response": f"⚠️ Cloud connection error: {str(e)}. Please check your internet connection and API configuration.",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def _get_cad_data(self) -> Dict[str, Any]:
+        """Get CAD data from active document if available"""
+        try:
+            import FreeCAD
+            
+            if FreeCAD.ActiveDocument:
+                doc = FreeCAD.ActiveDocument
+                objects = doc.Objects
+                
+                # Basic document info
+                doc_info = {
+                    "name": doc.Name,
+                    "object_count": len(objects),
+                    "objects": []
+                }
+                
+                # Get info about each object
+                for obj in objects:
+                    obj_info = {
+                        "name": obj.Name,
+                        "label": obj.Label,
+                        "type": obj.TypeId
+                    }
+                    
+                    # Add shape info if available
+                    if hasattr(obj, 'Shape'):
+                        bbox = obj.Shape.BoundBox
+                        obj_info["dimensions"] = {
+                            "x": bbox.XLength,
+                            "y": bbox.YLength,
+                            "z": bbox.ZLength
+                        }
+                        obj_info["volume"] = obj.Shape.Volume
+                    
+                    doc_info["objects"].append(obj_info)
+                
+                return doc_info
+            else:
+                return {"status": "no_active_document"}
+                
+        except Exception as e:
+            print(f"Error getting CAD data: {e}")
+            return {"status": "error", "message": str(e)}
+    
+    def _make_request(self, endpoint: str, payload: Dict[str, Any] = None, method: str = "POST") -> Dict[str, Any]:
+        """Make a request to the cloud API"""
+        url = f"{self.api_url}{endpoint}"
+        
+        # Set up headers with API key if available
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            # Try both header formats for API key
+            headers["X-API-Key"] = self.api_key
+            headers["Authorization"] = f"Bearer {self.api_key}"
+            print("Using API key for authentication")
+        
+        try:
+            print(f"Making {method} request to {url}")
+            if method == "GET":
+                response = requests.get(url, headers=headers, timeout=self.timeout)
+            elif method == "POST":
+                response = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            # Log response status
+            print(f"Response status code: {response.status_code}")
+            
+            # Check if response is successful
+            if response.status_code >= 400:
+                print(f"Error response: {response.text}")
+                if response.status_code == 422 and 'cad_data' in response.text:
+                    raise ValueError("API requires cad_data field")
+            
+            response.raise_for_status()
+            
+            # Parse response
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            self.last_error = str(e)
+            print(f"Cloud API request failed: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response status code: {e.response.status_code}")
+                try:
+                    print(f"Response content: {e.response.text}")
+                except:
+                    pass
+            raise Exception(f"Cloud API request failed: {str(e)}")
+        
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"Unexpected error: {str(e)}")
+            raise
+
+# Singleton cloud client instance
+_cloud_client_instance = None
+
+def get_cloud_client() -> CloudApiClient:
+    """Get the singleton cloud client instance"""
+    global _cloud_client_instance
+    if _cloud_client_instance is None:
+        _cloud_client_instance = CloudApiClient()
+    return _cloud_client_instance
+
+class StandaloneCoPilot(QtWidgets.QWidget):
+    """Standalone Manufacturing Co-Pilot with built-in singleton pattern"""
+    
+    def __init__(self, parent=None):
+        """Initialize the standalone co-pilot"""
+        super().__init__(parent)
+        
+        # Connect to cloud
+        self.cloud_client = get_cloud_client()
+        self.cloud_connected = self.cloud_client.connected
+        
+        # Initialize NL CAD editor
+        self.nl_cad_editor = NaturalLanguageCADEditor(self.cloud_client)
+        print("Natural Language CAD Editor initialized")
+        
+        # Set up the UI
+        self.setup_ui()
+        
+        # Update cloud status in UI
+        self.update_status(self.cloud_connected)
+    
+    def setup_ui(self):
+        """Set up the user interface"""
+        # Set window title and size
+        self.setWindowTitle("Standalone Manufacturing Co-Pilot")
+        self.resize(500, 600)
+        
+        # Create main layout
+        layout = QtWidgets.QVBoxLayout()
+        self.setLayout(layout)
+        
+        # Add header with logo and status
+        header_layout = QtWidgets.QHBoxLayout()
+        
+        # Logo and title
+        logo_label = QtWidgets.QLabel("🔧")
+        logo_label.setStyleSheet("font-size: 24px;")
+        title_label = QtWidgets.QLabel("Manufacturing Co-Pilot")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold;")
+        
+        # Status indicator
+        self.status_layout = QtWidgets.QHBoxLayout()
+        self.status_indicator = QtWidgets.QLabel("●")
+        self.status_indicator.setStyleSheet("color: red;")
+        self.status_text = QtWidgets.QLabel("Cloud: Disconnected")
+        self.status_layout.addWidget(self.status_indicator)
+        self.status_layout.addWidget(self.status_text)
+        
+        # Add to header layout
+        header_layout.addWidget(logo_label)
+        header_layout.addWidget(title_label)
+        header_layout.addStretch()
+        header_layout.addLayout(self.status_layout)
+        
+        # Add header to main layout
+        layout.addLayout(header_layout)
+        
+        # Add chat history area
+        self.chat_history = QtWidgets.QTextEdit()
+        self.chat_history.setReadOnly(True)
+        self.chat_history.setMinimumHeight(300)
+        layout.addWidget(self.chat_history)
+        
+        # Add input area with send button
+        input_layout = QtWidgets.QHBoxLayout()
+        
+        self.input_field = QtWidgets.QTextEdit()
+        self.input_field.setPlaceholderText("Ask about manufacturing...")
+        self.input_field.setMaximumHeight(100)
+        input_layout.addWidget(self.input_field)
+        
+        self.send_button = QtWidgets.QPushButton("Send")
+        self.send_button.clicked.connect(self.send_message)
+        self.send_button.setMinimumHeight(80)
+        input_layout.addWidget(self.send_button)
+        
+        layout.addLayout(input_layout)
+        
+        # Connect enter key to send message
+        self.input_field.installEventFilter(self)
+        
+        # Add buttons
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        self.analyze_button = QtWidgets.QPushButton("Analyze")
+        self.analyze_button.clicked.connect(self.on_analyze_clicked)
+        
+        self.suggestions_button = QtWidgets.QPushButton("Suggestions")
+        self.suggestions_button.clicked.connect(self.on_suggestions_clicked)
+        
+        self.clear_button = QtWidgets.QPushButton("Clear")
+        self.clear_button.clicked.connect(self.on_clear_clicked)
+        
+        button_layout.addWidget(self.analyze_button)
+        button_layout.addWidget(self.suggestions_button)
+        button_layout.addWidget(self.clear_button)
+        
+        layout.addLayout(button_layout)
+        
+        # Add initial message
+        self.add_system_message("Welcome to the Manufacturing Co-Pilot!")
+        self.add_system_message("Ask questions about manufacturing or CAD design.")
+        
+        # Add cloud status message
+        if self.cloud_connected:
+            self.add_system_message(f"Connected to cloud service at {self.cloud_client.api_url}")
+        else:
+            self.add_system_message(f"Failed to connect to cloud service: {self.cloud_client.last_error}")
+    
+    def eventFilter(self, obj, event):
+        """Handle events for input field"""
+        if obj is self.input_field and event.type() == QtCore.QEvent.KeyPress:
+            if event.key() == QtCore.Qt.Key_Return and not event.modifiers() & QtCore.Qt.ShiftModifier:
+                self.send_message()
+                return True
+        return super().eventFilter(obj, event)
+    
+    def send_message(self):
+        """Send a message to the cloud service"""
+        message = self.input_field.toPlainText().strip()
+        if not message:
+            return
+        
+        # Add user message to chat history
+        self.add_user_message(message)
+        
+        # Clear input field
+        self.input_field.clear()
+        
+        # Show processing indicator
+        self.add_system_message("Processing...")
+        
+        # Check if this is a CAD command
+        if self.is_cad_command(message):
+            self.process_cad_command(message)
+        else:
+            # Send message to cloud service for chat
+            try:
+                # Get response from cloud
+                response = self.cloud_client.get_chat_response(message)
+                
+                # Extract response text
+                if "response" in response:
+                    response_text = response["response"]
+                elif "error" in response:
+                    response_text = f"Error: {response['error']}"
+                else:
+                    print(f"Debug: Received empty response from cloud: {response}")
+                    response_text = "I'm processing your request locally."
+                
+                # Remove processing indicator
+                self.remove_last_processing_message()
+                
+                # Add assistant message
+                self.add_assistant_message(response_text)
+                
+            except Exception as e:
+                # Remove processing indicator
+                self.remove_last_processing_message()
+                
+                # Add error message
+                self.add_system_message(f"Error: {str(e)}")
+                print(f"Error sending message: {e}")
+                traceback.print_exc()
+    
+    def is_cad_command(self, text):
+        """Check if the text is a CAD command"""
+        cad_indicators = [
+            'create', 'make', 'add', 'generate',
+            'box', 'cylinder', 'sphere', 'cube',
+            'bracket', 'gear', 'housing', 'shaft',
+            'extrude', 'extend', 'pull', 'fillet', 'round'
+        ]
+        
+        text_lower = text.lower()
+        return any(indicator in text_lower for indicator in cad_indicators)
+    
+    def process_cad_command(self, text):
+        """Process a CAD command using the NL CAD editor"""
+        try:
+            # Remove processing indicator
+            self.remove_last_processing_message()
+            
+            # Add system message
+            self.add_system_message(f"Creating CAD model from: '{text}'")
+            
+            # Process command with NL CAD editor
+            result = self.nl_cad_editor.process_command(text)
+            
+            if result['success']:
+                # Add success message
+                self.add_system_message(f"✅ {result['message']}")
+                
+                # Add assistant message with details
+                self.add_assistant_message(f"I've created the CAD model based on your description. You can see it in the 3D view.")
+            else:
+                # Add error message
+                self.add_system_message(f"❌ {result['message']}")
+                
+                # Add assistant message with error
+                self.add_assistant_message(f"I couldn't create the CAD model. {result['message']}")
+            
+        except Exception as e:
+            # Add error message
+            self.add_system_message(f"Error processing CAD command: {str(e)}")
+            traceback.print_exc()
+    
+    def update_status(self, connected):
+        """Update the cloud connection status indicator"""
+        if connected:
+            self.status_indicator.setStyleSheet("color: green;")
+            self.status_text.setText("Cloud: Connected")
+            self.cloud_connected = True
+        else:
+            self.status_indicator.setStyleSheet("color: red;")
+            self.status_text.setText("Cloud: Disconnected")
+            self.cloud_connected = False
+    
+    def add_system_message(self, message):
+        """Add a system message to the chat history"""
+        timestamp = datetime.now().strftime("%H:%M")
+        self.chat_history.append(f"<b>[{timestamp}] System:</b> {message}")
+        
+    def remove_last_processing_message(self):
+        """Remove the last 'Processing...' message from chat history"""
+        # Get current HTML content
+        html = self.chat_history.toHtml()
+        
+        # Find and remove the last processing message
+        processing_text = "<b>[\d+:\d+] System:</b> Processing..."
+        import re
+        html = re.sub(processing_text, "", html, count=1)
+        
+        # Set the modified HTML content
+        self.chat_history.setHtml(html)
+    
+    def add_user_message(self, message):
+        """Add a user message to the chat history"""
+        timestamp = datetime.now().strftime("%H:%M")
+        self.chat_history.append(f"<b>[{timestamp}] You:</b> {message}")
+    
+    def add_assistant_message(self, message):
+        """Add an assistant message to the chat history"""
+        timestamp = datetime.now().strftime("%H:%M")
+        self.chat_history.append(f"<b>[{timestamp}] Manufacturing Co-Pilot:</b> {message}")
+    
+    def on_analyze_clicked(self):
+        """Handle analyze button click"""
+        self.add_system_message("Analyzing current model...")
+        try:
+            # Check if there's an active document
+            if FreeCAD.ActiveDocument:
+                doc_name = FreeCAD.ActiveDocument.Name
+                objects = FreeCAD.ActiveDocument.Objects
+                object_count = len(objects)
+                
+                # Basic analysis
+                analysis_text = f"Active document: {doc_name} with {object_count} objects\n"
+                
+                # Analyze each object
+                for obj in objects:
+                    if hasattr(obj, 'Shape'):
+                        # Get basic properties
+                        volume = obj.Shape.Volume
+                        bbox = obj.Shape.BoundBox
+                        dimensions = f"{bbox.XLength:.1f}x{bbox.YLength:.1f}x{bbox.ZLength:.1f}"
+                        
+                        analysis_text += f"- {obj.Label}: {obj.TypeId}, Volume: {volume:.1f} mm³, Size: {dimensions} mm\n"
+                    else:
+                        analysis_text += f"- {obj.Label}: {obj.TypeId}\n"
+                
+                # Add analysis to chat
+                self.add_assistant_message(f"Here's my analysis of the current model:\n\n{analysis_text}")
+            else:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("There is no active document to analyze. Please create or open a document first.")
+        except Exception as e:
+            self.add_system_message(f"Error analyzing model: {str(e)}")
+            traceback.print_exc()
+    
+    def on_suggestions_clicked(self):
+        """Handle suggestions button click"""
+        self.add_system_message("Generating CAD suggestions...")
+        
+        # Suggest some CAD commands
+        suggestions = [
+            "Create a box 100x50x20",
+            "Make a cylinder with diameter 30 and height 50",
+            "Create a bracket with mounting holes",
+            "Generate a gear with 20 teeth"
+        ]
+        
+        # Add suggestions to chat
+        self.add_assistant_message("Here are some CAD commands you can try:\n\n" + 
+                               "\n".join([f"- {s}" for s in suggestions]) + 
+                               "\n\nJust type one of these commands or create your own!")
+        
+        # Set a random suggestion in the input field
+        self.input_field.setText(random.choice(suggestions))
+    
+    def on_clear_clicked(self):
+        """Handle clear button click"""
+        self.chat_history.clear()
+        self.add_system_message("Chat history cleared.")
+    
+    def closeEvent(self, event):
+        """Handle window close event"""
+        global _STANDALONE_INSTANCE
+        print("Closing Standalone Co-Pilot")
+        _STANDALONE_INSTANCE = None
+        event.accept()
+
+class StandaloneCoPilotTaskPanel:
+    """Task panel for the Standalone Co-Pilot"""
+    
+    def __init__(self, widget):
+        """Initialize the task panel"""
+        self.form = widget
+        self.widget = widget
+        print("StandaloneCoPilotTaskPanel initialized")
+    
+    def accept(self):
+        """Handle accept event"""
+        print("StandaloneCoPilotTaskPanel accepted")
+        self._cleanup()
+        return True
+    
+    def reject(self):
+        """Handle reject event"""
+        print("StandaloneCoPilotTaskPanel rejected")
+        self._cleanup()
+        return True
+    
+    def _cleanup(self):
+        """Clean up resources"""
+        global _STANDALONE_INSTANCE
+        _STANDALONE_INSTANCE = None
+        print("Reset _STANDALONE_INSTANCE to None")
+    
+    def getStandardButtons(self):
+        """Return standard buttons"""
+        return 0
+
+def show_standalone_copilot():
+    """Show the standalone co-pilot with singleton pattern"""
+    global _STANDALONE_INSTANCE
+    
+    print("\n=== STARTING STANDALONE CO-PILOT ===\n")
+    
+    # Check if an instance already exists
+    if _STANDALONE_INSTANCE is not None:
+        print("Standalone Co-Pilot is already running - activating existing instance")
+        try:
+            # Try to bring existing instance to front
+            _STANDALONE_INSTANCE.activateWindow()
+            _STANDALONE_INSTANCE.raise_()
+            
+            # Show message to user
+            QtWidgets.QMessageBox.information(
+                None,
+                "Co-Pilot Already Running",
+                "Manufacturing Co-Pilot is already running. Using the existing instance."
+            )
+        except Exception as e:
+            print(f"Error activating existing instance: {e}")
+        return
+    
+    try:
+        # Close any active FreeCAD task dialogs
+        if FreeCADGui.Control.activeDialog():
+            print("Closing active FreeCAD task dialog")
+            FreeCADGui.Control.closeDialog()
+        
+        # Create new instance
+        copilot = StandaloneCoPilot()
+        _STANDALONE_INSTANCE = copilot
+        
+        # Show in FreeCAD task panel
+        panel = StandaloneCoPilotTaskPanel(copilot)
+        FreeCADGui.Control.showDialog(panel)
+        print("Standalone Co-Pilot shown in task panel")
+        
+        print("\n=== STANDALONE CO-PILOT STARTED SUCCESSFULLY ===\n")
+    except Exception as e:
+        print(f"Error showing Standalone Co-Pilot: {e}")
+        traceback.print_exc()
+        _STANDALONE_INSTANCE = None
+        
+        # Show error message
+        QtWidgets.QMessageBox.critical(
+            None,
+            "Co-Pilot Error",
+            f"Failed to start Standalone Co-Pilot:\n\n{str(e)}"
+        )
+
+# Main entry point
+if __name__ == "__main__":
+    print("\n=== STANDALONE CO-PILOT MACRO STARTING ===\n")
+    
+    try:
+        # Show the standalone co-pilot
+        show_standalone_copilot()
+    except Exception as e:
+        print(f"ERROR starting Standalone Co-Pilot: {e}")
+        traceback.print_exc()
+        
+        # Show error message
+        try:
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Co-Pilot Error",
+                f"Failed to start Standalone Co-Pilot:\n\n{str(e)}"
+            )
+        except Exception as msg_err:
+            print(f"Error showing message: {msg_err}")
+    
+    print("\n=== STANDALONE CO-PILOT MACRO INITIALIZATION COMPLETE ===\n")

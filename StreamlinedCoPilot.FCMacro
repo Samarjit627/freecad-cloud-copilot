@@ -1,0 +1,106 @@
+"""
+Streamlined Manufacturing Co-Pilot Macro for FreeCAD
+With simplified UI and improved chat interface
+"""
+
+import os
+import sys
+import traceback
+import threading
+import time
+from PySide2 import QtWidgets, QtCore, QtGui
+
+# Add macro directory to path
+MACRO_DIR = os.path.dirname(os.path.realpath(__file__))
+if MACRO_DIR not in sys.path:
+    sys.path.append(MACRO_DIR)
+
+# Add macro/macro subdirectory to path if it exists
+MACRO_SUBDIR = os.path.join(MACRO_DIR, 'macro')
+if os.path.exists(MACRO_SUBDIR) and MACRO_SUBDIR not in sys.path:
+    sys.path.append(MACRO_SUBDIR)
+
+# Import NL CAD integration
+import nl_cad_integration
+
+# Import local modules
+try:
+    import cloud_client
+    import config
+    import ai_engine
+    import chat_interface as chat_interface_module
+    import questionnaire
+    import cloud_cad_analyzer
+    import local_cad_analyzer
+except ImportError as e:
+    print(f"Error importing modules: {e}")
+    print("Make sure all required files are in the macro directory.")
+
+class StreamlinedCoPilotMacro:
+    """Main class for the Streamlined Manufacturing Co-Pilot macro"""
+    
+    def __init__(self):
+        """Initialize the macro"""
+        try:
+            print("\nStarting Streamlined Manufacturing Co-Pilot...")
+            
+            # Import required modules
+            import FreeCAD
+            import FreeCADGui
+            from PySide2 import QtCore, QtGui, QtWidgets
+            
+            # Check cloud connection
+            self.cloud_client = cloud_client.get_client()
+            print(f"Cloud URL: {self.cloud_client.api_url}")
+            print(f"Connected: {self.cloud_client.connected}")
+            
+            if self.cloud_client.connected:
+                print("✅ Successfully connected to Cloud Service")
+            
+            # Create a task panel class
+            class CoPilotTaskPanel:
+                def __init__(self, widget):
+                    self.form = widget
+                    self.widget = widget
+                
+                def accept(self):
+                    return True
+                
+                def reject(self):
+                    return True
+                
+                def getStandardButtons(self):
+                    return 0
+            
+            # Create the streamlined manufacturing chat interface
+            self.chat_interface = chat_interface_module.ManufacturingChatInterface()
+            
+            # Check if there's an active task dialog and close it first
+            try:
+                if FreeCADGui.Control.activeDialog():
+                    FreeCADGui.Control.closeDialog()
+                    print("Closed existing task dialog")
+            except Exception as dialog_err:
+                print(f"Note when checking active dialog: {dialog_err}")
+                
+            # Create the task panel
+            panel = CoPilotTaskPanel(self.chat_interface)
+            FreeCADGui.Control.showDialog(panel)
+            
+            print("✅ Streamlined Co-Pilot loaded in FreeCAD Task Panel")
+            print("Streamlined Co-Pilot is ready!")
+            
+        except Exception as e:
+            print(f"Error initializing Streamlined Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Streamlined Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create and run the macro
+if __name__ == "__main__":
+    StreamlinedCoPilotMacro()

@@ -1,0 +1,9 @@
+# FreeCAD Manufacturing Co-Pilot Requirements
+# Note: PySide2 is provided by FreeCAD when running as a macro
+
+# Core dependencies
+requests>=2.25.0
+openai>=1.0.0
+
+# Optional dependencies for standalone mode
+PySide2>=5.15.0; python_version >= "3.6"

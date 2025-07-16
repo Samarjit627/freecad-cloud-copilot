@@ -1,0 +1,9 @@
+{
+  "timestamp": "2025-07-13T18:32:17",
+  "cloud_url": "https://freecad-copilot-service-501520737043.asia-south1.run.app",
+  "connected": true,
+  "health_endpoint_working": true,
+  "working_analysis_endpoints": [
+    "/api/analysis/cad"
+  ]
+}

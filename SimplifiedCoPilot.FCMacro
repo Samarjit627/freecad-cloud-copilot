@@ -1,0 +1,466 @@
+"""
+Simplified Manufacturing Co-Pilot Macro for FreeCAD
+Connects to cloud AI service for manufacturing assistance
+"""
+
+import os
+import sys
+import traceback
+from PySide2 import QtWidgets, QtCore, QtGui
+
+# Add macro directory to path
+MACRO_DIR = os.path.dirname(os.path.realpath(__file__))
+if MACRO_DIR not in sys.path:
+    sys.path.append(MACRO_DIR)
+
+# Import local modules
+try:
+    from macro import cloud_client, config, cad_analyzer, ai_engine
+except ImportError:
+    print("Error importing modules. Make sure all required files are in the macro directory.")
+    raise
+
+class SimplifiedChatMessage(QtWidgets.QWidget):
+    """A simplified chat message widget"""
+    
+    def __init__(self, role, content, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.content = content
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Set up the UI for this message"""
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Header with role
+        header = QtWidgets.QLabel()
+        if self.role == "User":
+            header.setText("👤 You")
+            header.setStyleSheet("font-weight: bold; color: #2563eb;")
+        else:
+            header.setText("🤖 Manufacturing Co-Pilot")
+            header.setStyleSheet("font-weight: bold; color: #059669;")
+        
+        # Content
+        content = QtWidgets.QLabel(self.content)
+        content.setWordWrap(True)
+        content.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        content.setStyleSheet("""
+            background-color: white;
+            border-radius: 8px;
+            padding: 10px;
+            font-size: 14px;
+            color: black;
+        """)
+        
+        layout.addWidget(header)
+        layout.addWidget(content)
+
+class SimplifiedChatInterface(QtWidgets.QWidget):
+    """A simplified chat interface for the Manufacturing Co-Pilot"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cloud_client = cloud_client.get_client()
+        self.cad_analyzer = cad_analyzer.AdvancedCADAnalyzer()
+        self.ai_engine = ai_engine.ManufacturingIntelligenceEngine()
+        self.is_processing = False
+        self.setup_ui()
+        self.check_cloud_connection()
+        self.fetch_agents()
+    
+    def setup_ui(self):
+        """Set up the UI for the chat interface"""
+        self.setMinimumSize(600, 400)
+        
+        # Main layout
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header
+        header_layout = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Manufacturing Co-Pilot")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        
+        self.cloud_status = QtWidgets.QLabel("Cloud: Connecting...")
+        self.cloud_status.setStyleSheet("color: #6b7280;")
+        
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(self.cloud_status)
+        
+        layout.addLayout(header_layout)
+        
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Chat area
+        self.chat_area = QtWidgets.QScrollArea()
+        self.chat_area.setWidgetResizable(True)
+        self.chat_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.chat_area.setStyleSheet("background-color: #f3f4f6; border: none;")
+        
+        self.chat_container = QtWidgets.QWidget()
+        self.chat_layout = QtWidgets.QVBoxLayout(self.chat_container)
+        self.chat_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.chat_layout.setSpacing(15)
+        
+        self.chat_area.setWidget(self.chat_container)
+        layout.addWidget(self.chat_area, 1)
+        
+        # Input area
+        input_layout = QtWidgets.QHBoxLayout()
+        
+        self.input_field = QtWidgets.QLineEdit()
+        self.input_field.setPlaceholderText("Ask about manufacturing...")
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+                background-color: white;
+                color: black;
+                font-size: 14px;
+            }
+        """)
+        self.input_field.returnPressed.connect(self.send_message)
+        
+        self.send_button = QtWidgets.QPushButton("Send")
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton:disabled {
+                background-color: #93c5fd;
+            }
+        """)
+        self.send_button.clicked.connect(self.send_message)
+        
+        input_layout.addWidget(self.input_field, 1)
+        input_layout.addWidget(self.send_button)
+        
+        layout.addLayout(input_layout)
+        
+        # Button area
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        self.analyze_button = QtWidgets.QPushButton("📊 Analyze CAD")
+        self.analyze_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.analyze_button.clicked.connect(self.analyze_cad)
+        
+        self.clear_button = QtWidgets.QPushButton("🗑️ Clear Chat")
+        self.clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.clear_button.clicked.connect(self.clear_chat)
+        
+        button_layout.addWidget(self.analyze_button)
+        button_layout.addWidget(self.clear_button)
+        button_layout.addStretch()
+        
+        layout.addLayout(button_layout)
+        
+        # Add welcome message
+        self.add_message("Assistant", "👋 Welcome to the Manufacturing Co-Pilot!\n\nI can help you with:\n• Design for Manufacturing (DFM) recommendations\n• Material selection advice\n• Manufacturing process guidance\n• Cost optimization suggestions\n\nAsk me anything about your design or manufacturing process!")
+    
+    def add_message(self, role, content):
+        """Add a message to the chat"""
+        message = SimplifiedChatMessage(role, content)
+        self.chat_layout.addWidget(message)
+        self.scroll_to_bottom()
+    
+    def scroll_to_bottom(self):
+        """Scroll to the bottom of the chat"""
+        self.chat_area.verticalScrollBar().setValue(
+            self.chat_area.verticalScrollBar().maximum()
+        )
+    
+    def send_message(self):
+        """Send a message from the input field"""
+        if self.is_processing:
+            return
+        
+        text = self.input_field.text().strip()
+        if not text:
+            return
+        
+        # Add user message
+        self.add_message("User", text)
+        self.input_field.clear()
+        
+        # Set processing state
+        self.is_processing = True
+        self.send_button.setEnabled(False)
+        self.send_button.setText("Processing...")
+        
+        # Add thinking message
+        self.add_message("Assistant", "Thinking...")
+        
+        # Start thread to get response
+        self.query_thread = QueryThread(self.cloud_client, text)
+        self.query_thread.response_ready.connect(self.handle_response)
+        self.query_thread.finished.connect(self.reset_ui)
+        self.query_thread.start()
+    
+    def handle_response(self, response):
+        """Handle the response from the AI"""
+        # Remove the "Thinking..." message
+        item = self.chat_layout.itemAt(self.chat_layout.count() - 1)
+        if item and item.widget():
+            item.widget().deleteLater()
+        
+        # Add the actual response
+        self.add_message("Assistant", response)
+    
+    def reset_ui(self):
+        """Reset the UI after processing"""
+        self.is_processing = False
+        self.send_button.setEnabled(True)
+        self.send_button.setText("Send")
+    
+    def analyze_cad(self):
+        """Analyze the current CAD document"""
+        try:
+            import FreeCAD
+            if not FreeCAD.ActiveDocument:
+                self.add_message("Assistant", "⚠️ No active document. Please open a CAD file first.")
+                return
+            
+            self.add_message("Assistant", "🔍 Analyzing your CAD model...")
+            
+            # Start thread to analyze CAD
+            self.analyze_thread = AnalyzeThread(self.cad_analyzer)
+            self.analyze_thread.analysis_ready.connect(self.handle_analysis)
+            self.analyze_thread.start()
+            
+        except Exception as e:
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {str(e)}")
+    
+    def handle_analysis(self, analysis):
+        """Handle the CAD analysis results"""
+        if "error" in analysis:
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {analysis['error']}")
+            return
+        
+        # Format analysis results
+        result = "📊 **CAD Analysis Results**\n\n"
+        
+        if "name" in analysis:
+            result += f"**Model:** {analysis['name']}\n"
+        
+        if "metrics" in analysis:
+            metrics = analysis["metrics"]
+            result += "\n**Metrics:**\n"
+            if "volume" in metrics:
+                result += f"• Volume: {metrics['volume']:.2f} mm³\n"
+            if "surface_area" in metrics:
+                result += f"• Surface Area: {metrics['surface_area']:.2f} mm²\n"
+            if "object_count" in metrics:
+                result += f"• Object Count: {metrics['object_count']}\n"
+        
+        if "complexity" in analysis:
+            result += f"\n**Complexity:** {analysis['complexity']}\n"
+        
+        self.add_message("Assistant", result)
+    
+    def clear_chat(self):
+        """Clear the chat history"""
+        # Remove all messages except the welcome message
+        while self.chat_layout.count() > 1:
+            item = self.chat_layout.itemAt(1)
+            if item and item.widget():
+                item.widget().deleteLater()
+    
+    def check_cloud_connection(self):
+        """Check cloud connection"""
+        self.cloud_thread = CloudThread(self.cloud_client)
+        self.cloud_thread.status_ready.connect(self.update_cloud_status)
+        self.cloud_thread.start()
+    
+    def update_cloud_status(self, connected):
+        """Update cloud connection status"""
+        if connected:
+            self.cloud_status.setText("Cloud: Connected ✅")
+            self.cloud_status.setStyleSheet("color: #059669;")
+        else:
+            self.cloud_status.setText("Cloud: Disconnected ❌")
+            self.cloud_status.setStyleSheet("color: #dc2626;")
+    
+    def fetch_agents(self):
+        """Fetch available manufacturing agents"""
+        if self.cloud_client and self.cloud_client.connected:
+            self.agents_thread = AgentsThread(self.cloud_client)
+            self.agents_thread.agents_ready.connect(self.handle_agents)
+            self.agents_thread.start()
+    
+    def handle_agents(self, agents):
+        """Handle the fetched agents"""
+        if agents:
+            agent_names = [agent.get('name', 'Unknown') for agent in agents]
+            self.add_message("Assistant", f"Available manufacturing experts: {', '.join(agent_names)}")
+
+class QueryThread(QtCore.QThread):
+    """Thread for querying the AI"""
+    response_ready = QtCore.Signal(str)
+    
+    def __init__(self, cloud_client, query):
+        super().__init__()
+        self.cloud_client = cloud_client
+        self.query = query
+    
+    def run(self):
+        try:
+            if self.cloud_client and self.cloud_client.connected:
+                # Use default agent for now
+                response = self.cloud_client.query_agent("machining-expert", self.query)
+                self.response_ready.emit(response)
+            else:
+                self.response_ready.emit("❌ Cloud service is not connected. Please check your internet connection.")
+        except Exception as e:
+            self.response_ready.emit(f"❌ Error: {str(e)}")
+
+class AnalyzeThread(QtCore.QThread):
+    """Thread for analyzing CAD"""
+    analysis_ready = QtCore.Signal(dict)
+    
+    def __init__(self, cad_analyzer):
+        super().__init__()
+        self.cad_analyzer = cad_analyzer
+    
+    def run(self):
+        try:
+            import FreeCAD
+            analysis = self.cad_analyzer.analyze_document(FreeCAD.ActiveDocument)
+            self.analysis_ready.emit(analysis)
+        except Exception as e:
+            self.analysis_ready.emit({"error": str(e)})
+
+class CloudThread(QtCore.QThread):
+    """Thread for checking cloud connection"""
+    status_ready = QtCore.Signal(bool)
+    
+    def __init__(self, cloud_client):
+        super().__init__()
+        self.cloud_client = cloud_client
+    
+    def run(self):
+        try:
+            if self.cloud_client:
+                connected = self.cloud_client.test_connection()
+            else:
+                connected = False
+            self.status_ready.emit(connected)
+        except Exception:
+            self.status_ready.emit(False)
+
+class AgentsThread(QtCore.QThread):
+    """Thread for fetching manufacturing agents"""
+    agents_ready = QtCore.Signal(list)
+    
+    def __init__(self, cloud_client):
+        super().__init__()
+        self.cloud_client = cloud_client
+    
+    def run(self):
+        try:
+            agents = self.cloud_client.get_available_agents()
+            self.agents_ready.emit(agents)
+        except Exception:
+            self.agents_ready.emit([])
+
+class SimplifiedCoPilotMacro:
+    """Main class for the Simplified Manufacturing Co-Pilot macro"""
+    
+    def __init__(self):
+        """Initialize the macro"""
+        try:
+            # Print welcome message
+            print("\nStarting Simplified Manufacturing Co-Pilot...")
+            
+            # Check cloud connection status
+            try:
+                client = cloud_client.get_client()
+                print(f"Cloud URL: {config.CLOUD_API_URL}")
+                print(f"Connected: {client.connected}")
+                if client.connected:
+                    print("✅ Successfully connected to Cloud Service")
+                else:
+                    print(f"❌ Connection failed: {client.last_error}")
+            except Exception as e:
+                print(f"Error checking cloud connection: {e}")
+            
+            # Create task panel
+            import FreeCADGui
+            
+            # Create a task panel class
+            class CoPilotTaskPanel:
+                def __init__(self, widget):
+                    self.form = widget
+                    self.widget = widget
+                
+                def accept(self):
+                    return True
+                
+                def reject(self):
+                    return True
+                
+                def getStandardButtons(self):
+                    return 0
+            
+            # Create the chat interface
+            self.chat_interface = SimplifiedChatInterface()
+            
+            # Create the task panel
+            panel = CoPilotTaskPanel(self.chat_interface)
+            FreeCADGui.Control.showDialog(panel)
+            
+            print("✅ Simplified Co-Pilot loaded in FreeCAD Task Panel")
+            print("Manufacturing Co-Pilot is ready!")
+            
+        except Exception as e:
+            print(f"Error initializing Simplified Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Simplified Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create and run the macro
+if __name__ == "__main__":
+    SimplifiedCoPilotMacro()

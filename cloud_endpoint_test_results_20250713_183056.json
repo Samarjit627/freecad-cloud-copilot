@@ -1,0 +1,861 @@
+[
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/",
+    "response": {
+      "message": "FreeCAD Manufacturing Co-Pilot API",
+      "docs_url": "/docs",
+      "health_check": "/health"
+    }
+  },
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/health",
+    "response": {
+      "status": "healthy",
+      "timestamp": "2025-07-13T13:00:34.369910",
+      "version": "1.0.0"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 405,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis/cad",
+    "response": {
+      "detail": "Method Not Allowed"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis/cad",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/cad-analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analyze",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/chat",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/agents",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/docs",
+    "response": "\n    <!DOCTYPE html>\n    <html>\n    <head>\n    <link type=\"text/css\" rel=\"stylesheet\" href=\"https://cdn.jsdelivr.net/npm/swagger-ui-dist@5.9.0/swagger-ui.css\">\n    <link rel=\"shortcut icon\" href=\"http..."
+  },
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/openapi.json",
+    "response": {
+      "openapi": "3.1.0",
+      "info": {
+        "title": "FreeCAD Manufacturing Co-Pilot API",
+        "description": "Cloud backend for FreeCAD Manufacturing Co-Pilot",
+        "version": "1.0.0"
+      },
+      "paths": {
+        "/api/chat/completions": {
+          "post": {
+            "tags": [
+              "chat"
+            ],
+            "summary": "Get Chat Completion",
+            "description": "Get manufacturing expert advice based on query and CAD analysis",
+            "operationId": "get_chat_completion_api_chat_completions_post",
+            "requestBody": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/ChatRequest"
+                  }
+                }
+              },
+              "required": true
+            },
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/ChatResponse"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            },
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ]
+          }
+        },
+        "/api/chat/conversations/{conversation_id}": {
+          "get": {
+            "tags": [
+              "chat"
+            ],
+            "summary": "Get Conversation",
+            "description": "Get conversation history by ID",
+            "operationId": "get_conversation_api_chat_conversations__conversation_id__get",
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "conversation_id",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "title": "Conversation Id"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/ChatMessage"
+                      },
+                      "title": "Response Get Conversation Api Chat Conversations  Conversation Id  Get"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/api/analysis/cad": {
+          "post": {
+            "tags": [
+              "analysis"
+            ],
+            "summary": "Analyze Cad",
+            "description": "Analyze CAD data and provide manufacturing recommendations",
+            "operationId": "analyze_cad_api_analysis_cad_post",
+            "requestBody": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AnalysisRequest"
+                  }
+                }
+              },
+              "required": true
+            },
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/AnalysisResponse"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            },
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ]
+          }
+        },
+        "/api/analysis/results/{analysis_id}": {
+          "get": {
+            "tags": [
+              "analysis"
+            ],
+            "summary": "Get Analysis Result",
+            "description": "Get analysis result by ID",
+            "operationId": "get_analysis_result_api_analysis_results__analysis_id__get",
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "analysis_id",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "title": "Analysis Id"
+                }
+              }
+            ],
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/AnalysisResponse"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/api/agents/list": {
+          "get": {
+            "tags": [
+              "agents"
+            ],
+            "summary": "List Agents",
+            "description": "List all available specialized agents",
+            "operationId": "list_agents_api_agents_list_get",
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {}
+                  }
+                }
+              }
+            },
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ]
+          }
+        },
+        "/api/agents/{agent_type}": {
+          "post": {
+            "tags": [
+              "agents"
+            ],
+            "summary": "Query Agent",
+            "description": "Query a specific manufacturing agent",
+            "operationId": "query_agent_api_agents__agent_type__post",
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ],
+            "parameters": [
+              {
+                "name": "agent_type",
+                "in": "path",
+                "required": true,
+                "schema": {
+                  "type": "string",
+                  "title": "Agent Type"
+                }
+              }
+            ],
+            "requestBody": {
+              "required": true,
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AgentRequest"
+                  }
+                }
+              }
+            },
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/AgentResponse"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/api/agents/orchestrate": {
+          "post": {
+            "tags": [
+              "agents"
+            ],
+            "summary": "Orchestrate Agents",
+            "description": "Orchestrate multiple agents to solve a complex manufacturing query",
+            "operationId": "orchestrate_agents_api_agents_orchestrate_post",
+            "requestBody": {
+              "content": {
+                "application/json": {
+                  "schema": {
+                    "$ref": "#/components/schemas/AgentRequest"
+                  }
+                }
+              },
+              "required": true
+            },
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "type": "object",
+                      "title": "Response Orchestrate Agents Api Agents Orchestrate Post"
+                    }
+                  }
+                }
+              },
+              "422": {
+                "description": "Validation Error",
+                "content": {
+                  "application/json": {
+                    "schema": {
+                      "$ref": "#/components/schemas/HTTPValidationError"
+                    }
+                  }
+                }
+              }
+            },
+            "security": [
+              {
+                "APIKeyHeader": []
+              }
+            ]
+          }
+        },
+        "/health": {
+          "get": {
+            "summary": "Health Check",
+            "description": "Health check endpoint that doesn't require authentication",
+            "operationId": "health_check_health_get",
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {}
+                  }
+                }
+              }
+            }
+          }
+        },
+        "/": {
+          "get": {
+            "summary": "Root",
+            "description": "Root endpoint that doesn't require authentication",
+            "operationId": "root__get",
+            "responses": {
+              "200": {
+                "description": "Successful Response",
+                "content": {
+                  "application/json": {
+                    "schema": {}
+                  }
+                }
+              }
+            }
+          }
+        }
+      },
+      "components": {
+        "schemas": {
+          "AgentRequest": {
+            "properties": {
+              "agent_type": {
+                "type": "string",
+                "title": "Agent Type"
+              },
+              "query": {
+                "type": "string",
+                "title": "Query"
+              },
+              "cad_analysis": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Cad Analysis"
+              },
+              "user_context": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "User Context"
+              },
+              "additional_data": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Additional Data"
+              }
+            },
+            "type": "object",
+            "required": [
+              "agent_type",
+              "query"
+            ],
+            "title": "AgentRequest"
+          },
+          "AgentResponse": {
+            "properties": {
+              "response": {
+                "type": "object",
+                "title": "Response"
+              },
+              "agent_type": {
+                "type": "string",
+                "title": "Agent Type"
+              },
+              "timestamp": {
+                "type": "string",
+                "title": "Timestamp"
+              }
+            },
+            "type": "object",
+            "required": [
+              "response",
+              "agent_type",
+              "timestamp"
+            ],
+            "title": "AgentResponse"
+          },
+          "AnalysisRequest": {
+            "properties": {
+              "cad_data": {
+                "type": "object",
+                "title": "Cad Data"
+              },
+              "user_requirements": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "User Requirements"
+              }
+            },
+            "type": "object",
+            "required": [
+              "cad_data"
+            ],
+            "title": "AnalysisRequest"
+          },
+          "AnalysisResponse": {
+            "properties": {
+              "analysis_id": {
+                "type": "string",
+                "title": "Analysis Id"
+              },
+              "dimensions": {
+                "type": "object",
+                "title": "Dimensions"
+              },
+              "manufacturing_features": {
+                "type": "object",
+                "title": "Manufacturing Features"
+              },
+              "material_suggestions": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "title": "Material Suggestions"
+              },
+              "process_recommendations": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "title": "Process Recommendations"
+              },
+              "design_issues": {
+                "items": {
+                  "type": "string"
+                },
+                "type": "array",
+                "title": "Design Issues"
+              },
+              "timestamp": {
+                "type": "string",
+                "title": "Timestamp"
+              }
+            },
+            "type": "object",
+            "required": [
+              "analysis_id",
+              "dimensions",
+              "manufacturing_features",
+              "material_suggestions",
+              "process_recommendations",
+              "design_issues",
+              "timestamp"
+            ],
+            "title": "AnalysisResponse"
+          },
+          "ChatMessage": {
+            "properties": {
+              "role": {
+                "type": "string",
+                "title": "Role"
+              },
+              "content": {
+                "type": "string",
+                "title": "Content"
+              }
+            },
+            "type": "object",
+            "required": [
+              "role",
+              "content"
+            ],
+            "title": "ChatMessage"
+          },
+          "ChatRequest": {
+            "properties": {
+              "query": {
+                "type": "string",
+                "title": "Query"
+              },
+              "cad_analysis": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Cad Analysis"
+              },
+              "user_context": {
+                "anyOf": [
+                  {
+                    "type": "object"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "User Context"
+              },
+              "mode": {
+                "type": "string",
+                "title": "Mode",
+                "default": "general"
+              },
+              "conversation_history": {
+                "anyOf": [
+                  {
+                    "items": {
+                      "$ref": "#/components/schemas/ChatMessage"
+                    },
+                    "type": "array"
+                  },
+                  {
+                    "type": "null"
+                  }
+                ],
+                "title": "Conversation History"
+              }
+            },
+            "type": "object",
+            "required": [
+              "query"
+            ],
+            "title": "ChatRequest"
+          },
+          "ChatResponse": {
+            "properties": {
+              "response": {
+                "type": "string",
+                "title": "Response"
+              },
+              "conversation_id": {
+                "type": "string",
+                "title": "Conversation Id"
+              },
+              "timestamp": {
+                "type": "string",
+                "title": "Timestamp"
+              }
+            },
+            "type": "object",
+            "required": [
+              "response",
+              "conversation_id",
+              "timestamp"
+            ],
+            "title": "ChatResponse"
+          },
+          "HTTPValidationError": {
+            "properties": {
+              "detail": {
+                "items": {
+                  "$ref": "#/components/schemas/ValidationError"
+                },
+                "type": "array",
+                "title": "Detail"
+              }
+            },
+            "type": "object",
+            "title": "HTTPValidationError"
+          },
+          "ValidationError": {
+            "properties": {
+              "loc": {
+                "items": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "integer"
+                    }
+                  ]
+                },
+                "type": "array",
+                "title": "Location"
+              },
+              "msg": {
+                "type": "string",
+                "title": "Message"
+              },
+              "type": {
+                "type": "string",
+                "title": "Error Type"
+              }
+            },
+            "type": "object",
+            "required": [
+              "loc",
+              "msg",
+              "type"
+            ],
+            "title": "ValidationError"
+          }
+        },
+        "securitySchemes": {
+          "APIKeyHeader": {
+            "type": "apiKey",
+            "in": "header",
+            "name": "X-API-Key"
+          }
+        }
+      }
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 401,
+    "exists": true,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis/cad",
+    "response": {
+      "detail": "Invalid API Key"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis/cad",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/cad-analysis",
+    "response": {
+      "detail": "Not Found"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analyze",
+    "response": {
+      "detail": "Not Found"
+    }
+  }
+]

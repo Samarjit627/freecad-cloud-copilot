@@ -1,0 +1,385 @@
+"""
+Cloud API Client for the FreeCAD Manufacturing Co-Pilot
+Handles communication with the cloud backend
+"""
+
+import json
+import urllib.request
+import urllib.error
+import urllib.parse
+import os
+import time
+import requests
+from typing import Dict, List, Any, Optional
+from pathlib import Path
+
+try:
+    from macro import config
+except ImportError:
+    import config
+
+class CloudApiClient:
+    """Client for communicating with the Manufacturing Co-Pilot Cloud API"""
+    
+    # Default endpoint for CAD analysis - this is the correct endpoint from the FastAPI app
+    default_analysis_endpoint = "/api/analysis/cad"
+    
+    @classmethod
+    def load_cloud_config(cls):
+        """Load cloud configuration from JSON file if available"""
+        try:
+            # Check for config file in the same directory as this script
+            script_dir = Path(__file__).parent.parent
+            config_file = script_dir / "cloud_config.json"
+            
+            if config_file.exists():
+                print(f"Loading cloud configuration from {config_file}")
+                with open(config_file, "r") as f:
+                    cloud_config = json.load(f)
+                
+                # Update default endpoint if specified
+                if "default_analysis_endpoint" in cloud_config:
+                    cls.default_analysis_endpoint = cloud_config["default_analysis_endpoint"]
+                    print(f"Using custom analysis endpoint: {cls.default_analysis_endpoint}")
+                
+                return cloud_config
+            else:
+                print("No cloud_config.json file found, using defaults")
+                return {}
+        except Exception as e:
+            print(f"Error loading cloud configuration: {e}")
+            return {}
+    
+    def __init__(self, api_url: str = None, api_key: str = None):
+        """Initialize the cloud API client"""
+        # Load cloud configuration
+        cloud_config = self.load_cloud_config()
+        
+        # Set API URL and key from config or parameters
+        self.api_url = api_url or cloud_config.get("cloud_api_url", config.CLOUD_API_URL)
+        self.api_key = api_key or cloud_config.get("cloud_api_key", config.CLOUD_API_KEY)
+        
+        # Set other properties
+        self.timeout = 30  # seconds
+        self.last_error = None
+        self.connected = False
+        self.last_successful_endpoint = self.default_analysis_endpoint  # Set default endpoint
+        
+        # Store fallback endpoints from config
+        self.fallback_endpoints = cloud_config.get("fallback_endpoints", [])
+        
+        # Test connection on init
+        self.test_connection()
+    
+    def test_connection(self) -> bool:
+        """Test connection to the cloud API"""
+        try:
+            response = self._make_request("/health", method="GET")
+            self.connected = True
+            return True
+        except Exception as e:
+            self.last_error = str(e)
+            self.connected = False
+            return False
+    
+    def get_chat_response(self, query: str, cad_analysis: Dict[str, Any], 
+                          user_context: Dict[str, Any], mode: str = "general",
+                          conversation_id: Optional[str] = None) -> Dict[str, Any]:
+        """Get a chat response from the cloud API"""
+        try:
+            payload = {
+                "query": query,
+                "cad_analysis": cad_analysis,
+                "user_context": user_context,
+                "mode": mode,
+                "conversation_id": conversation_id
+            }
+            
+            response = self._make_request("/api/chat", payload=payload)
+            return response
+        except Exception as e:
+            self.last_error = str(e)
+            return {
+                "error": str(e),
+                "response": f"⚠️ Cloud connection error: {str(e)}. Please check your internet connection and API configuration.",
+                "conversation_id": conversation_id or "error",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def enhance_cad_analysis(self, cad_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Enhance CAD analysis with cloud-based intelligence"""
+        try:
+            payload = {
+                "cad_data": cad_data
+            }
+            
+            response = self._make_request("/api/analysis", payload=payload)
+            return response.get("analysis", cad_data)
+        except Exception as e:
+            self.last_error = str(e)
+            return cad_data
+            
+    def analyze_cad(self, metadata: Dict[str, Any], geometry_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Send CAD data to the cloud for comprehensive analysis"""
+        try:
+            # Prepare payload - wrap metadata and geometry in cad_data field as expected by the API
+            payload = {
+                "cad_data": {
+                    "metadata": metadata,
+                    "geometry": geometry_data,
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                }
+            }
+            
+            # Send to cloud for analysis
+            print("Sending CAD data to cloud for analysis...")
+            
+            # First try the default endpoint if we have one from previous successful calls
+            if self.last_successful_endpoint:
+                endpoints_to_try = [self.last_successful_endpoint]
+                print(f"Using previously successful endpoint: {self.last_successful_endpoint}")
+            else:
+                # Start with the default endpoint
+                endpoints_to_try = [self.default_analysis_endpoint]
+                
+                # Add fallback endpoints from config if available
+                if hasattr(self, 'fallback_endpoints') and self.fallback_endpoints:
+                    endpoints_to_try.extend(self.fallback_endpoints)
+                else:
+                    # Use hardcoded fallbacks if no config is available
+                    endpoints_to_try.extend([
+                        "/api/analysis/cad",       # Correct endpoint from FastAPI app
+                        "/api/analysis",           # Base endpoint
+                        "/api/cad-analysis",       # Alternative with prefix
+                        "/api/v1/analysis",        # Version-specific endpoint
+                        "/analysis",               # Direct endpoint
+                        "/cad-analysis",           # Alternative name
+                        "/analyze"                 # Another common name
+                    ])
+                
+                # Remove duplicates while preserving order
+                seen = set()
+                endpoints_to_try = [x for x in endpoints_to_try if not (x in seen or seen.add(x))]
+            
+            last_error = None
+            for endpoint in endpoints_to_try:
+                try:
+                    print(f"Trying endpoint: {endpoint}")
+                    response = self._make_request(endpoint, payload=payload)
+                    print(f"Success with endpoint: {endpoint}")
+                    
+                    # Store the successful endpoint
+                    self.last_successful_endpoint = endpoint
+                    
+                    # Debug: Print the response from the cloud API
+                    print("\nDEBUG - Cloud API raw response:")
+                    import json
+                    print(f"Response type: {type(response)}")
+                    print(f"Response keys: {list(response.keys()) if isinstance(response, dict) else 'Not a dictionary'}")
+                    
+                    # Map the cloud API response format to our expected format
+                    if isinstance(response, dict):
+                        # Create features structure from manufacturing_features
+                        if "manufacturing_features" in response and "features" not in response:
+                            mf = response["manufacturing_features"]
+                            
+                            # Create the features structure expected by our display code
+                            response["features"] = {
+                                "holes": [{}] * mf.get("holes", 0),  # Create list with the number of holes
+                                "fillets": [],
+                                "chamfers": [],
+                                "ribs": [{}] * mf.get("ribs", 0)  # Create list with the number of ribs
+                            }
+                            
+                            # Add any other features from manufacturing_features
+                            if "thin_walls" in mf and mf["thin_walls"] > 0:
+                                response["features"]["thin_walls"] = [{}] * mf["thin_walls"]
+                                
+                            if "sharp_corners" in mf and mf["sharp_corners"] > 0:
+                                response["features"]["sharp_corners"] = [{}] * mf["sharp_corners"]
+                        
+                        # If no manufacturing_features, create empty features structure
+                        elif "features" not in response:
+                            print("WARNING: 'features' key missing from cloud response, adding empty features structure")
+                            response["features"] = {
+                                "holes": [],
+                                "fillets": [],
+                                "chamfers": [],
+                                "ribs": []
+                            }
+                            
+                        # Add manufacturing insights from design_issues and process_recommendations
+                        if "manufacturing_insights" not in response:
+                            insights = []
+                            
+                            # Add design issues as insights
+                            if "design_issues" in response:
+                                insights.extend(response["design_issues"])
+                                
+                            # Add process recommendations as insights
+                            if "process_recommendations" in response:
+                                insights.extend([f"Recommended process: {proc}" for proc in response["process_recommendations"]])
+                                
+                            # Add material suggestions as insights
+                            if "material_suggestions" in response:
+                                insights.extend([f"Suggested material: {mat}" for mat in response["material_suggestions"]])
+                                
+                            response["manufacturing_insights"] = insights
+                            
+                        # Update metadata with dimensions if available
+                        if "dimensions" in response and isinstance(response["dimensions"], dict) and "metadata" not in response:
+                            response["metadata"] = {}
+                            
+                        if "dimensions" in response and isinstance(response["dimensions"], dict) and "metadata" in response:
+                            dims = response["dimensions"]
+                            if "x" in dims:
+                                response["metadata"]["x_length"] = dims["x"]
+                            if "y" in dims:
+                                response["metadata"]["y_length"] = dims["y"]
+                            if "z" in dims:
+                                response["metadata"]["z_length"] = dims["z"]
+                    
+                    # If the cloud returns enhanced metadata, merge it with our basic metadata
+                    if "metadata" in response and "cad_data" in payload and "metadata" in payload["cad_data"]:
+                        response["metadata"].update(payload["cad_data"]["metadata"])
+                        
+                    # Mark this as cloud analysis
+                    response["analysis_type"] = "cloud"
+                    return response
+                    
+                except Exception as e:
+                    print(f"Failed with endpoint {endpoint}: {str(e)}")
+                    last_error = e
+                    continue
+            
+            # If we get here, all endpoints failed
+            print("All cloud analysis endpoints failed. Raising exception...")
+            raise Exception(f"All cloud analysis endpoints failed. Last error: {str(last_error)}")
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"Error in cloud CAD analysis: {str(e)}")
+            
+            # Return basic structure with error
+            return {
+                "error": str(e),
+                "metadata": metadata,
+                "features": {
+                    "holes": [],
+                    "fillets": [],
+                    "chamfers": [],
+                    "ribs": []
+                },
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+        
+    def get_available_agents(self) -> Dict[str, Any]:
+        """Get list of available manufacturing agents"""
+        try:
+            response = self._make_request("/agents", method="GET")
+            return response
+        except Exception as e:
+            self.last_error = str(e)
+            return {"agents": [], "error": str(e)}
+        
+    def query_agent(self, agent_id: str, query: str, cad_data: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Query a specific manufacturing agent"""
+        try:
+            payload = {
+                "query": query,
+                "cad_analysis": cad_data or {}
+            }
+            
+            response = self._make_request(f"/query/{agent_id}", payload=payload)
+            return response
+        except Exception as e:
+            self.last_error = str(e)
+            return {
+                "agent_id": agent_id,
+                "response": f"⚠️ Error querying agent: {str(e)}",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+        
+    def orchestrate_agents(self, query: str, cad_data: Dict[str, Any] = None, 
+                          agent_ids: list = None) -> Dict[str, Any]:
+        """Orchestrate multiple manufacturing agents to answer a complex query"""
+        try:
+            payload = {
+                "query": query,
+                "cad_analysis": cad_data or {},
+                "agent_ids": agent_ids
+            }
+            
+            response = self._make_request("/orchestrate", payload=payload)
+            return response
+        except Exception as e:
+            self.last_error = str(e)
+            return {
+                "error": str(e),
+                "responses": [],
+                "summary": f"⚠️ Orchestration error: {str(e)}",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def _make_request(self, endpoint: str, payload: Dict[str, Any] = None, method: str = "POST") -> Dict[str, Any]:
+        """Make a request to the cloud API"""
+        url = f"{self.api_url}{endpoint}"
+        
+        # Set up headers with API key if available
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["X-API-Key"] = self.api_key
+            print("Using API key for authentication")
+        
+        try:
+            print(f"Making {method} request to {url}")
+            if method == "GET":
+                response = requests.get(url, headers=headers, timeout=self.timeout)
+            elif method == "POST":
+                if payload:
+                    payload_str = json.dumps(payload)
+                    print(f"Sending payload: {payload_str[:200]}..." if len(payload_str) > 200 else payload_str)
+                response = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+            else:
+                raise ValueError(f"Unsupported HTTP method: {method}")
+            
+            # Log response status
+            print(f"Response status code: {response.status_code}")
+            
+            # Check if response is successful
+            response.raise_for_status()
+            
+            # Parse response
+            return response.json()
+            
+        except requests.exceptions.RequestException as e:
+            self.last_error = str(e)
+            print(f"Cloud API request failed: {str(e)}")
+            if hasattr(e, 'response') and e.response is not None:
+                print(f"Response status code: {e.response.status_code}")
+                try:
+                    print(f"Response content: {e.response.text}")
+                except:
+                    pass
+            raise Exception(f"Cloud API request failed: {str(e)}")
+        
+        except Exception as e:
+            self.last_error = str(e)
+            print(f"Unexpected error: {str(e)}")
+            raise
+
+# Singleton instance
+_client_instance = None
+
+def get_client() -> CloudApiClient:
+    """Get the singleton client instance"""
+    global _client_instance
+    if _client_instance is None:
+        _client_instance = CloudApiClient()
+    return _client_instance
+
+# Test the connection when imported
+if __name__ == "__main__":
+    client = get_client()
+    print(f"Cloud API Connected: {client.connected}")
+    if not client.connected:
+        print(f"Error: {client.last_error}")

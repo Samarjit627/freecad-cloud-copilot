@@ -1,0 +1,69 @@
+{
+  "GET /": {
+    "status": 200,
+    "content_length": 68,
+    "content_preview": "{\"message\":\"FreeCAD Manufacturing Co-Pilot API\",\"status\":\"running\"}\n"
+  },
+  "GET /health": {
+    "status": 200,
+    "content_length": 21,
+    "content_preview": "{\"status\":\"healthy\"}\n"
+  },
+  "GET /agents": {
+    "status": 200,
+    "content_length": 369,
+    "content_preview": "{\"agents\":[{\"description\":\"Specializes in CNC machining operations and toolpaths\",\"id\":\"machining-ex"
+  },
+  "GET /analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "GET /api/analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "GET /cad-analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "GET /api/cad-analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "GET /analyze": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "POST /": {
+    "status": 405,
+    "error": "Method Not Allowed"
+  },
+  "POST /health": {
+    "status": 405,
+    "error": "Method Not Allowed"
+  },
+  "POST /agents": {
+    "status": 405,
+    "error": "Method Not Allowed"
+  },
+  "POST /analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "POST /api/analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "POST /cad-analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "POST /api/cad-analysis": {
+    "status": 404,
+    "error": "Not Found"
+  },
+  "POST /analyze": {
+    "status": 404,
+    "error": "Not Found"
+  }
+}

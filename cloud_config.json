@@ -1,0 +1,12 @@
+{
+  "cloud_api_url": "https://freecad-copilot-service-501520737043.asia-south1.run.app",
+  "cloud_api_key": "dev_api_key_for_testing",
+  "default_analysis_endpoint": "/api/analysis/cad",
+  "fallback_endpoints": [
+    "/api/analysis/cad",
+    "/api/analysis"
+  ],
+  "use_cloud_backend": true,
+  "enable_auto_analysis": true,
+  "enable_debug_mode": true
+}

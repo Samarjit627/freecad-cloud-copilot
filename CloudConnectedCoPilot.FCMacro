@@ -1,0 +1,198 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+
+"""
+Cloud-Connected Manufacturing Co-Pilot for FreeCAD
+This macro provides manufacturing guidance using cloud-based AI agents
+"""
+
+import os
+import sys
+import traceback
+
+# Add the macro directory to the Python path
+macro_dir = os.path.dirname(os.path.realpath(__file__))
+if macro_dir not in sys.path:
+    sys.path.append(macro_dir)
+
+# Try to import Qt
+try:
+    from PySide2 import QtCore, QtGui, QtWidgets
+except ImportError:
+    try:
+        from PySide import QtCore, QtGui
+        from PySide import QtGui as QtWidgets
+    except ImportError:
+        print("Error: This macro requires PySide or PySide2 to be installed")
+        raise
+
+# Try to import FreeCAD modules
+try:
+    import FreeCAD
+    import FreeCADGui
+except ImportError:
+    print("Error: Cannot import FreeCAD modules. This macro must be run from within FreeCAD.")
+    raise
+
+# Import the macro modules
+try:
+    from macro.chat_interface import ManufacturingChatInterface
+    import macro.config as config
+    import macro.cloud_client as cloud_client
+except ImportError as e:
+    print(f"Error importing macro modules: {e}")
+    print("Make sure the 'macro' directory exists alongside this FCMacro file.")
+    raise
+
+class CloudConnectedCoPilotMacro:
+    """Main class for the Cloud-Connected Manufacturing Co-Pilot macro"""
+    
+    def __init__(self, use_task_panel=True):
+        """Initialize the macro"""
+        try:
+            # Print welcome message
+            print("Starting Cloud-Connected Manufacturing Co-Pilot...")
+            
+            # Create chat interface
+            self.chat_interface = ManufacturingChatInterface()
+            
+            if use_task_panel:
+                # Use FreeCAD's Task Panel
+                import FreeCADGui
+                
+                # Create a task panel class
+                class CoPilotTaskPanel:
+                    def __init__(self, widget):
+                        self.form = widget
+                        self.widget = widget
+                    
+                    def accept(self):
+                        return True
+                    
+                    def reject(self):
+                        return True
+                    
+                    def getStandardButtons(self):
+                        from PySide2 import QtCore
+                        # Only show a close button
+                        return QtCore.Qt.NoButton
+                
+                # Create the task panel
+                panel = CoPilotTaskPanel(self.chat_interface)
+                FreeCADGui.Control.showDialog(panel)
+                
+                print("✅ Co-Pilot loaded in FreeCAD Task Panel")
+                print("Look for the Co-Pilot interface in the Task panel on the left side")
+            else:
+                # Create standalone window
+                self.main_window = QtWidgets.QMainWindow()
+                self.main_window.setWindowTitle("☁️ Cloud-Connected Manufacturing Co-Pilot")
+                self.main_window.setMinimumSize(800, 600)
+                self.main_window.setCentralWidget(self.chat_interface)
+                
+                # Show the window and bring it to the front
+                self.main_window.show()
+                self.main_window.raise_()
+                self.main_window.activateWindow()
+                
+                print("✅ Co-Pilot loaded in separate window")
+            
+            # Print success message
+            print("Cloud-Connected Manufacturing Co-Pilot is ready!")
+            
+        except Exception as e:
+            print(f"Error initializing Cloud-Connected Manufacturing Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Cloud-Connected Manufacturing Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create a toolbar button in FreeCAD
+def create_copilot_button():
+    import FreeCADGui
+    
+    # Create command class
+    class CoPilotCommand:
+        def GetResources(self):
+            return {
+                'Pixmap': 'Std_Tool1', # Use a standard icon
+                'MenuText': 'Cloud Co-Pilot',
+                'ToolTip': 'Open the Cloud-Connected Manufacturing Co-Pilot'
+            }
+            
+        def Activated(self):
+            # This will be called when the button is clicked
+            print("Opening Cloud-Connected Manufacturing Co-Pilot...")
+            CloudConnectedCoPilotMacro()
+            
+        def IsActive(self):
+            return True
+    
+    # Register the command
+    FreeCADGui.addCommand('CloudCoPilot', CoPilotCommand())
+    
+    # Try to add to a toolbar
+    try:
+        # Try to add to the active workbench
+        if hasattr(FreeCADGui, "activeWorkbench"):
+            wb = FreeCADGui.activeWorkbench()
+            if hasattr(wb, "appendToolbar"):
+                wb.appendToolbar("Co-Pilot", ["CloudCoPilot"])
+                print("✅ Added Co-Pilot button to toolbar")
+                return
+        
+        # Alternative method - add to global toolbars
+        if hasattr(FreeCADGui, "addCommand"):
+            # Command is already registered above, just need to add it to a toolbar
+            mw = FreeCADGui.getMainWindow()
+            if mw:
+                # Find or create a Co-Pilot toolbar
+                toolbar_name = "Co-Pilot"
+                found = False
+                for tb in mw.findChildren(QtWidgets.QToolBar):
+                    if tb.windowTitle() == toolbar_name:
+                        found = True
+                        tb.addAction(FreeCADGui.Command.get("CloudCoPilot").getAction())
+                        break
+                
+                if not found:
+                    # Create a new toolbar
+                    tb = mw.addToolBar(toolbar_name)
+                    tb.addAction(FreeCADGui.Command.get("CloudCoPilot").getAction())
+                
+                print("✅ Added Co-Pilot button to custom toolbar")
+    except Exception as e:
+        print(f"Note: Could not add toolbar button: {e}")
+        print("You can still use the Co-Pilot through the Task Panel")
+
+# Create and run the macro
+if __name__ == "__main__":
+    # Print cloud connection status
+    try:
+        from macro import cloud_client, config
+        client = cloud_client.get_client()
+        print(f"\n\n===== CLOUD-CONNECTED CO-PILOT STATUS =====")
+        print(f"Cloud URL: {config.CLOUD_API_URL}")
+        print(f"Connected: {client.connected}")
+        if client.connected:
+            print("✅ Successfully connected to Cloud Service at:")
+            print(f"   {config.CLOUD_API_URL}")
+        else:
+            print(f"❌ Connection failed: {client.last_error}")
+        print("=============================================\n\n")
+    except Exception as e:
+        print(f"Error checking cloud connection: {e}")
+    
+    # Create the button in FreeCAD interface
+    try:
+        create_copilot_button()
+        print("Look for the 'Cloud Co-Pilot' button in the toolbar")
+    except Exception as e:
+        print(f"Could not create toolbar button: {e}")
+    
+    # Launch the Co-Pilot
+    CloudConnectedCoPilotMacro()

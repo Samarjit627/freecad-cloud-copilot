@@ -1,0 +1,1192 @@
+"""
+Improved Manufacturing Co-Pilot Macro for FreeCAD
+With fixed text visibility and improved UI
+"""
+
+import os
+import sys
+import traceback
+import threading
+import time
+from PySide2 import QtWidgets, QtCore, QtGui
+
+# Add macro directory to path
+MACRO_DIR = os.path.dirname(os.path.realpath(__file__))
+if MACRO_DIR not in sys.path:
+    sys.path.append(MACRO_DIR)
+
+# Add macro/macro subdirectory to path if it exists
+MACRO_SUBDIR = os.path.join(MACRO_DIR, 'macro')
+if os.path.exists(MACRO_SUBDIR) and MACRO_SUBDIR not in sys.path:
+    sys.path.append(MACRO_SUBDIR)
+
+# Import NL CAD integration
+import nl_cad_integration
+
+
+
+# Import local modules
+try:
+    import cloud_client, config, ai_engine
+    import chat_interface as chat_interface_module
+    import questionnaire
+    import cloud_cad_analyzer
+    import local_cad_analyzer
+except ImportError:
+    try:
+        import cloud_client
+        import config
+        import ai_engine
+        import chat_interface as chat_interface_module
+        import questionnaire
+        import cloud_cad_analyzer
+        import local_cad_analyzer
+    except ImportError as e:
+        print(f"Error importing modules: {e}")
+        print("Make sure all required files are in the macro directory.")
+
+# Define a built-in local analyzer in case the import fails
+class BuiltInLocalAnalyzer:
+    """Built-in local CAD analyzer for fallback when imports fail"""
+    
+    def __init__(self):
+        self.last_error = None
+        
+    def analyze_document(self, doc):
+        """Analyze a FreeCAD document locally
+        
+        Args:
+            doc: FreeCAD document
+            
+        Returns:
+            Dict with analysis results
+        """
+        import FreeCAD
+        import Part
+        
+        try:
+            # Basic metadata
+            result = {}
+            metadata = {}
+            
+            # Document name
+            metadata["name"] = doc.Name
+            
+            # Count objects
+            object_count = 0
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape"):
+                    object_count += 1
+            metadata["object_count"] = object_count
+            
+            # Get bounding box for dimensions
+            bbox = FreeCAD.BoundBox()
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape"):
+                    bbox.add(obj.Shape.BoundBox)
+                    
+            metadata["x_length"] = bbox.XLength
+            metadata["y_length"] = bbox.YLength
+            metadata["z_length"] = bbox.ZLength
+            
+            # Calculate volume and surface area
+            total_volume = 0
+            total_surface_area = 0
+            
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape"):
+                    total_volume += obj.Shape.Volume
+                    total_surface_area += obj.Shape.Area
+                    
+            metadata["volume"] = total_volume / 1000  # Convert to cm³
+            metadata["surface_area"] = total_surface_area / 100  # Convert to cm²
+            
+            # Estimate wall thickness (simplified)
+            metadata["min_wall_thickness"] = 1.0
+            metadata["max_wall_thickness"] = 5.0
+            metadata["avg_wall_thickness"] = 3.0
+            
+            # Add metadata to result
+            result["metadata"] = metadata
+            
+            # Add basic feature detection
+            features = {}
+            features["holes"] = []
+            features["fillets"] = []
+            features["chamfers"] = []
+            result["features"] = features
+            
+            # Add manufacturing insights
+            result["manufacturing_insights"] = [
+                "Consider adding draft angles for easier part removal from molds.",
+                "Wall thickness appears suitable for injection molding.",
+                "Design may benefit from additional reinforcement ribs."
+            ]
+            
+            # Set analysis type
+            result["analysis_type"] = "local"
+            
+            return result
+            
+        except Exception as e:
+            print(f"Error in built-in local analysis: {str(e)}")
+            return {
+                "error": str(e),
+                "analysis_type": "error",
+                "note": "Local analysis failed. Please check the model and try again."
+            }
+
+# Create a global instance for fallback
+_built_in_analyzer = BuiltInLocalAnalyzer()
+
+# Create a module-like object with get_analyzer function
+class BuiltInLocalAnalyzerModule:
+    @staticmethod
+    def get_analyzer():
+        return _built_in_analyzer
+        
+# Use this if local_cad_analyzer import fails
+if 'local_cad_analyzer' not in globals():
+    local_cad_analyzer = BuiltInLocalAnalyzerModule()
+
+class MessageWidget(QtWidgets.QWidget):
+    """A chat message widget with guaranteed text visibility"""
+    
+    def __init__(self, role, content, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.content = content
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Set up the UI for this message"""
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Header with role
+        header = QtWidgets.QLabel()
+        if self.role == "User":
+            header.setText("👤 You")
+            header.setStyleSheet("font-weight: bold; color: #2563eb;")
+        else:
+            header.setText("🤖 Manufacturing Co-Pilot")
+            header.setStyleSheet("font-weight: bold; color: #059669;")
+        
+        # Content with HTML formatting for guaranteed visibility
+        content_frame = QtWidgets.QFrame()
+        content_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        
+        # Style based on role
+        if self.role == "User":
+            bg_color = "#f3f4f6"
+        else:
+            bg_color = "#eef2ff"
+            
+        content_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {bg_color};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+        """)
+        
+        content_layout = QtWidgets.QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Use QLabel with HTML for guaranteed text visibility
+        content_label = QtWidgets.QLabel()
+        content_label.setWordWrap(True)
+        content_label.setTextFormat(QtCore.Qt.RichText)
+        content_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        
+        # Format content with markdown-like syntax
+        formatted_content = self._format_markdown(self.content)
+        content_label.setText(f"<div style='color: black;'>{formatted_content}</div>")
+        
+        content_layout.addWidget(content_label)
+        
+        layout.addWidget(header)
+        layout.addWidget(content_frame)
+    
+    def _format_markdown(self, text):
+        """Format text with basic markdown-like syntax"""
+        if not text:
+            return ""
+        
+        # Replace newlines with HTML breaks
+        text = text.replace("\n", "<br>")
+        
+        # Bold text
+        text = text.replace("**", "<b>", 1)
+        while "**" in text:
+            text = text.replace("**", "</b>", 1)
+            if "**" in text:
+                text = text.replace("**", "<b>", 1)
+        
+        # Italic text
+        text = text.replace("*", "<i>", 1)
+        while "*" in text:
+            text = text.replace("*", "</i>", 1)
+            if "*" in text:
+                text = text.replace("*", "<i>", 1)
+        
+        # Code text
+        text = text.replace("`", "<code>", 1)
+        while "`" in text:
+            text = text.replace("`", "</code>", 1)
+            if "`" in text:
+                text = text.replace("`", "<code>", 1)
+        
+        # Lists (simple implementation)
+        lines = text.split("<br>")
+        for i, line in enumerate(lines):
+            if line.strip().startswith("• "):
+                lines[i] = f"&nbsp;&nbsp;• {line.strip()[2:]}"
+            elif line.strip().startswith("- "):
+                lines[i] = f"&nbsp;&nbsp;• {line.strip()[2:]}"
+        
+        return "<br>".join(lines)
+
+# Use the ManufacturingChatInterface from the chat_interface module instead of defining it here
+    
+    def setup_ui(self):
+        """Set up the UI for the chat interface"""
+        self.setMinimumSize(600, 500)
+        
+        # Main layout
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header
+        header_layout = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Manufacturing Co-Pilot")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: black;")
+        
+        self.cloud_status = QtWidgets.QLabel("Cloud: Connecting...")
+        self.cloud_status.setStyleSheet("color: #6b7280;")
+        
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(self.cloud_status)
+        
+        layout.addLayout(header_layout)
+        
+        # Chat area
+        self.chat_scroll = QtWidgets.QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.chat_scroll.setStyleSheet("background-color: white; border: none;")
+        
+        self.chat_container = QtWidgets.QWidget()
+        self.chat_layout = QtWidgets.QVBoxLayout(self.chat_container)
+        self.chat_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.chat_layout.setSpacing(15)
+        
+        self.chat_scroll.setWidget(self.chat_container)
+        layout.addWidget(self.chat_scroll, 1)
+        
+        # Input area
+        input_layout = QtWidgets.QHBoxLayout()
+        
+        self.input_field = QtWidgets.QLineEdit()
+        self.input_field.setPlaceholderText("Ask about manufacturing...")
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+                background-color: white;
+                color: black;
+                font-size: 14px;
+            }
+        """)
+        self.input_field.returnPressed.connect(self.send_message)
+        
+        self.send_button = QtWidgets.QPushButton("Send")
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton:disabled {
+                background-color: #93c5fd;
+            }
+        """)
+        self.send_button.clicked.connect(self.send_message)
+        
+        input_layout.addWidget(self.input_field, 1)
+        input_layout.addWidget(self.send_button)
+        
+        layout.addLayout(input_layout)
+        
+        # Button area
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        self.analyze_button = QtWidgets.QPushButton("📊 Analyze CAD")
+        self.analyze_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.analyze_button.clicked.connect(self.analyze_cad)
+        
+        # Engineering analysis button removed - now integrated into the main CAD analysis
+        
+        self.clear_button = QtWidgets.QPushButton("🗑️ Clear Chat")
+        self.clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.clear_button.clicked.connect(self.clear_chat)
+        
+        button_layout.addWidget(self.analyze_button)
+        # Engineering analysis button removed - now integrated into main CAD analysis
+        button_layout.addWidget(self.clear_button)
+        button_layout.addStretch()
+        
+        layout.addLayout(button_layout)
+        
+        # Add welcome message
+        self.add_message("Assistant", "👋 Welcome to the Manufacturing Co-Pilot!\n\nI can help you with manufacturing questions and analyze your CAD models.\n\nHow can I assist you today?")
+        
+        # Integrate NL CAD
+        try:
+            nl_cad_integration.integrate_nl_cad(self)
+            print("NL CAD integrated successfully")
+        except Exception as e:
+            print(f"Failed to integrate NL CAD: {e}")
+    
+    def add_message(self, role, content):
+        """Add a message to the chat with guaranteed visibility"""
+        message = MessageWidget(role, content)
+        self.chat_layout.addWidget(message)
+        self.scroll_to_bottom()
+        QtWidgets.QApplication.processEvents()
+    
+    def scroll_to_bottom(self):
+        """Scroll to the bottom of the chat"""
+        self.chat_scroll.verticalScrollBar().setValue(
+            self.chat_scroll.verticalScrollBar().maximum()
+        )
+    
+    def send_message(self):
+        """Send a message from the input field"""
+        if self.is_processing:
+            return
+        
+        text = self.input_field.text().strip()
+        if not text:
+            return
+        
+        # Add user message
+        self.add_message("User", text)
+        self.input_field.clear()
+        
+        # Set processing state
+        self.is_processing = True
+        self.send_button.setEnabled(False)
+        self.send_button.setText("Processing...")
+        
+        # Start thread to get response
+        self.query_thread = QueryThread(self.cloud_client, text)
+        self.query_thread.response_ready.connect(self.handle_response)
+        self.query_thread.finished.connect(self.reset_ui)
+        self.query_thread.start()
+    
+    def handle_response(self, response):
+        """Handle the response from the AI"""
+        self.add_message("Assistant", response)
+    
+    def reset_ui(self):
+        """Reset the UI after processing"""
+        self.is_processing = False
+        self.send_button.setEnabled(True)
+        self.send_button.setText("Send")
+    
+    def analyze_cad(self):
+        """Analyze the active CAD document using the cloud-based CAD analyzer with minimal local fallback"""
+        try:
+            import FreeCAD
+            import Part
+            
+            if not FreeCAD.ActiveDocument:
+                self.add_message("Assistant", "❌ No active document. Please open a CAD model first.")
+                return
+                
+            # Show initial metadata while we wait for analysis
+            self._show_initial_metadata()
+            
+            # Try cloud analysis first
+            try:
+                print("Attempting cloud CAD analysis...")
+                
+                # Check if cloud service is available
+                if not self._check_cloud_service():
+                    print("⚠️ Cloud service unavailable, falling back to local analysis")
+                    # Add more detailed error information for diagnostics
+                    cloud_error_msg = "Cloud API endpoints not accessible. This is likely due to the API endpoints not being deployed on the cloud service."
+                    print(cloud_error_msg)
+                    raise Exception(cloud_error_msg)
+                
+                # Create cloud analyzer
+                cloud_analyzer = cloud_cad_analyzer.get_analyzer()
+                
+                # Analyze the document
+                cloud_result = cloud_analyzer.analyze_document(FreeCAD.ActiveDocument)
+                
+                # If we get here, cloud analysis succeeded
+                print("✅ Cloud analysis successful!")
+                self.handle_analysis(cloud_result)
+                return
+                
+            except Exception as cloud_error:
+                print(f"Error in cloud CAD analysis: {str(cloud_error)}")
+                print("⚠️ Falling back to local analysis...")
+                
+                # Add cloud error to the result for better diagnostics
+                cloud_error_info = {
+                    "cloud_error": str(cloud_error),
+                    "cloud_endpoints_tested": self.cloud_client.fallback_endpoints if hasattr(self.cloud_client, 'fallback_endpoints') else ["Unknown"],
+                    "cloud_url": self.cloud_client.api_url if hasattr(self.cloud_client, 'api_url') else "Unknown"
+                }
+                
+                try:
+                    # Try to use the local analyzer
+                    print("Using local CAD analyzer...")
+                    local_analyzer = local_cad_analyzer.get_analyzer()
+                    local_result = local_analyzer.analyze_document(FreeCAD.ActiveDocument)
+                    
+                    # Add cloud error info to local result for reference
+                    local_result["cloud_error"] = str(cloud_error)
+                    local_result["cloud_status"] = "Cloud analysis failed, using local results"
+                    
+                    # Handle the local analysis result
+                    print("✅ Local analysis completed as fallback")
+                    self.handle_analysis(local_result)
+                    return
+                    
+                except Exception as local_error:
+                    # Both cloud and local analysis failed
+                    print(f"Error in local CAD analysis: {str(local_error)}")
+                    error_result = {
+                        "error": f"Cloud error: {str(cloud_error)}\nLocal error: {str(local_error)}",
+                        "analysis_type": "error",
+                        "cloud_error_details": cloud_error_info,
+                        "note": "Unable to complete CAD analysis. The cloud service API endpoints are not accessible, and local analysis also failed."
+                    }
+                    self.handle_analysis(error_result)
+                    return
+                    
+        except Exception as e:
+            print(f"Catastrophic error in analyze_cad: {str(e)}")
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {str(e)}")
+            traceback.print_exc()
+            
+    def handle_analysis(self, analysis_result):
+        """Handle the analysis result"""
+        try:
+            # Format the analysis result as a message
+            message = self._format_analysis_result(analysis_result)
+            
+            # Add the message to the chat
+            self.add_message("Assistant", message)
+            
+        except Exception as e:
+            print(f"Error handling analysis result: {str(e)}")
+            self.add_message("Assistant", f"❌ Error processing analysis result: {str(e)}")
+            traceback.print_exc()
+            
+    # Engineering analysis method removed - now integrated into the main CAD analysis
+    def _check_cloud_service(self):
+        """Check if the cloud service is available by testing endpoints"""
+        try:
+            import requests
+            import time
+            import json
+            
+            # Try to connect to the health endpoint first
+            try:
+                # Use the cloud client instance that was created during initialization
+                if not self.cloud_client.test_connection():
+                    print("Cloud service health check failed")
+                    return False
+                    
+                print("Cloud service health check passed")
+            except Exception as e:
+                print(f"Error connecting to cloud service health endpoint: {str(e)}")
+                return False
+            
+            # Try to find a working analysis endpoint
+            # These are the endpoints we'll try in order
+            endpoints = [
+                "/api/analysis/cad",  # This is the correct endpoint from the FastAPI app
+                "/api/analysis",
+                "/analysis/cad",
+                "/analysis",
+                "/analyze-cad",
+                "/api/analyze-cad",
+                "/cad/analyze",
+                "/api/cad/analyze",
+                "/v1/analyze",
+                "/v1/cad-analysis"
+            ]
+            
+            # First check if we already have a successful endpoint from previous runs
+            if hasattr(self.cloud_client, 'last_successful_endpoint') and self.cloud_client.last_successful_endpoint:
+                print(f"Using previously successful endpoint: {self.cloud_client.last_successful_endpoint}")
+                return True
+            
+            # Log all endpoints we're going to test
+            print(f"Testing {len(endpoints)} cloud analysis endpoints...")
+            
+            # Track all responses for diagnostics
+            endpoint_results = {}
+            
+            # Try each endpoint with a minimal payload
+            for endpoint in endpoints:
+                try:
+                    # Make a small test request to see if endpoint exists
+                    minimal_payload = {
+                        "test": True,
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                    }
+                    
+                    url = f"{self.cloud_client.api_url}{endpoint}"
+                    print(f"Testing endpoint: {url}")
+                    
+                    # Set up headers with API key if available
+                    headers = {"Content-Type": "application/json"}
+                    if hasattr(self.cloud_client, 'api_key') and self.cloud_client.api_key:
+                        headers["X-API-Key"] = self.cloud_client.api_key
+                        print(f"Using API key: {self.cloud_client.api_key[:5]}...")
+                    
+                    # Make the request with a short timeout
+                    response = requests.post(url, json=minimal_payload, headers=headers, timeout=5)
+                    
+                    # Record the result for diagnostics
+                    endpoint_results[endpoint] = {
+                        "status_code": response.status_code,
+                        "response_text": response.text[:100] + "..." if len(response.text) > 100 else response.text
+                    }
+                    
+                    # If we get a 200 OK, this endpoint works
+                    if response.status_code == 200:
+                        print(f"Found working endpoint: {endpoint}")
+                        self.cloud_client.last_successful_endpoint = endpoint
+                        return True
+                    else:
+                        print(f"Endpoint {endpoint} returned status code {response.status_code}")
+                        
+                except Exception as e:
+                    print(f"Error testing endpoint {endpoint}: {str(e)}")
+                    endpoint_results[endpoint] = {"error": str(e)}
+                    continue
+            
+            # No working endpoints found - log detailed diagnostics
+            print("No working cloud analysis endpoints found")
+            print("Endpoint test results:")
+            print(json.dumps(endpoint_results, indent=2))
+            
+            # Save diagnostics to a file for troubleshooting
+            try:
+                diagnostics_file = os.path.join(MACRO_DIR, "cloud_diagnostics.json")
+                with open(diagnostics_file, "w") as f:
+                    json.dump({
+                        "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+                        "cloud_url": self.cloud_client.api_url,
+                        "endpoints_tested": endpoints,
+                        "results": endpoint_results
+                    }, f, indent=2)
+                print(f"Saved diagnostics to {diagnostics_file}")
+            except Exception as save_error:
+                print(f"Error saving diagnostics: {str(save_error)}")
+                
+            return False
+            
+        except Exception as e:
+            print(f"Error checking cloud service: {str(e)}")
+            return False
+            
+    def _minimal_local_analysis(self, doc):
+        """Perform minimal local analysis - just enough to show something useful"""
+        import FreeCAD
+        
+        # Create a very minimal result
+        result = {}
+        metadata = {}
+        
+        # Document name
+        metadata["name"] = doc.Name
+        
+        # Count objects
+        object_count = 0
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape"):
+                object_count += 1
+        metadata["object_count"] = object_count
+        
+        # Get bounding box for dimensions
+        bbox = FreeCAD.BoundBox()
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape"):
+                bbox.add(obj.Shape.BoundBox)
+                
+        metadata["x_length"] = bbox.XLength
+        metadata["y_length"] = bbox.YLength
+        metadata["z_length"] = bbox.ZLength
+        
+        # Add metadata to result
+        result["metadata"] = metadata
+        
+        # Add note about cloud features
+        result["note"] = "This is a minimal local analysis. Connect to cloud for full feature analysis."
+        result["analysis_type"] = "local"
+        
+        # Add placeholder for manufacturing insights
+        result["manufacturing_insights"] = [
+            "For detailed manufacturing insights, please connect to the cloud service."
+        ]
+        
+        print("✅ Minimal local analysis completed")
+        return result
+            
+    def _perform_local_analysis(self, doc):
+        """Perform local CAD analysis when cloud analysis fails"""
+        import FreeCAD
+        import Part
+        
+        # Basic metadata
+        result = {}
+        metadata = {}
+        
+        # Document name
+        metadata["name"] = doc.Name
+        
+        # Count objects
+        object_count = 0
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape"):
+                object_count += 1
+        metadata["object_count"] = object_count
+        
+        # Get bounding box for dimensions
+        bbox = FreeCAD.BoundBox()
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape"):
+                bbox.add(obj.Shape.BoundBox)
+                
+        metadata["x_length"] = bbox.XLength
+        metadata["y_length"] = bbox.YLength
+        metadata["z_length"] = bbox.ZLength
+        
+        # Calculate volume and surface area
+        total_volume = 0
+        total_surface_area = 0
+        
+        for obj in doc.Objects:
+            if hasattr(obj, "Shape"):
+                total_volume += obj.Shape.Volume
+                total_surface_area += obj.Shape.Area
+                
+        metadata["volume"] = total_volume / 1000  # Convert to cm³
+        metadata["surface_area"] = total_surface_area / 100  # Convert to cm²
+        
+        # Estimate wall thickness (simplified)
+        metadata["min_wall_thickness"] = 1.0
+        metadata["max_wall_thickness"] = 5.0
+        metadata["avg_wall_thickness"] = 3.0
+        
+        # Add metadata to result
+        result["metadata"] = metadata
+        
+        # Add basic feature detection
+        features = {}
+        features["holes"] = []
+        features["fillets"] = []
+        features["chamfers"] = []
+        result["features"] = features
+        
+        # Add manufacturing insights
+        result["manufacturing_insights"] = [
+            "Consider adding draft angles for easier part removal from molds.",
+            "Wall thickness appears suitable for injection molding.",
+            "Design may benefit from additional reinforcement ribs."
+        ]
+        
+        print("✅ Local analysis completed successfully as fallback")
+        return result
+    
+    def handle_analysis(self, analysis):
+        """Handle the CAD analysis results"""
+        if "error" in analysis:
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {analysis['error']}")
+            return
+        
+        # Format the analysis results
+        self._display_analysis_results(analysis)
+        
+        # Prompt for questionnaire
+        self.add_message("Assistant", "Would you like to start the manufacturing questionnaire now to get more detailed insights?")
+        
+    def _show_initial_metadata(self):
+        """Show initial metadata while waiting for cloud analysis"""
+        try:
+            doc = FreeCAD.ActiveDocument
+            
+            # Basic metadata that can be extracted quickly
+            message = "📊 **Basic Model Information**\n\n"
+            message += f"**Model Name:** {doc.Name}\n"
+            
+            # Count objects
+            part_count = 0
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape"):
+                    part_count += 1
+            
+            message += f"**Part Count:** {part_count}\n"
+            
+            # Get bounding box for basic dimensions
+            try:
+                shapes = []
+                for obj in doc.Objects:
+                    if hasattr(obj, "Shape"):
+                        shapes.append(obj.Shape)
+                
+                if shapes:
+                    # Create a compound shape
+                    import Part
+                    compound = Part.makeCompound(shapes)
+                    bbox = compound.BoundBox
+                    
+                    # Add bounding box dimensions
+                    message += f"**Dimensions (mm):** {bbox.XLength:.2f} × {bbox.YLength:.2f} × {bbox.ZLength:.2f}\n"
+            except Exception as e:
+                print(f"Error calculating bounding box: {str(e)}")
+                
+            message += "\n🔄 **Starting CAD analysis...**\n"
+            message += "Attempting cloud-based analysis first. If cloud service is unavailable, will fall back to local analysis.\n"
+            message += "This may take a moment as we analyze features like holes, fillets, chamfers, and wall thickness."
+            
+            self.add_message("Assistant", message)
+            
+        except Exception as e:
+            print(f"Error showing initial metadata: {str(e)}")
+    
+    def _display_analysis_results(self, analysis):
+        """Display the CAD analysis results in the chat interface"""
+        try:
+            # Check analysis type and format header accordingly
+            analysis_type = analysis.get("analysis_type", "unknown")
+            
+            # Create a single unified header for all analysis results
+            message = "✅ **CAD Analysis Results**\n\n"
+            
+            # Add source information as a note, not a separate section
+            if analysis_type == "cloud":
+                message += "*Analysis source: Cloud service*\n\n"
+            elif analysis_type == "local":
+                message += "*Analysis source: Local analysis (cloud unavailable)*\n\n"
+                
+                # Add cloud error as a note if available
+                if "cloud_error" in analysis:
+                    message += f"*Note: Cloud service error: {analysis['cloud_error']}*\n\n"
+            elif analysis_type == "error":
+                message = "❌ **CAD Analysis Failed**\n\n"
+                
+                if "error" in analysis:
+                    message += f"*{analysis['error']}*\n\n"
+                    
+                if "note" in analysis:
+                    message += f"*{analysis['note']}*\n\n"
+                    
+                # Add specific errors if available
+                if "cloud_error" in analysis:
+                    message += f"*Cloud error: {analysis['cloud_error']}*\n\n"
+                    
+                if "local_error" in analysis:
+                    message += f"*Local error: {analysis['local_error']}*\n\n"
+                    
+                # Return early since we can't display other analysis data
+                self.add_message("Assistant", message)
+                return
+            
+            # Model information - all in a single section
+            if "metadata" in analysis:
+                metadata = analysis["metadata"]
+                
+                if "name" in metadata:
+                    message += f"• **Name:** {metadata['name']}\n"
+                
+                if "object_count" in metadata:
+                    message += f"• **Part Count:** {metadata['object_count']}\n"
+            
+            # Prefer engineering dimensions over metadata dimensions
+            if "dimensions" in analysis:
+                dims = analysis["dimensions"]
+                message += f"• **Dimensions:** {dims.get('length_x', 0):.2f} × {dims.get('width_y', 0):.2f} × {dims.get('height_z', 0):.2f} mm\n"
+                
+                # Surface area only - no volume as requested
+                if "surface_area" in dims:
+                    message += f"• **Surface Area:** {dims.get('surface_area', 0)/100:.2f} cm²\n"
+            # Fall back to metadata dimensions if engineering analysis didn't provide them
+            elif "metadata" in analysis and all(key in metadata for key in ["x_length", "y_length", "z_length"]):
+                message += f"• **Dimensions:** {metadata.get('x_length', 0):.2f} × {metadata.get('y_length', 0):.2f} × {metadata.get('z_length', 0):.2f} mm\n"
+                
+                # Surface area only - no volume as requested
+                if "surface_area" in metadata:
+                    message += f"• **Surface Area:** {metadata['surface_area']:.2f} cm²\n"
+                    
+            # Add wall thickness information in the same section
+            if "wall_thickness" in analysis:
+                wt = analysis["wall_thickness"]
+                message += f"• **Wall Thickness:** Min {wt.get('min', 0):.2f} mm, Max {wt.get('max', 0):.2f} mm, Avg {wt.get('average', 0):.2f} mm\n"
+            # Fall back to metadata wall thickness if engineering analysis didn't provide it
+            elif "metadata" in analysis and "min_wall_thickness" in analysis["metadata"]:
+                message += f"• **Wall Thickness:** Min {metadata['min_wall_thickness']:.2f} mm, Max {metadata['max_wall_thickness']:.2f} mm, Avg {metadata['avg_wall_thickness']:.2f} mm\n"
+            
+            # Add feature counts directly in the same section
+            if "features" in analysis:
+                features = analysis["features"]
+                
+                # Debug: Print features structure to console
+                print("\nDEBUG - Features structure in _display_analysis_results:")
+                print(f"Features keys: {list(features.keys()) if isinstance(features, dict) else 'Not a dictionary'}")
+                
+                # Remove holes and ribs from features dict if they somehow still exist
+                if "holes" in features:
+                    del features["holes"]
+                if "ribs" in features:
+                    del features["ribs"]
+                
+                # Only display fillets and chamfers - holes and ribs have been removed
+                if "fillets" in features:
+                    message += f"• **Fillets:** {len(features['fillets'])}\n"
+                    print(f"Fillets found: {len(features['fillets'])}")
+                else:
+                    print("No 'fillets' key in features")
+                
+                if "chamfers" in features:
+                    message += f"• **Chamfers:** {len(features['chamfers'])}\n"
+                    print(f"Chamfers found: {len(features['chamfers'])}")
+                else:
+                    print("No 'chamfers' key in features")
+                    
+                # Handle additional features that might be in the cloud response
+                if "thin_walls" in features:
+                    message += f"• **Thin Walls:** {len(features['thin_walls'])}\n"
+                    print(f"Thin walls found: {len(features['thin_walls'])}")
+                    
+                if "sharp_corners" in features:
+                    message += f"• **Sharp Corners:** {len(features['sharp_corners'])}\n"
+                    print(f"Sharp corners found: {len(features['sharp_corners'])}")
+                    
+                if "undercuts" in features:
+                    message += f"• **Undercuts:** {len(features['undercuts'])}\n"
+                    print(f"Undercuts found: {len(features['undercuts'])}")
+                    
+                # Add any other feature types that might be present
+                for key in features.keys():
+                    if key not in ["holes", "fillets", "chamfers", "ribs", "thin_walls", "sharp_corners", "undercuts"]:
+                        message += f"• **{key.replace('_', ' ').title()}:** {len(features[key])}\n"
+                        print(f"{key} found: {len(features[key])}")
+            else:
+                print("DEBUG: No 'features' key in analysis results")
+                
+            # Add manufacturing complexity and ratings in the same unified section
+            if "manufacturability" in analysis:
+                mfg = analysis["manufacturability"]
+                
+                if "score" in mfg:
+                    message += f"• **Manufacturing Score:** {mfg['score']}/100\n"
+                
+                if "complexity" in mfg:
+                    message += f"• **Manufacturing Complexity:** {mfg['complexity']}/10\n"
+                
+                if "insights" in mfg and isinstance(mfg["insights"], list):
+                    # Add insights directly to the main section
+                    for insight in mfg["insights"]:
+                        message += f"• **Insight:** {insight}\n"
+            # Fall back to old manufacturing features if engineering analysis didn't provide it
+            elif "manufacturing_features" in analysis and isinstance(analysis["manufacturing_features"], dict):
+                mf = analysis["manufacturing_features"]
+                
+                # Remove holes and ribs from manufacturing features if they somehow still exist
+                if "holes" in mf:
+                    del mf["holes"]
+                if "ribs" in mf:
+                    del mf["ribs"]
+                    
+                if "complexity_rating" in mf:
+                    message += f"• **Manufacturing Complexity:** {mf['complexity_rating']}\n"
+                    
+                if "moldability_score" in mf:
+                    message += f"• **Moldability Score:** {mf['moldability_score']}\n"
+                    
+                if "manufacturability_index" in mf:
+                    message += f"• **Manufacturability Index:** {mf['manufacturability_index']}\n"
+            
+            self.add_message("Assistant", message)
+            
+        except Exception as e:
+            error_message = f"❌ Error displaying analysis results: {str(e)}"
+            self.add_message("Assistant", error_message)
+            print(f"Error in _display_analysis_results: {str(e)}")
+            traceback.print_exc()
+            
+    def reset_chat(self):
+        """Reset the chat interface"""
+        # Remove all messages
+        while self.chat_layout.count() > 0:
+            item = self.chat_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Add welcome message again
+        self.add_message("Assistant", "👋 Welcome to the Manufacturing Co-Pilot!\n\nI can help you with manufacturing questions and analyze your CAD models.\n\nHow can I assist you today?")
+    
+    def clear_chat(self):
+        """Clear the chat history"""
+        # Remove all messages
+        while self.chat_layout.count() > 0:
+            item = self.chat_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Add welcome message again
+        self.add_message("Assistant", "👋 Welcome to the Manufacturing Co-Pilot!\n\nI can help you with manufacturing questions and analyze your CAD models.\n\nHow can I assist you today?")
+    
+    def check_cloud_connection(self):
+        """Check cloud connection"""
+        self.cloud_thread = CloudThread(self.cloud_client)
+        self.cloud_thread.status_ready.connect(self.update_cloud_status)
+        self.cloud_thread.start()
+    
+    def update_cloud_status(self, connected):
+        """Update cloud connection status"""
+        if connected:
+            self.cloud_status.setText("Cloud: Connected ✅")
+            self.cloud_status.setStyleSheet("color: #059669;")
+        else:
+            self.cloud_status.setText("Cloud: Disconnected ❌")
+            self.cloud_status.setStyleSheet("color: #dc2626;")
+
+class QueryThread(QtCore.QThread):
+    """Thread for querying the AI"""
+    response_ready = QtCore.Signal(str)
+    
+    def __init__(self, cloud_client, query):
+        super().__init__()
+        self.cloud_client = cloud_client
+        self.query = query
+    
+    def run(self):
+        try:
+            if self.cloud_client and self.cloud_client.connected:
+                # Use default agent for now
+                # Use the api/cad endpoint instead of machining-expert
+                response_data = self.cloud_client.query_agent("api/cad", self.query)
+                
+                # Extract response text
+                if isinstance(response_data, dict):
+                    response = response_data.get("response", str(response_data))
+                else:
+                    response = str(response_data)
+                
+                # Ensure response is visible
+                if not response or response.strip() == "":
+                    response = "[Empty response received from server]"
+                
+                self.response_ready.emit(response)
+            else:
+                self.response_ready.emit("❌ Cloud service is not connected. Please check your internet connection.")
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            self.response_ready.emit(error_msg)
+
+class AnalyzeThread(QtCore.QThread):
+    """Thread for analyzing CAD using cloud services"""
+    analysis_ready = QtCore.Signal(dict)
+    
+    def __init__(self, cloud_analyzer):
+        super().__init__()
+        self.cloud_analyzer = cloud_analyzer
+    
+    def run(self):
+        try:
+            import FreeCAD
+            import Part
+            
+            # First try cloud analysis
+            try:
+                print("Attempting cloud-based CAD analysis...")
+                analysis = self.cloud_analyzer.analyze_document(FreeCAD.ActiveDocument)
+                
+                # If we get here, cloud analysis succeeded
+                analysis["analysis_type"] = "cloud"  # Ensure this is set
+                self.analysis_ready.emit(analysis)
+                return
+            except Exception as cloud_error:
+                # Cloud analysis failed, log the error
+                print(f"Error in cloud CAD analysis: {str(cloud_error)}")
+                print("⚠️ Falling back to local CAD analysis...")
+                
+                # Try local analysis as fallback
+                try:
+                    # Use the built-in local analyzer we defined at the top of the file
+                    # This ensures we always have a fallback even if imports fail
+                    local_result = _built_in_analyzer.analyze_document(FreeCAD.ActiveDocument)
+                    
+                    # Add fallback info
+                    local_result["analysis_type"] = "local"
+                    local_result["cloud_error"] = str(cloud_error)
+                    local_result["note"] = "Cloud analysis unavailable. Using limited local analysis."
+                    
+                    print("✅ Local analysis completed successfully as fallback")
+                    self.analysis_ready.emit(local_result)
+                    return
+                except Exception as local_error:
+                    # Both cloud and local analysis failed
+                    print(f"Error in local CAD analysis: {str(local_error)}")
+                    error_result = {
+                        "analysis_type": "error",
+                        "cloud_error": str(cloud_error),
+                        "local_error": str(local_error),
+                        "error": "Both cloud and local analysis failed",
+                        "note": "Unable to complete CAD analysis. Please check logs for details."
+                    }
+                    self.analysis_ready.emit(error_result)
+                    return
+        except Exception as e:
+            # Something catastrophic went wrong
+            print(f"Catastrophic error in analysis thread: {str(e)}")
+            self.analysis_ready.emit({"error": str(e), "analysis_type": "error"})
+
+class CloudThread(QtCore.QThread):
+    """Thread for checking cloud connection"""
+    status_ready = QtCore.Signal(bool)
+    
+    def __init__(self, cloud_client):
+        super().__init__()
+        self.cloud_client = cloud_client
+    
+    def run(self):
+        try:
+            if self.cloud_client:
+                connected = self.cloud_client.test_connection()
+            else:
+                connected = False
+            self.status_ready.emit(connected)
+        except Exception:
+            self.status_ready.emit(False)
+
+class ImprovedCoPilotMacro:
+    """Main class for the Improved Manufacturing Co-Pilot macro"""
+    
+    def __init__(self):
+        """Initialize the macro"""
+        try:
+            print("\nStarting Improved Manufacturing Co-Pilot...")
+            
+            # Import required modules
+            import FreeCAD
+            import FreeCADGui
+            from PySide import QtCore, QtGui, QtWidgets
+            import traceback
+            import time
+            import requests
+            
+            # Import local modules
+            try:
+                from macro import cloud_client, config, ai_engine, chat_interface, questionnaire
+                from macro import cloud_cad_analyzer, local_cad_analyzer
+            except ImportError:
+                # Try direct import if not in a package
+                import cloud_client, config, ai_engine, chat_interface, questionnaire
+                import cloud_cad_analyzer, local_cad_analyzer
+            
+            # Check cloud connection
+            self.cloud_client = cloud_client.get_client()
+            print(f"Cloud URL: {self.cloud_client.api_url}")
+            print(f"Connected: {self.cloud_client.connected}")
+            
+            # Store the cloud client as a class attribute for later use
+            ImprovedCoPilotMacro.cloud_client_instance = self.cloud_client
+            
+            if self.cloud_client.connected:
+                print("✅ Successfully connected to Cloud Service")
+            
+            # Create task panel
+            import FreeCADGui
+            
+            # Create a task panel class
+            class CoPilotTaskPanel:
+                def __init__(self, widget):
+                    self.form = widget
+                    self.widget = widget
+                
+                def accept(self):
+                    return True
+                
+                def reject(self):
+                    return True
+                
+                def getStandardButtons(self):
+                    return 0
+            
+            # Create the streamlined manufacturing chat interface
+            self.chat_interface = chat_interface_module.ManufacturingChatInterface()
+            
+            # Register the chat interface with the chat_interface_module for global access
+            chat_interface_module.register_interface(self.chat_interface)
+            
+            # Check if there's an active task dialog and close it first
+            try:
+                if FreeCADGui.Control.activeDialog():
+                    FreeCADGui.Control.closeDialog()
+                    print("Closed existing task dialog")
+            except Exception as dialog_err:
+                print(f"Note when checking active dialog: {dialog_err}")
+                
+            # Create the task panel
+            panel = CoPilotTaskPanel(self.chat_interface)
+            FreeCADGui.Control.showDialog(panel)
+            
+            print("✅ Improved Co-Pilot loaded in FreeCAD Task Panel")
+            print("Improved Co-Pilot is ready!")
+            
+        except Exception as e:
+            print(f"Error initializing Improved Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Improved Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create and run the macro
+if __name__ == "__main__":
+    ImprovedCoPilotMacro()

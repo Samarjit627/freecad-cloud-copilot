@@ -1,0 +1,189 @@
+{
+  "timestamp": "2025-07-12T13:59:57",
+  "cloud_api_url": "https://freecad-copilot-service-501520737043.asia-south1.run.app",
+  "working_get": [
+    {
+      "endpoint": "/",
+      "method": "GET",
+      "status": 200,
+      "working": true
+    },
+    {
+      "endpoint": "/health",
+      "method": "GET",
+      "status": 200,
+      "working": true
+    },
+    {
+      "endpoint": "/agents",
+      "method": "GET",
+      "status": 200,
+      "working": true
+    }
+  ],
+  "working_post": [],
+  "failed": [
+    {
+      "endpoint": "/api",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/v1",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/v1",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/analyze",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/analyze",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/cad-analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/cad-analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/cad/analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/cad/analysis",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/chat",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/chat",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/docs",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/docs",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/swagger",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/openapi",
+      "method": "GET",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/analyze",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/analyze",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/cad-analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/cad-analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/cad/analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/cad/analysis",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/chat",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    },
+    {
+      "endpoint": "/api/chat",
+      "method": "POST",
+      "status": 404,
+      "working": false
+    }
+  ]
+}

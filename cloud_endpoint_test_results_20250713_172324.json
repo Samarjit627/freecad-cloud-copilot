@@ -1,0 +1,154 @@
+[
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/",
+    "response": {
+      "message": "FreeCAD Manufacturing Co-Pilot API",
+      "status": "running"
+    }
+  },
+  {
+    "status": 200,
+    "exists": true,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/health",
+    "response": {
+      "status": "healthy"
+    }
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis/cad",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis/cad",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/cad-analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analyze",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/chat",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/agents",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/docs",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "GET",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/openapi.json",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/analysis/cad",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/api/v1/analysis/cad",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/cad-analysis",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  },
+  {
+    "status": 404,
+    "exists": false,
+    "method": "POST",
+    "url": "https://freecad-copilot-service-501520737043.asia-south1.run.app/analyze",
+    "response": "<!DOCTYPE HTML PUBLIC \"-//W3C//DTD HTML 3.2 Final//EN\">\n<title>404 Not Found</title>\n<h1>Not Found</h1>\n<p>The requested URL was not found on the server. If you entered the URL manually please check y..."
+  }
+]

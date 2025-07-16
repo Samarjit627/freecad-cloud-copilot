@@ -1,0 +1,569 @@
+"""
+Diagnostic Manufacturing Co-Pilot Macro for FreeCAD
+Helps identify and fix UI display issues
+"""
+
+import os
+import sys
+import traceback
+import json
+from PySide2 import QtWidgets, QtCore, QtGui
+
+# Add macro directory to path
+MACRO_DIR = os.path.dirname(os.path.realpath(__file__))
+if MACRO_DIR not in sys.path:
+    sys.path.append(MACRO_DIR)
+
+# Import local modules
+try:
+    from macro import cloud_client, config, cad_analyzer, ai_engine
+except ImportError:
+    print("Error importing modules. Make sure all required files are in the macro directory.")
+    raise
+
+class DiagnosticMessageWidget(QtWidgets.QWidget):
+    """A diagnostic message widget that shows text with multiple styling options"""
+    
+    def __init__(self, role, content, parent=None):
+        super().__init__(parent)
+        self.role = role
+        self.content = content
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Set up the UI for this message"""
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Header with role and debug info
+        header = QtWidgets.QLabel()
+        if self.role == "User":
+            header.setText("👤 You")
+            header.setStyleSheet("font-weight: bold; color: #2563eb;")
+        else:
+            header.setText("🤖 Manufacturing Co-Pilot [DEBUG MODE]")
+            header.setStyleSheet("font-weight: bold; color: #059669;")
+        
+        # Debug info about content
+        debug_info = QtWidgets.QLabel()
+        debug_info.setText(f"Content length: {len(self.content)} chars | Type: {type(self.content).__name__}")
+        debug_info.setStyleSheet("color: #6b7280; font-size: 10px;")
+        
+        # Content with multiple display options
+        content_tabs = QtWidgets.QTabWidget()
+        
+        # Option 1: QLabel with HTML
+        html_tab = QtWidgets.QWidget()
+        html_layout = QtWidgets.QVBoxLayout(html_tab)
+        html_label = QtWidgets.QLabel()
+        html_label.setWordWrap(True)
+        html_label.setTextFormat(QtCore.Qt.RichText)
+        html_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        html_label.setText(f"<div style='color: black;'>{self.content}</div>")
+        html_layout.addWidget(html_label)
+        content_tabs.addTab(html_tab, "HTML")
+        
+        # Option 2: QTextBrowser
+        browser_tab = QtWidgets.QWidget()
+        browser_layout = QtWidgets.QVBoxLayout(browser_tab)
+        text_browser = QtWidgets.QTextBrowser()
+        text_browser.setStyleSheet("color: black; background-color: white;")
+        text_browser.setPlainText(self.content)
+        browser_layout.addWidget(text_browser)
+        content_tabs.addTab(browser_tab, "Browser")
+        
+        # Option 3: Plain QLabel
+        plain_tab = QtWidgets.QWidget()
+        plain_layout = QtWidgets.QVBoxLayout(plain_tab)
+        plain_label = QtWidgets.QLabel()
+        plain_label.setWordWrap(True)
+        plain_label.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        plain_label.setText(self.content)
+        plain_label.setStyleSheet("color: black; background-color: white;")
+        plain_layout.addWidget(plain_label)
+        content_tabs.addTab(plain_tab, "Plain")
+        
+        # Option 4: Raw text
+        raw_tab = QtWidgets.QWidget()
+        raw_layout = QtWidgets.QVBoxLayout(raw_tab)
+        raw_edit = QtWidgets.QTextEdit()
+        raw_edit.setReadOnly(True)
+        raw_edit.setStyleSheet("color: black; background-color: white;")
+        raw_edit.setText(repr(self.content))
+        raw_layout.addWidget(raw_edit)
+        content_tabs.addTab(raw_tab, "Raw")
+        
+        # Style the content container
+        if self.role == "User":
+            bg_color = "#f3f4f6"
+        else:
+            bg_color = "#eef2ff"
+            
+        content_frame = QtWidgets.QFrame()
+        content_frame.setFrameShape(QtWidgets.QFrame.StyledPanel)
+        content_frame.setStyleSheet(f"""
+            QFrame {{
+                background-color: {bg_color};
+                border-radius: 8px;
+                padding: 8px;
+            }}
+        """)
+        
+        content_layout = QtWidgets.QVBoxLayout(content_frame)
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.addWidget(content_tabs)
+        
+        layout.addWidget(header)
+        layout.addWidget(debug_info)
+        layout.addWidget(content_frame)
+
+class DiagnosticChatInterface(QtWidgets.QWidget):
+    """A diagnostic chat interface for the Manufacturing Co-Pilot"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cloud_client = cloud_client.get_client()
+        self.cad_analyzer = cad_analyzer.AdvancedCADAnalyzer()
+        self.ai_engine = ai_engine.ManufacturingIntelligenceEngine()
+        self.is_processing = False
+        self.setup_ui()
+        self.check_cloud_connection()
+    
+    def setup_ui(self):
+        """Set up the UI for the chat interface"""
+        self.setMinimumSize(700, 500)
+        
+        # Main layout
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Header
+        header_layout = QtWidgets.QHBoxLayout()
+        title = QtWidgets.QLabel("Manufacturing Co-Pilot [DIAGNOSTIC MODE]")
+        title.setStyleSheet("font-size: 16px; font-weight: bold; color: black;")
+        
+        self.cloud_status = QtWidgets.QLabel("Cloud: Connecting...")
+        self.cloud_status.setStyleSheet("color: #6b7280;")
+        
+        header_layout.addWidget(title)
+        header_layout.addStretch()
+        header_layout.addWidget(self.cloud_status)
+        
+        layout.addLayout(header_layout)
+        
+        # Debug info panel
+        debug_panel = QtWidgets.QGroupBox("Debug Information")
+        debug_panel.setStyleSheet("color: black;")
+        debug_layout = QtWidgets.QFormLayout(debug_panel)
+        
+        self.debug_cloud_url = QtWidgets.QLabel(config.CLOUD_API_URL)
+        self.debug_cloud_url.setStyleSheet("color: black;")
+        debug_layout.addRow("Cloud URL:", self.debug_cloud_url)
+        
+        self.debug_connection = QtWidgets.QLabel("Checking...")
+        self.debug_connection.setStyleSheet("color: black;")
+        debug_layout.addRow("Connection:", self.debug_connection)
+        
+        self.debug_last_response = QtWidgets.QLabel("None")
+        self.debug_last_response.setStyleSheet("color: black;")
+        debug_layout.addRow("Last Response:", self.debug_last_response)
+        
+        layout.addWidget(debug_panel)
+        
+        # Separator
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.HLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Sunken)
+        layout.addWidget(separator)
+        
+        # Chat area
+        self.chat_scroll = QtWidgets.QScrollArea()
+        self.chat_scroll.setWidgetResizable(True)
+        self.chat_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+        self.chat_scroll.setStyleSheet("background-color: white; border: none;")
+        
+        self.chat_container = QtWidgets.QWidget()
+        self.chat_layout = QtWidgets.QVBoxLayout(self.chat_container)
+        self.chat_layout.setAlignment(QtCore.Qt.AlignTop)
+        self.chat_layout.setSpacing(15)
+        
+        self.chat_scroll.setWidget(self.chat_container)
+        layout.addWidget(self.chat_scroll, 1)
+        
+        # Input area
+        input_layout = QtWidgets.QHBoxLayout()
+        
+        self.input_field = QtWidgets.QLineEdit()
+        self.input_field.setPlaceholderText("Ask about manufacturing...")
+        self.input_field.setStyleSheet("""
+            QLineEdit {
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+                background-color: white;
+                color: black;
+                font-size: 14px;
+            }
+        """)
+        self.input_field.returnPressed.connect(self.send_message)
+        
+        self.send_button = QtWidgets.QPushButton("Send")
+        self.send_button.setStyleSheet("""
+            QPushButton {
+                background-color: #2563eb;
+                color: white;
+                border: none;
+                border-radius: 8px;
+                padding: 8px 16px;
+                font-weight: bold;
+            }
+            QPushButton:hover {
+                background-color: #1d4ed8;
+            }
+            QPushButton:disabled {
+                background-color: #93c5fd;
+            }
+        """)
+        self.send_button.clicked.connect(self.send_message)
+        
+        input_layout.addWidget(self.input_field, 1)
+        input_layout.addWidget(self.send_button)
+        
+        layout.addLayout(input_layout)
+        
+        # Button area
+        button_layout = QtWidgets.QHBoxLayout()
+        
+        self.analyze_button = QtWidgets.QPushButton("📊 Analyze CAD")
+        self.analyze_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.analyze_button.clicked.connect(self.analyze_cad)
+        
+        self.clear_button = QtWidgets.QPushButton("🗑️ Clear Chat")
+        self.clear_button.setStyleSheet("""
+            QPushButton {
+                background-color: white;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #f9fafb;
+            }
+        """)
+        self.clear_button.clicked.connect(self.clear_chat)
+        
+        self.test_button = QtWidgets.QPushButton("🧪 Test Message Display")
+        self.test_button.setStyleSheet("""
+            QPushButton {
+                background-color: #fef3c7;
+                color: #92400e;
+                border: 1px solid #f59e0b;
+                border-radius: 8px;
+                padding: 8px 12px;
+            }
+            QPushButton:hover {
+                background-color: #fde68a;
+            }
+        """)
+        self.test_button.clicked.connect(self.test_message_display)
+        
+        button_layout.addWidget(self.analyze_button)
+        button_layout.addWidget(self.clear_button)
+        button_layout.addWidget(self.test_button)
+        button_layout.addStretch()
+        
+        layout.addLayout(button_layout)
+        
+        # Add welcome message
+        self.add_message("Assistant", "👋 Welcome to the Diagnostic Co-Pilot!\n\nThis version will help identify display issues with messages.\n\nTry sending a message or use the 'Test Message Display' button to check different display options.")
+    
+    def add_message(self, role, content):
+        """Add a message to the chat"""
+        message = DiagnosticMessageWidget(role, content)
+        self.chat_layout.addWidget(message)
+        self.scroll_to_bottom()
+        QtWidgets.QApplication.processEvents()
+    
+    def scroll_to_bottom(self):
+        """Scroll to the bottom of the chat"""
+        self.chat_scroll.verticalScrollBar().setValue(
+            self.chat_scroll.verticalScrollBar().maximum()
+        )
+    
+    def send_message(self):
+        """Send a message from the input field"""
+        if self.is_processing:
+            return
+        
+        text = self.input_field.text().strip()
+        if not text:
+            return
+        
+        # Add user message
+        self.add_message("User", text)
+        self.input_field.clear()
+        
+        # Set processing state
+        self.is_processing = True
+        self.send_button.setEnabled(False)
+        self.send_button.setText("Processing...")
+        
+        # Start thread to get response
+        self.query_thread = DiagnosticQueryThread(self.cloud_client, text)
+        self.query_thread.response_ready.connect(self.handle_response)
+        self.query_thread.debug_info.connect(self.update_debug_info)
+        self.query_thread.finished.connect(self.reset_ui)
+        self.query_thread.start()
+    
+    def handle_response(self, response):
+        """Handle the response from the AI"""
+        self.add_message("Assistant", response)
+    
+    def update_debug_info(self, info):
+        """Update debug information"""
+        self.debug_last_response = QtWidgets.QLabel(info)
+        self.debug_last_response.setStyleSheet("color: black; font-family: monospace;")
+        self.debug_last_response.setWordWrap(True)
+    
+    def reset_ui(self):
+        """Reset the UI after processing"""
+        self.is_processing = False
+        self.send_button.setEnabled(True)
+        self.send_button.setText("Send")
+    
+    def analyze_cad(self):
+        """Analyze the current CAD document"""
+        try:
+            import FreeCAD
+            if not FreeCAD.ActiveDocument:
+                self.add_message("Assistant", "⚠️ No active document. Please open a CAD file first.")
+                return
+            
+            self.add_message("Assistant", "🔍 Analyzing your CAD model...")
+            
+            # Start thread to analyze CAD
+            self.analyze_thread = DiagnosticAnalyzeThread(self.cad_analyzer)
+            self.analyze_thread.analysis_ready.connect(self.handle_analysis)
+            self.analyze_thread.start()
+            
+        except Exception as e:
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {str(e)}")
+    
+    def handle_analysis(self, analysis):
+        """Handle the CAD analysis results"""
+        if "error" in analysis:
+            self.add_message("Assistant", f"❌ Error analyzing CAD: {analysis['error']}")
+            return
+        
+        # Format analysis results
+        result = "📊 <b>CAD Analysis Results</b><br><br>"
+        
+        if "name" in analysis:
+            result += f"<b>Model:</b> {analysis['name']}<br>"
+        
+        if "metrics" in analysis:
+            metrics = analysis["metrics"]
+            result += "<br><b>Metrics:</b><br>"
+            if "volume" in metrics:
+                result += f"• Volume: {metrics['volume']:.2f} mm³<br>"
+            if "surface_area" in metrics:
+                result += f"• Surface Area: {metrics['surface_area']:.2f} mm²<br>"
+            if "object_count" in metrics:
+                result += f"• Object Count: {metrics['object_count']}<br>"
+        
+        if "complexity" in analysis:
+            result += f"<br><b>Complexity:</b> {analysis['complexity']}<br>"
+        
+        self.add_message("Assistant", result)
+    
+    def clear_chat(self):
+        """Clear the chat history"""
+        # Remove all messages
+        while self.chat_layout.count() > 0:
+            item = self.chat_layout.takeAt(0)
+            if item.widget():
+                item.widget().deleteLater()
+        
+        # Add welcome message again
+        self.add_message("Assistant", "👋 Welcome to the Diagnostic Co-Pilot!\n\nThis version will help identify display issues with messages.\n\nTry sending a message or use the 'Test Message Display' button to check different display options.")
+    
+    def check_cloud_connection(self):
+        """Check cloud connection"""
+        self.cloud_thread = DiagnosticCloudThread(self.cloud_client)
+        self.cloud_thread.status_ready.connect(self.update_cloud_status)
+        self.cloud_thread.start()
+    
+    def update_cloud_status(self, connected):
+        """Update cloud connection status"""
+        if connected:
+            self.cloud_status.setText("Cloud: Connected ✅")
+            self.cloud_status.setStyleSheet("color: #059669;")
+            self.debug_connection.setText("Connected ✅")
+            self.debug_connection.setStyleSheet("color: #059669;")
+        else:
+            self.cloud_status.setText("Cloud: Disconnected ❌")
+            self.cloud_status.setStyleSheet("color: #dc2626;")
+            self.debug_connection.setText("Disconnected ❌")
+            self.debug_connection.setStyleSheet("color: #dc2626;")
+    
+    def test_message_display(self):
+        """Test different message display options"""
+        test_message = """This is a test message with different formatting:
+        
+• Bold text: **bold**
+• Italic text: *italic*
+• Code: `code`
+• List item 1
+• List item 2
+        
+This message should be visible in all display modes."""
+        
+        self.add_message("Assistant", test_message)
+
+class DiagnosticQueryThread(QtCore.QThread):
+    """Thread for querying the AI with diagnostic information"""
+    response_ready = QtCore.Signal(str)
+    debug_info = QtCore.Signal(str)
+    
+    def __init__(self, cloud_client, query):
+        super().__init__()
+        self.cloud_client = cloud_client
+        self.query = query
+    
+    def run(self):
+        try:
+            if self.cloud_client and self.cloud_client.connected:
+                # Use default agent for now
+                response_data = self.cloud_client.query_agent("machining-expert", self.query)
+                
+                # Extract response text
+                if isinstance(response_data, dict):
+                    response = response_data.get("response", str(response_data))
+                    # Send debug info
+                    self.debug_info.emit(json.dumps(response_data, indent=2)[:200] + "...")
+                else:
+                    response = str(response_data)
+                    self.debug_info.emit(f"Non-dict response: {type(response_data)}")
+                
+                # Ensure response is visible
+                if not response or response.strip() == "":
+                    response = "[Empty response received from server]"
+                
+                self.response_ready.emit(response)
+            else:
+                self.response_ready.emit("❌ Cloud service is not connected. Please check your internet connection.")
+                self.debug_info.emit("No connection to cloud service")
+        except Exception as e:
+            error_msg = f"❌ Error: {str(e)}"
+            self.response_ready.emit(error_msg)
+            self.debug_info.emit(f"Exception: {traceback.format_exc()}")
+
+class DiagnosticAnalyzeThread(QtCore.QThread):
+    """Thread for analyzing CAD with diagnostics"""
+    analysis_ready = QtCore.Signal(dict)
+    
+    def __init__(self, cad_analyzer):
+        super().__init__()
+        self.cad_analyzer = cad_analyzer
+    
+    def run(self):
+        try:
+            import FreeCAD
+            analysis = self.cad_analyzer.analyze_document(FreeCAD.ActiveDocument)
+            self.analysis_ready.emit(analysis)
+        except Exception as e:
+            self.analysis_ready.emit({"error": str(e)})
+
+class DiagnosticCloudThread(QtCore.QThread):
+    """Thread for checking cloud connection with diagnostics"""
+    status_ready = QtCore.Signal(bool)
+    
+    def __init__(self, cloud_client):
+        super().__init__()
+        self.cloud_client = cloud_client
+    
+    def run(self):
+        try:
+            if self.cloud_client:
+                connected = self.cloud_client.test_connection()
+            else:
+                connected = False
+            self.status_ready.emit(connected)
+        except Exception:
+            self.status_ready.emit(False)
+
+class DiagnosticCoPilotMacro:
+    """Main class for the Diagnostic Manufacturing Co-Pilot macro"""
+    
+    def __init__(self):
+        """Initialize the macro"""
+        try:
+            # Print welcome message
+            print("\nStarting Diagnostic Manufacturing Co-Pilot...")
+            
+            # Check cloud connection status
+            try:
+                client = cloud_client.get_client()
+                print(f"Cloud URL: {config.CLOUD_API_URL}")
+                print(f"Connected: {client.connected}")
+                if client.connected:
+                    print("✅ Successfully connected to Cloud Service")
+                else:
+                    print(f"❌ Connection failed: {client.last_error}")
+            except Exception as e:
+                print(f"Error checking cloud connection: {e}")
+            
+            # Create task panel
+            import FreeCADGui
+            
+            # Create a task panel class
+            class CoPilotTaskPanel:
+                def __init__(self, widget):
+                    self.form = widget
+                    self.widget = widget
+                
+                def accept(self):
+                    return True
+                
+                def reject(self):
+                    return True
+                
+                def getStandardButtons(self):
+                    return 0
+            
+            # Create the chat interface
+            self.chat_interface = DiagnosticChatInterface()
+            
+            # Create the task panel
+            panel = CoPilotTaskPanel(self.chat_interface)
+            FreeCADGui.Control.showDialog(panel)
+            
+            print("✅ Diagnostic Co-Pilot loaded in FreeCAD Task Panel")
+            print("Diagnostic Co-Pilot is ready!")
+            
+        except Exception as e:
+            print(f"Error initializing Diagnostic Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None, 
+                "Initialization Error",
+                f"Failed to initialize the Diagnostic Co-Pilot:\n\n{str(e)}"
+            )
+
+# Create and run the macro
+if __name__ == "__main__":
+    DiagnosticCoPilotMacro()

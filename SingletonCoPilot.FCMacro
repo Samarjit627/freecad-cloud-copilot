@@ -1,0 +1,255 @@
+"""
+SingletonCoPilot - Manufacturing Co-Pilot with Strict Singleton Pattern
+A FreeCAD macro that provides AI-powered manufacturing intelligence
+with enhanced UI and cloud backend integration.
+
+This version implements a strict singleton pattern to prevent multiple
+instances of the UI from being created.
+
+Author: Samarjit
+License: MIT
+Version: 1.0.0
+"""
+
+import os
+import sys
+import traceback
+from PySide2 import QtWidgets, QtCore
+
+# Global singleton instance tracker
+_SINGLETON_INSTANCE = None
+
+class SingletonCoPilotMacro:
+    """Manufacturing Co-Pilot Macro with strict singleton enforcement"""
+    
+    def __init__(self):
+        """Initialize the macro with strict singleton enforcement"""
+        global _SINGLETON_INSTANCE
+        
+        print("\n=== INITIALIZING SINGLETON CO-PILOT ===\n")
+        
+        # If an instance already exists, activate it and return
+        if _SINGLETON_INSTANCE is not None:
+            print("Co-Pilot is already running - activating existing instance")
+            self.activate_existing_instance()
+            return
+        
+        # Set ourselves as the singleton instance
+        _SINGLETON_INSTANCE = self
+        
+        # Run the macro
+        try:
+            self.run()
+        except Exception as e:
+            # Reset the singleton instance if there's an error
+            _SINGLETON_INSTANCE = None
+            raise e
+    
+    def activate_existing_instance(self):
+        """Find and activate any existing Co-Pilot windows"""
+        try:
+            # Import required modules
+            import FreeCADGui
+            from PySide2 import QtWidgets
+            
+            # First check for task panel
+            activated = False
+            if FreeCADGui.Control.activeDialog():
+                try:
+                    dialog = FreeCADGui.Control.activeDialog()
+                    if hasattr(dialog, 'form') and hasattr(dialog.form, 'windowTitle'):
+                        title = dialog.form.windowTitle()
+                        if 'Co-Pilot' in title:
+                            print(f"Found existing Co-Pilot task panel: {title}")
+                            # Try to bring it to front
+                            dialog.form.activateWindow()
+                            dialog.form.raise_()
+                            activated = True
+                except Exception as e:
+                    print(f"Error activating task panel: {e}")
+            
+            # Then check for any top-level widgets
+            if not activated:
+                for widget in QtWidgets.QApplication.topLevelWidgets():
+                    try:
+                        if hasattr(widget, 'windowTitle'):
+                            title = widget.windowTitle()
+                            if 'Co-Pilot' in title:
+                                print(f"Found existing Co-Pilot window: {title}")
+                                widget.activateWindow()
+                                widget.raise_()
+                                activated = True
+                                break
+                    except Exception as widget_err:
+                        print(f"Error checking widget: {widget_err}")
+            
+            # Show a message to the user
+            QtWidgets.QMessageBox.information(
+                None,
+                "Co-Pilot Already Running",
+                "Manufacturing Co-Pilot is already running. Using the existing instance."
+            )
+            
+        except Exception as e:
+            print(f"Error activating existing instance: {e}")
+            traceback.print_exc()
+    
+    def run(self):
+        """Run the macro"""
+        try:
+            print("\n=== STARTING SINGLETON CO-PILOT ===\n")
+            
+            # Import required modules
+            import os
+            import sys
+            import traceback
+            from PySide2 import QtWidgets, QtCore
+            import FreeCADGui
+            
+            # Get the macro directory path
+            macro_dir = os.path.dirname(os.path.realpath(__file__))
+            print(f"Macro directory: {macro_dir}")
+            
+            # Add macro directory to path if not already there
+            if macro_dir not in sys.path:
+                sys.path.append(macro_dir)
+                print(f"Added {macro_dir} to sys.path")
+            
+            # Add macro/macro subdirectory to path
+            modules_dir = os.path.join(macro_dir, "macro")
+            if os.path.exists(modules_dir) and modules_dir not in sys.path:
+                sys.path.append(modules_dir)
+                print(f"Added {modules_dir} to sys.path")
+            
+            # First, check for any active FreeCAD task dialogs and close them
+            print("Checking for active FreeCAD task dialogs...")
+            try:
+                if FreeCADGui.Control.activeDialog():
+                    dialog = FreeCADGui.Control.activeDialog()
+                    if hasattr(dialog, 'form') and hasattr(dialog.form, 'windowTitle'):
+                        title = dialog.form.windowTitle()
+                        print(f"Found active dialog: {title}")
+                        if 'Co-Pilot' in title:
+                            print("Closing existing Co-Pilot dialog")
+                            FreeCADGui.Control.closeDialog()
+            except Exception as dialog_err:
+                print(f"Error checking/closing task dialogs: {dialog_err}")
+            
+            # Import chat interface module
+            print("Importing chat interface module...")
+            try:
+                from macro import chat_interface
+            except ImportError:
+                # Try direct import if not in a package
+                import chat_interface
+            
+            # Try to import other required modules
+            try:
+                from macro import cloud_client, config
+            except ImportError:
+                # Try direct import if not in a package
+                import cloud_client, config
+            
+            # Clean up any existing instances
+            print("\n=== CLEANING UP EXISTING INSTANCES ===\n")
+            chat_interface.ManufacturingChatInterface.cleanup_instances()
+            
+            # Check cloud connection
+            print("\n=== CHECKING CLOUD CONNECTION ===\n")
+            self.cloud_client = cloud_client.get_client()
+            print(f"Cloud URL: {self.cloud_client.api_url}")
+            print(f"Connected: {self.cloud_client.connected}")
+            
+            # Create the manufacturing chat interface
+            print("\n=== CREATING NEW CHAT INTERFACE ===\n")
+            self.chat_interface = chat_interface.ManufacturingChatInterface()
+            
+            # Register the chat interface for global access
+            chat_interface.register_interface(self.chat_interface)
+            print("Registered chat interface for global access")
+                
+            # Create a task panel class with proper singleton cleanup
+            class CoPilotTaskPanel:
+                def __init__(self, widget):
+                    self.form = widget
+                    self.widget = widget
+                    # Set the window title to help with detection
+                    self.widget.setWindowTitle("Manufacturing Co-Pilot")
+                    print("CoPilotTaskPanel initialized with widget")
+                
+                def accept(self):
+                    print("\n=== COPILOT TASK PANEL CLOSING (ACCEPT) ===\n")
+                    # Reset the singleton instance when closed
+                    self._cleanup()
+                    return True
+                
+                def reject(self):
+                    print("\n=== COPILOT TASK PANEL CLOSING (REJECT) ===\n")
+                    # Reset the singleton instance when closed
+                    self._cleanup()
+                    return True
+                
+                def _cleanup(self):
+                    """Centralized cleanup method"""
+                    # Reset the singleton instance
+                    global _SINGLETON_INSTANCE
+                    _SINGLETON_INSTANCE = None
+                    print("Reset global _SINGLETON_INSTANCE to None")
+                    
+                    # Clean up chat interface instances
+                    try:
+                        from macro import chat_interface
+                        chat_interface.ManufacturingChatInterface.cleanup_instances()
+                        print("Cleaned up chat interface instances")
+                    except Exception as e:
+                        print(f"Error cleaning up chat interface instances: {e}")
+                
+                def getStandardButtons(self):
+                    return 0
+            
+            # Create and show the task panel
+            print("\n=== CREATING TASK PANEL ===\n")
+            panel = CoPilotTaskPanel(self.chat_interface)
+            FreeCADGui.Control.showDialog(panel)
+            print("Task panel shown")
+            
+            print("\n=== SINGLETON CO-PILOT STARTED SUCCESSFULLY ===\n")
+            
+        except Exception as e:
+            print(f"Error running Co-Pilot: {e}")
+            traceback.print_exc()
+            
+            # Reset the singleton instance
+            global _SINGLETON_INSTANCE
+            _SINGLETON_INSTANCE = None
+            
+            # Show error message
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Co-Pilot Error",
+                f"Failed to start Manufacturing Co-Pilot:\n\n{str(e)}"
+            )
+
+# Main entry point
+if __name__ == "__main__":
+    print("\n=== SINGLETON CO-PILOT MACRO STARTING ===\n")
+    
+    try:
+        # Create the macro - our singleton pattern will handle the rest
+        SingletonCoPilotMacro()
+    except Exception as e:
+        print(f"ERROR starting Co-Pilot: {e}")
+        traceback.print_exc()
+        
+        # Show error message
+        try:
+            from PySide2 import QtWidgets
+            QtWidgets.QMessageBox.critical(
+                None,
+                "Co-Pilot Error",
+                f"Failed to start Manufacturing Co-Pilot:\n\n{str(e)}"
+            )
+        except Exception as msg_err:
+            print(f"Error showing message: {msg_err}")
+    
+    print("\n=== SINGLETON CO-PILOT MACRO INITIALIZATION COMPLETE ===\n")
