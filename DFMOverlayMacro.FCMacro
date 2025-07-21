@@ -1,0 +1,13 @@
+
+import FreeCAD
+
+def run_dfm_check():
+    print("🔍 Running simulated DFM analysis...")
+    violations = [
+        {"face_index": 3, "issue": "Wall too thin", "severity": "high"},
+        {"face_index": 7, "issue": "Hole too small", "severity": "medium"}
+    ]
+    for v in violations:
+        print(f"🚨 Face {v['face_index']}: {v['issue']} (Severity: {v['severity']})")
+
+run_dfm_check()

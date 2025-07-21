@@ -11,12 +11,18 @@ from datetime import datetime
 import os
 import openai
 
+# Import agent modules
+from app.agents import dfm_agent
+
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Initialize router
 router = APIRouter()
+
+# Include agent-specific routers
+router.include_router(dfm_agent.router, prefix="/dfm", tags=["DFM"])
 
 # OpenAI configuration
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")

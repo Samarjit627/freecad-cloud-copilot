@@ -4,6 +4,7 @@ Handles chat completions and conversation management
 """
 import os
 import logging
+import requests
 from fastapi import APIRouter, HTTPException, Depends
 from pydantic import BaseModel
 from typing import List, Dict, Optional, Any
@@ -50,6 +51,113 @@ async def get_chat_completion(request: ChatRequest):
         # Generate a conversation ID if not present
         conversation_id = f"conv_{datetime.now().strftime('%Y%m%d%H%M%S')}"
         
+        # Check if this is a DFM analysis request
+        query_lower = request.query.lower()
+        if ("dfm" in query_lower or 
+            "check for manufacturability" in query_lower or
+            "design for manufacturing" in query_lower or
+            "check this part" in query_lower or
+            "manufacturable" in query_lower):
+            
+            logger.info("DFM analysis request detected")
+            
+            # Extract CAD analysis data if available
+            part_name = "Unknown Part"
+            material = "ABS"  # Default material
+            min_wall_thickness = 0.8  # Default thickness in mm
+            fillet_radius = 0.3  # Default fillet radius in mm
+            draft_angle = 0.5  # Default draft angle in degrees
+            has_undercuts = False  # Default undercut status
+            
+            # Use CAD analysis data if available
+            if request.cad_analysis:
+                # Extract from engineering analysis if available
+                if "engineering_analysis" in request.cad_analysis:
+                    eng = request.cad_analysis.get("engineering_analysis", {})
+                    thickness_data = eng.get("thickness", {})
+                    features_data = eng.get("features", {})
+                    
+                    part_name = request.cad_analysis.get("name", part_name)
+                    material = request.cad_analysis.get("material", material)
+                    min_wall_thickness = thickness_data.get("min", min_wall_thickness)
+                    
+                    # Extract fillet radius from engineering analysis
+                    if "fillets" in features_data and features_data["fillets"]:
+                        fillets = features_data["fillets"]
+                        fillet_radii = [f.get("radius", 0) for f in fillets if isinstance(f, dict) and "radius" in f]
+                        if fillet_radii:
+                            fillet_radius = min(fillet_radii)
+                    
+                    # Extract draft angle and undercut information
+                    draft_angle = min(
+                        1.0,  # Default minimum
+                        features_data.get("min_draft_angle", draft_angle)
+                    )
+                    has_undercuts = features_data.get("undercuts_count", 0) > 0
+                
+                # Fall back to basic dimensions if engineering analysis not available
+                else:
+                    dims = request.cad_analysis.get("dimensions", {})
+                    features = request.cad_analysis.get("manufacturing_features", {})
+                    
+                    part_name = request.cad_analysis.get("name", part_name)
+                    material = request.cad_analysis.get("material", material)
+                    min_wall_thickness = dims.get("thickness", min_wall_thickness)
+                    fillet_radius = features.get("min_fillet_radius", fillet_radius)
+                    draft_angle = features.get("min_draft_angle", draft_angle)
+                    has_undercuts = features.get("has_undercuts", has_undercuts)
+            
+            # Prepare DFM input
+            dfm_input = {
+                "part_name": part_name,
+                "material": material,
+                "min_wall_thickness_mm": min_wall_thickness,
+                "fillet_radius_mm": fillet_radius,
+                "draft_angle_deg": draft_angle,
+                "has_undercuts": has_undercuts
+            }
+            
+            try:
+                # Call the DFM check endpoint (internal call)
+                # For local development, we use direct API call
+                from app.agents.dfm_agent import check_dfm
+                from app.agents.dfm_agent import DFMInput
+                
+                # Convert dict to pydantic model
+                dfm_request = DFMInput(**dfm_input)
+                dfm_result = check_dfm(dfm_request)
+                
+                # Format the response
+                response_text = f"DFM Analysis for {dfm_result.part_name}:\n\n"
+                
+                if not dfm_result.violations:
+                    response_text += "✅ No manufacturability issues detected!\n"
+                else:
+                    for v in dfm_result.violations:
+                        emoji = {"critical": "🚨", "warning": "⚠️", "info": "ℹ️"}.get(v.severity, "")
+                        response_text += f"{emoji} {v.rule}: {v.message}\n"
+                
+                response_text += "\nWould you like detailed recommendations to improve manufacturability?"
+                
+                # Store conversation
+                if conversation_id not in conversations:
+                    conversations[conversation_id] = []
+                
+                conversations[conversation_id].append({"role": "user", "content": request.query})
+                conversations[conversation_id].append({"role": "assistant", "content": response_text})
+                
+                return ChatResponse(
+                    response=response_text,
+                    conversation_id=conversation_id,
+                    timestamp=datetime.now().isoformat()
+                )
+                
+            except Exception as e:
+                logger.error(f"DFM check error: {e}")
+                # Fall back to regular chat completion if DFM check fails
+                logger.info("Falling back to regular chat completion")
+        
+        # Regular chat completion flow
         # Build system prompt
         system_prompt = build_system_prompt(request.cad_analysis, request.user_context, request.mode)
         

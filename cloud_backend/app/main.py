@@ -12,7 +12,8 @@ from typing import Dict, List, Optional, Any
 import openai
 from datetime import datetime
 
-from app.routers import chat, analysis, agents
+from cloud_backend.app.routers import chat, analysis, agents
+
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
