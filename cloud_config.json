@@ -6,7 +6,11 @@
     "/api/analysis/cad",
     "/api/analysis"
   ],
+  "dfm_endpoint": "/api/analysis/cad",
   "use_cloud_backend": true,
   "enable_auto_analysis": true,
-  "enable_debug_mode": true
+  "enable_debug_mode": true,
+  "connection_timeout": 30,
+  "retry_count": 3,
+  "use_dedicated_dfm_endpoint": false
 }

@@ -13,15 +13,16 @@ Version: 1.0.0
 
 import os
 import sys
-import traceback
 import json
 import time
-import re
-import math
 import random
 import requests
+import traceback
+import re
+import math
+from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 from datetime import datetime
-from typing import Dict, List, Any, Optional
+from PySide2 import QtWidgets, QtCore, QtGui
 
 # Try to import FreeCAD modules
 try:
@@ -931,14 +932,29 @@ class CloudApiClient:
         # Load cloud configuration
         cloud_config = self.load_cloud_config()
         
+        # Store the entire config in the instance
+        self.config = cloud_config
+        
         # Set API URL and key from config or parameters
         self.api_url = api_url or cloud_config.get("cloud_api_url", "https://freecad-copilot-service-501520737043.asia-south1.run.app")
         self.api_key = api_key or cloud_config.get("cloud_api_key", "dev_api_key_for_testing")
+        self.default_analysis_endpoint = self.default_analysis_endpoint or cloud_config.get("default_analysis_endpoint", "/api/analysis/cad")
+        self.timeout = cloud_config.get("connection_timeout", 10)  # Default timeout in seconds
         
-        # Set other properties
-        self.timeout = 30  # seconds
+        # Print debug info about DFM endpoint
+        if "dfm_endpoint" in cloud_config:
+            print(f"DEBUG: Loaded DFM endpoint from config: {cloud_config['dfm_endpoint']}")
+        else:
+            print("DEBUG: No DFM endpoint found in config")
+            # Add default DFM endpoint if not present
+            # Use the analysis endpoint for DFM since the dedicated DFM endpoint doesn't exist
+            self.config["dfm_endpoint"] = "/api/analysis/cad"
         self.last_error = None
         self.connected = False
+        self.connection_quality = "unknown"  # unknown, poor, fair, good, excellent
+        self.last_latency = 0  # in ms
+        self.last_check_time = 0
+        self.connection_listeners = []  # callbacks for connection status changes
         
         # Test connection on init
         self.test_connection()
@@ -946,12 +962,107 @@ class CloudApiClient:
     def test_connection(self) -> bool:
         """Test connection to the cloud API"""
         try:
-            response = self._make_request("/health", method="GET")
-            self.connected = True
-            return True
+            # Load timeout from config or use default
+            cloud_config = self.load_cloud_config()
+            timeout = cloud_config.get("connection_timeout", 10)
+            retry_count = cloud_config.get("retry_count", 3)
+            
+            # Try multiple endpoints for reliability
+            endpoints_to_try = ["/api/health", "/health", "/api/status", "/"]
+            
+            # Add a test for the DFM endpoint if configured
+            if hasattr(self, 'config') and 'dfm_endpoint' in self.config:
+                dfm_endpoint = self.config['dfm_endpoint']
+                if dfm_endpoint and dfm_endpoint not in endpoints_to_try:
+                    # Add a health check version of the DFM endpoint
+                    dfm_base = dfm_endpoint.split('/check')[0] if '/check' in dfm_endpoint else dfm_endpoint
+                    dfm_health = f"{dfm_base}/health"
+                    endpoints_to_try.insert(0, dfm_health)  # Try DFM health endpoint first
+            
+            print(f"Testing connection with endpoints: {endpoints_to_try}")
+            
+            # Try each endpoint with retries
+            for endpoint in endpoints_to_try:
+                for attempt in range(retry_count):
+                    try:
+                        start_time = time.time()
+                        response = self._make_request(endpoint, method="GET", timeout=timeout)
+                        end_time = time.time()
+                        
+                        # Calculate latency in milliseconds
+                        latency = int((end_time - start_time) * 1000)
+                        self.last_latency = latency
+                        self.last_check_time = time.time()
+                        
+                        # Determine connection quality based on latency
+                        if latency < 200:
+                            self.connection_quality = "excellent"
+                        elif latency < 500:
+                            self.connection_quality = "good"
+                        elif latency < 1000:
+                            self.connection_quality = "fair"
+                        else:
+                            self.connection_quality = "poor"
+                        
+                        # Connection successful
+                        old_status = self.connected
+                        self.connected = True
+                        
+                        # Notify listeners if status changed
+                        if not old_status and self.connected:
+                            self._notify_connection_change()
+                        
+                        print(f"Successfully connected to cloud API via {endpoint}")
+                        return True
+                    except Exception as e:
+                        print(f"Attempt {attempt+1}/{retry_count} failed for endpoint {endpoint}: {str(e)}")
+                        if attempt == retry_count - 1:
+                            continue  # Try next endpoint
+                        time.sleep(0.5)  # Brief delay between retries
+            
+            # If we get here, all endpoints failed
+            self.last_error = "Failed to connect to any API endpoint"
+            old_status = self.connected
+            self.connected = False
+            self.connection_quality = "poor"  # Set to poor instead of unknown for UI clarity
+            
+            # Try one more time with the default API key
+            print("Trying connection with default API key...")
+            self.api_key = "dev_api_key_for_testing"
+            
+            # Try the most reliable endpoint with the default key
+            try:
+                response = self._make_request("/health", method="GET", timeout=timeout)
+                print("Connection successful with default API key")
+                self.connected = True
+                self.connection_quality = "fair"
+                
+                # Update the config file with the working API key
+                if hasattr(self, 'config'):
+                    self.config["cloud_api_key"] = self.api_key
+                    self._save_config_to_file()
+                    
+                # Notify listeners of the connection change
+                self._notify_connection_change()
+                return True
+            except Exception as e:
+                print(f"Connection with default API key also failed: {str(e)}")
+            
+            # Notify listeners if status changed
+            if old_status and not self.connected:
+                self._notify_connection_change()
+            
+            return False
         except Exception as e:
             self.last_error = str(e)
+            old_status = self.connected
             self.connected = False
+            self.connection_quality = "unknown"
+            
+            # Notify listeners if status changed
+            if old_status and not self.connected:
+                self._notify_connection_change()
+            
             return False
     
     def get_chat_response(self, message: str) -> Dict[str, Any]:
@@ -959,6 +1070,33 @@ class CloudApiClient:
         try:
             # Get active document info if available
             cad_data = self._get_cad_data()
+            
+            # Check if this is a DFM analysis request
+            message_lower = message.lower()
+            dfm_terms = [
+                "dfm", 
+                "check for manufacturability",
+                "design for manufacturing",
+                "manufacturable",
+                "3d print",
+                "3d printing",
+                "printable",
+                "can this be printed",
+                "can this be manufactured",
+                "cnc",
+                "machining",
+                "machinable",
+                "manufacturing issues",
+                "manufacturing problems",
+                "manufacturing constraints",
+                "check this part"
+            ]
+            # Log the message for debugging
+            print(f"DEBUG: Checking if message is DFM request: '{message}'")
+            
+            # Check if any DFM term is in the message
+            is_dfm_request = any(term in message_lower for term in dfm_terms)
+            print(f"DEBUG: Is DFM request: {is_dfm_request}")
             
             # Prepare payload for analysis endpoint
             payload = {
@@ -968,39 +1106,272 @@ class CloudApiClient:
                 "cad_data": cad_data
             }
             
-            # Try the default analysis endpoint first
-            try:
-                response = self._make_request(self.default_analysis_endpoint, payload=payload)
-                return response
-            except Exception as first_error:
-                print(f"Primary endpoint failed: {str(first_error)}")
+            # Determine which endpoint to use
+            endpoint = self.default_analysis_endpoint
+            
+            # Debug config information
+            print(f"DEBUG: Has config attribute: {hasattr(self, 'config')}")
+            if hasattr(self, 'config'):
+                print(f"DEBUG: Config keys: {list(self.config.keys())}")
+                print(f"DEBUG: DFM endpoint in config: {'dfm_endpoint' in self.config}")
+                if 'dfm_endpoint' in self.config:
+                    print(f"DEBUG: DFM endpoint value: {self.config['dfm_endpoint']}")
+            
+            # If this is a DFM request and dfm_endpoint is configured, use it
+            if is_dfm_request:
+                print("DEBUG: This is a DFM request")
+                if hasattr(self, 'config') and 'dfm_endpoint' in self.config:
+                    print(f"DEBUG: Using DFM endpoint: {self.config['dfm_endpoint']}")
+                    endpoint = self.config['dfm_endpoint']
+                else:
+                    print("DEBUG: No DFM endpoint configured, using default endpoint")
+            else:
+                print("DEBUG: Not a DFM request, using default endpoint")
+            
+            # Prepare the appropriate payload based on the endpoint
+            request_payload = payload
+            
+            # If this is a DFM request, format the payload appropriately
+            if is_dfm_request:
+                print("DEBUG: Formatting payload for DFM endpoint")
                 
-                # Try fallback endpoints if available
-                if hasattr(self, 'config') and 'fallback_endpoints' in self.config:
-                    for endpoint in self.config['fallback_endpoints']:
-                        try:
-                            print(f"Trying fallback endpoint: {endpoint}")
-                            response = self._make_request(endpoint, payload=payload)
-                            return response
-                        except Exception as e:
-                            print(f"Fallback endpoint {endpoint} failed: {str(e)}")
+                # Format payload for the new DFM endpoint structure
+                print("DEBUG: Formatting payload for new DFM endpoint structure")
                 
-                # If all endpoints fail, try the /api/chat endpoint as last resort
+                # Extract CAD data
+                if 'cad_data' not in payload:
+                    print("ERROR: Missing cad_data in payload")
+                    payload['cad_data'] = {}
+                
+                cad_data = payload['cad_data']
+                part_name = cad_data.get('name', 'Unknown Part')
+                
+                # Default values
+                material = cad_data.get('material', 'ABS')
+                process = 'fdm'  # Default to FDM 3D printing
+                
+                # Extract manufacturing intent from message if available
+                message = payload.get('message', '').lower()
+                
+                # More detailed process detection
+                if 'cnc' in message or 'machining' in message or 'milling' in message:
+                    process = 'cnc'
+                    print(f"DEBUG: Detected CNC machining process from query: '{message}'")
+                elif '3d print' in message or 'fdm' in message or 'printing' in message or 'printed' in message:
+                    process = 'fdm'
+                    print(f"DEBUG: Detected 3D printing process from query: '{message}'")
+                elif 'injection' in message or 'molding' in message or 'moulding' in message:
+                    process = 'injection_molding'
+                    print(f"DEBUG: Detected injection molding process from query: '{message}'")
+                
+                print(f"DEBUG: Selected manufacturing process: {process}")
+                
+                # Extract features from CAD data
+                features = []
+                
+                # Add walls if we have thickness information
+                if 'dimensions' in cad_data and 'thickness' in cad_data['dimensions']:
+                    features.append({
+                        "type": "wall",
+                        "dimensions": {"thickness": cad_data['dimensions'].get('thickness', 1.5)},
+                        "geometry_ref": {"face_index": None}
+                    })
+                
+                # Add fillets if we have radius information
+                if 'manufacturing_features' in cad_data and 'min_fillet_radius' in cad_data['manufacturing_features']:
+                    features.append({
+                        "type": "fillet",
+                        "dimensions": {"radius": cad_data['manufacturing_features'].get('min_fillet_radius', 0.5)},
+                        "geometry_ref": {"edge_index": None}
+                    })
+                
+                # Add holes if we have any in the features
+                if 'manufacturing_features' in cad_data and 'holes' in cad_data['manufacturing_features']:
+                    hole_count = cad_data['manufacturing_features'].get('holes', 0)
+                    if hole_count > 0:
+                        features.append({
+                            "type": "hole",
+                            "dimensions": {"diameter": 2.0},  # Default diameter
+                            "geometry_ref": {"face_index": None}
+                        })
+                
+                # Create the DFM-specific payload that works with both endpoints
+                dfm_data = {
+                    "material": material,
+                    "process": process,
+                    "features": features,
+                    "tolerances": {"general": 0.1},
+                    "surface_finish": "normal"
+                }
+                
+                # Integrate DFM data into the standard payload format
+                request_payload = {
+                    "message": payload["message"],
+                    "timestamp": payload["timestamp"],
+                    "mode": "dfm",  # Set mode to dfm
+                    "cad_data": payload["cad_data"],
+                    "dfm_data": dfm_data,  # Add the DFM-specific data
+                    "analysis_type": "dfm",
+                    "manufacturing_process": process,  # Explicitly specify the manufacturing process
+                    "query_intent": {
+                        "process_specific": True,
+                        "process_type": process,
+                        "original_query": payload["message"]
+                    }
+                }
+                
+                print(f"DEBUG: New DFM payload: {request_payload}")
+                print(f"DEBUG: Enhanced payload for DFM: {request_payload}")
+                print(f"DEBUG: DFM payload: {request_payload}")
+            
+            # Try the selected endpoint with retries
+            max_retries = 3
+            retry_delay = 1  # seconds
+            
+            # For DFM requests, use the dedicated endpoint if available
+            if is_dfm_request:
+                # Check if we should use the new dedicated DFM endpoint
+                if self.config.get('use_dedicated_dfm_endpoint', False) and '/check_dfm' in self.config.get('dfm_endpoint', ''):
+                    # Use the dedicated endpoint without query parameters
+                    print(f"DEBUG: Using dedicated DFM endpoint: {endpoint}")
+                else:
+                    # Fall back to the analysis endpoint with query parameters
+                    endpoint = f"{endpoint}?analysis_type=dfm&process={process}"
+                    print(f"DEBUG: Using analysis endpoint with DFM and process parameters: {endpoint}")
+            
+            for attempt in range(1, max_retries + 1):
                 try:
-                    print("Trying generic chat endpoint: /api/chat")
-                    chat_payload = {"message": message}
-                    response = self._make_request("/api/chat", payload=chat_payload)
+                    if attempt > 1:
+                        print(f"Retry attempt {attempt}/{max_retries} for endpoint {endpoint}")
+                    response = self._make_request(endpoint, payload=request_payload)
+                    # If successful, update connection status
+                    if not self.connected:
+                        old_status = self.connected
+                        self.connected = True
+                        if old_status != self.connected:
+                            self._notify_connection_change()
+                
+                    # For DFM requests, format the response appropriately
+                    if is_dfm_request:
+                        print("DEBUG: Formatting DFM response")
+                        print(f"DEBUG: Response keys: {response.keys() if isinstance(response, dict) else 'Not a dict'}")                        
+                        # Get part name from payload
+                        part_name = "Unknown Part"
+                        original_query = ""
+                        if isinstance(payload, dict):
+                            if 'cad_data' in payload:
+                                part_name = payload['cad_data'].get('name', 'Unknown Part')
+                            elif 'material' in payload and 'features' in payload:
+                                # This is the new DFM payload format
+                                part_name = "Part"
+                            
+                            # Store the original query for context
+                            original_query = payload.get('message', '')
+                            
+                        # Add the original query to the response for context
+                        if isinstance(response, dict) and original_query:
+                            response['original_query'] = original_query
+                        
+                        # Create a DFM-specific response
+                        if isinstance(response, dict):
+                            # Check if this is a response from the new DFM endpoint
+                            if 'violations' in response:
+                                print("DEBUG: Found violations data in response (new DFM format)")
+                                dfm_response = {
+                                    "response": self._format_dfm_response(response, part_name),
+                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                                }
+                                return dfm_response
+                            # Check if this is an analysis result with manufacturability data (legacy format)
+                            elif 'manufacturability_index' in response or 'design_issues' in response:
+                                print("DEBUG: Found manufacturability data in response (legacy format)")
+                                
+                                # Determine if this is a process-specific query
+                                process_type = ''
+                                if original_query:
+                                    if '3d print' in original_query.lower() or 'printed' in original_query.lower() or 'printing' in original_query.lower():
+                                        process_type = 'fdm'
+                                        print(f"DEBUG: Detected 3D printing query: '{original_query}'")
+                                    elif 'cnc' in original_query.lower() or 'machin' in original_query.lower() or 'mill' in original_query.lower():
+                                        process_type = 'cnc'
+                                        print(f"DEBUG: Detected CNC machining query: '{original_query}'")
+                                
+                                # Add process type to the response
+                                if process_type:
+                                    response['manufacturing_process'] = process_type
+                                
+                                dfm_response = {
+                                    "response": self._format_dfm_response(response, part_name),
+                                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                                }
+                                return dfm_response
+                
                     return response
                 except Exception as e:
-                    print(f"Chat endpoint failed: {str(e)}")
-                    
-                # If we get here, all endpoints failed
-                raise Exception(f"All endpoints failed. Primary error: {str(first_error)}")
+                    print(f"Primary endpoint attempt {attempt} failed: {str(e)}")
+                    if attempt < max_retries:
+                        print(f"Waiting {retry_delay}s before retry...")
+                        time.sleep(retry_delay)
+                        retry_delay *= 2  # Exponential backoff
+                    else:
+                        first_error = e
+            
+            # If we get here, all primary endpoint attempts failed
+            print("All primary endpoint attempts failed, trying fallbacks")
+            
+            # Try fallback endpoints if available
+            if hasattr(self, 'config') and 'fallback_endpoints' in self.config:
+                for endpoint in self.config['fallback_endpoints']:
+                    try:
+                        print(f"Trying fallback endpoint: {endpoint}")
+                        response = self._make_request(endpoint, payload=payload)
+                        return response
+                    except Exception as e:
+                        print(f"Fallback endpoint {endpoint} failed: {str(e)}")
+            
+            # If all endpoints fail, try the /api/chat endpoint as last resort
+            try:
+                print("Trying generic chat endpoint: /api/chat")
+                chat_payload = {"message": message}
+                response = self._make_request("/api/chat", payload=chat_payload)
+                return response
+            except Exception as e:
+                print(f"Chat endpoint failed: {str(e)}")
+                
+                # Force reconnection attempt
+                print("Attempting to reconnect to cloud service...")
+                self.test_connection()
+                
+                # If reconnection successful, try one more time with the original endpoint
+                if self.connected:
+                    print("Reconnected successfully, retrying original request")
+                    try:
+                        response = self._make_request(endpoint, payload=request_payload)
+                        return response
+                    except Exception as retry_error:
+                        print(f"Retry after reconnection failed: {str(retry_error)}")
+                        
+                # If we still can't connect, return a local fallback response
+                return {
+                    "response": "I'm processing your request locally. Cloud connection is currently unavailable.",
+                    "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                }
+                
+            # If we get here, all endpoints failed
+            raise Exception(f"All endpoints failed. Primary error: {str(first_error)}")
         except Exception as e:
             self.last_error = str(e)
+            # Update connection status if needed
+            if self.connected:
+                old_status = self.connected
+                self.connected = False
+                self.connection_quality = "unknown"
+                if old_status != self.connected:
+                    self._notify_connection_change()
+            
             return {
                 "error": str(e),
-                "response": f"⚠️ Cloud connection error: {str(e)}. Please check your internet connection and API configuration.",
+                "response": f"⚠️ Cloud connection error: {str(e)}. Please check your internet connection and API configuration.\n\nYou can click on the connection indicator to retry.",
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
             }
     
@@ -1048,37 +1419,82 @@ class CloudApiClient:
             print(f"Error getting CAD data: {e}")
             return {"status": "error", "message": str(e)}
     
-    def _make_request(self, endpoint: str, payload: Dict[str, Any] = None, method: str = "POST") -> Dict[str, Any]:
+    def _make_request(self, endpoint: str, payload: Dict[str, Any] = None, method: str = "POST", timeout: int = None) -> Dict[str, Any]:
         """Make a request to the cloud API"""
         url = f"{self.api_url}{endpoint}"
         
         # Set up headers with API key if available
         headers = {"Content-Type": "application/json"}
         if self.api_key:
-            # Try both header formats for API key
-            headers["X-API-Key"] = self.api_key
-            headers["Authorization"] = f"Bearer {self.api_key}"
-            print("Using API key for authentication")
+            # Use the correct header format for API key based on endpoint
+            if endpoint.startswith("/api/dfm"):
+                # DFM endpoint uses Authorization header
+                headers["Authorization"] = f"Bearer {self.api_key}"
+                print("Using Bearer token authentication for DFM endpoint")
+            else:
+                # Other endpoints use X-API-Key header
+                headers["X-API-Key"] = self.api_key
+                print("Using X-API-Key authentication")
+                
+            # For maximum compatibility, include both formats
+            if "X-API-Key" not in headers:
+                headers["X-API-Key"] = self.api_key
+            if "Authorization" not in headers:
+                headers["Authorization"] = f"Bearer {self.api_key}"
+        
+        # Use provided timeout or default from config
+        if timeout is None:
+            cloud_config = self.load_cloud_config()
+            timeout = cloud_config.get("connection_timeout", 10)
         
         try:
-            print(f"Making {method} request to {url}")
+            print(f"Making {method} request to {url} with timeout {timeout}s")
+            start_time = time.time()
+            
             if method == "GET":
-                response = requests.get(url, headers=headers, timeout=self.timeout)
+                response = requests.get(url, headers=headers, timeout=timeout)
             elif method == "POST":
-                response = requests.post(url, json=payload, headers=headers, timeout=self.timeout)
+                response = requests.post(url, json=payload, headers=headers, timeout=timeout)
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
+            # Calculate latency
+            end_time = time.time()
+            latency = int((end_time - start_time) * 1000)
+            self.last_latency = latency
+            
             # Log response status
-            print(f"Response status code: {response.status_code}")
+            print(f"Response status code: {response.status_code}, latency: {latency}ms")
             
             # Check if response is successful
             if response.status_code >= 400:
                 print(f"Error response: {response.text}")
-                if response.status_code == 422 and 'cad_data' in response.text:
+                
+                # Handle specific error codes
+                if response.status_code == 401:
+                    # Authentication error - try to recover
+                    print("Authentication error. Trying to recover...")
+                    # Reload config to get fresh API key
+                    cloud_config = self.load_cloud_config()
+                    self.api_key = cloud_config.get("cloud_api_key", "dev_api_key_for_testing")
+                    raise ValueError(f"Authentication failed: {response.text}. Updated API key for next attempt.")
+                elif response.status_code == 404:
+                    # Not found error
+                    raise ValueError(f"Endpoint not found: {endpoint}")
+                elif response.status_code == 422 and 'cad_data' in response.text:
                     raise ValueError("API requires cad_data field")
             
             response.raise_for_status()
+            
+            # Update connection quality based on latency
+            if latency < 200:
+                self.connection_quality = "excellent"
+            elif latency < 500:
+                self.connection_quality = "good"
+            elif latency < 1000:
+                self.connection_quality = "fair"
+            else:
+                self.connection_quality = "poor"
             
             # Parse response
             return response.json()
@@ -1092,12 +1508,371 @@ class CloudApiClient:
                     print(f"Response content: {e.response.text}")
                 except:
                     pass
+            # Update connection status
+            old_status = self.connected
+            self.connected = False
+            self.connection_quality = "unknown"
+            
+            # Notify listeners if status changed
+            if old_status and not self.connected:
+                self._notify_connection_change()
+                
             raise Exception(f"Cloud API request failed: {str(e)}")
         
         except Exception as e:
             self.last_error = str(e)
             print(f"Unexpected error: {str(e)}")
             raise
+
+    def add_connection_listener(self, callback):
+        """Add a callback function to be notified of connection status changes"""
+        if callback not in self.connection_listeners:
+            self.connection_listeners.append(callback)
+    
+    def remove_connection_listener(self, callback):
+        """Remove a connection status callback"""
+        if callback in self.connection_listeners:
+            self.connection_listeners.remove(callback)
+    
+    def _notify_connection_change(self):
+        """Notify all listeners of connection status change"""
+        for callback in self.connection_listeners:
+            try:
+                callback(self.connected, self.connection_quality, self.last_latency)
+            except Exception as e:
+                print(f"Error in connection listener callback: {str(e)}")
+                
+    def _save_config_to_file(self):
+        """Save the current configuration to the config file"""
+        try:
+            if hasattr(self, 'config'):
+                script_dir = os.path.dirname(os.path.realpath(__file__))
+                config_file = os.path.join(script_dir, "cloud_config.json")
+                
+                print(f"Saving updated configuration to {config_file}")
+                with open(config_file, "w") as f:
+                    json.dump(self.config, f, indent=2)
+                print("Configuration saved successfully")
+                return True
+            return False
+        except Exception as e:
+            print(f"Error saving configuration: {str(e)}")
+            return False
+            
+    def _format_dfm_response(self, analysis_result, part_name):
+        """Format DFM analysis results into a user-friendly response with numbered list for better readability"""
+        try:
+            # Check if this is the new DFM endpoint response format
+            if 'violations' in analysis_result:
+                return self._format_new_dfm_response(analysis_result, part_name)
+            else:
+                # Use the existing formatter for the old response format
+                return self._format_legacy_dfm_response(analysis_result, part_name)
+        except Exception as e:
+            print(f"Error formatting DFM response: {str(e)}")
+            return f"Error formatting DFM analysis results: {str(e)}"
+    
+    def _format_new_dfm_response(self, analysis_result, part_name):
+        """Format DFM analysis results from the new endpoint structure"""
+        try:
+            # Start with part name as a header
+            response_text = f"DFM Analysis for {part_name}:\n\n"
+            
+            violations = analysis_result.get('violations', [])
+            
+            # Start numbered list
+            item_num = 1
+            
+            # Add overall assessment
+            if not violations:
+                response_text += f"{item_num}. ✅ Overall: Excellent manufacturability\n"
+            else:
+                # Calculate overall severity based on highest severity score
+                max_severity = max([v.get('severity_score', 0) for v in violations]) if violations else 0
+                
+                if max_severity >= 90:
+                    response_text += f"{item_num}. 🚨 Overall: Critical manufacturability issues detected\n"
+                elif max_severity >= 70:
+                    response_text += f"{item_num}. ⚠️ Overall: Significant manufacturability issues detected\n"
+                else:
+                    response_text += f"{item_num}. ℹ️ Overall: Minor manufacturability issues detected\n"
+            item_num += 1
+            
+            # Add process information
+            process_name = "Unknown"
+            
+            # Try to get process from the response first
+            if 'manufacturing_process' in analysis_result:
+                process = analysis_result['manufacturing_process']
+                if process == 'fdm':
+                    process_name = "FDM 3D Printing"
+                elif process == 'cnc':
+                    process_name = "CNC Machining"
+                elif process == 'injection_molding':
+                    process_name = "Injection Molding"
+            # Fall back to checking violations text
+            elif violations and len(violations) > 0 and 'issue' in violations[0]:
+                issue_text = violations[0]['issue'].lower()
+                if 'fdm' in issue_text or '3d print' in issue_text or 'printing' in issue_text:
+                    process_name = "FDM 3D Printing"
+                    process = "fdm"
+                elif 'cnc' in issue_text or 'machin' in issue_text or 'mill' in issue_text:
+                    process_name = "CNC Machining"
+                    process = "cnc"
+            
+            response_text += f"{item_num}. Manufacturing Process: {process_name}\n"
+            item_num += 1
+            
+            # Add violations with severity indicators
+            response_text += f"\n{item_num}. Manufacturability Issues:\n"
+            item_num += 1
+            
+            if not violations:
+                response_text += "   ✓ No specific manufacturability issues detected.\n"
+            else:
+                for i, violation in enumerate(violations, 1):
+                    # Get severity and issue details
+                    severity_score = violation.get('severity_score', 0)
+                    issue = violation.get('issue', 'Unknown issue')
+                    suggestion = violation.get('suggestion', '')
+                    
+                    # Choose emoji based on severity score
+                    if severity_score >= 90:
+                        emoji = "🚨"  # Red alert for critical issues
+                    elif severity_score >= 70:
+                        emoji = "⚠️"  # Warning for moderate issues
+                    else:
+                        emoji = "ℹ️"  # Info for minor issues
+                    
+                    # Format the issue and suggestion
+                    issue_text = f"{emoji} {issue}"
+                    if suggestion:
+                        issue_text += f" - {suggestion}"
+                    
+                    response_text += f"   {i}. {issue_text}\n"
+            
+            return response_text
+        except Exception as e:
+            print(f"Error formatting new DFM response: {str(e)}")
+            return f"Error formatting DFM analysis results: {str(e)}"
+    
+    def _format_legacy_dfm_response(self, analysis_result, part_name):
+        """Format DFM analysis results from the legacy endpoint structure"""
+        try:
+            # Check if this is a 3D printing request by looking at the original query
+            original_query = ''
+            if 'original_query' in analysis_result:
+                original_query = analysis_result.get('original_query', '').lower()
+                print(f"DEBUG: Found original query in response: '{original_query}'")
+            elif 'query_intent' in analysis_result:
+                original_query = analysis_result.get('query_intent', {}).get('original_query', '').lower()
+            
+            # Force process detection from the original message
+            process = ''
+            if '3d print' in original_query or 'printed' in original_query or 'printing' in original_query:
+                process = 'fdm'
+                print("DEBUG: Forcing 3D printing specific formatting based on query")
+            elif 'cnc' in original_query or 'machin' in original_query or 'mill' in original_query:
+                process = 'cnc'
+                print("DEBUG: Forcing CNC machining specific formatting based on query")
+            
+            # If we couldn't detect from query, try to get from response
+            if not process:
+                process = analysis_result.get('manufacturing_process', '')
+                if not process and 'request_metadata' in analysis_result:
+                    process = analysis_result.get('request_metadata', {}).get('manufacturing_process', '')
+            
+            # Default to generic if no process is specified
+            process_name = "Manufacturing"
+            
+            # Force 3D printing specific response for 3D printing queries
+            if '3d print' in original_query or 'printed' in original_query or 'printing' in original_query:
+                process = 'fdm'
+                process_name = "3D Printing (FDM)"
+                print("DEBUG: Forcing 3D printing specific response format")
+            # Force CNC machining specific response for machining queries
+            elif 'cnc' in original_query or 'machin' in original_query or 'mill' in original_query:
+                process = 'cnc'
+                process_name = "CNC Machining"
+                print("DEBUG: Forcing CNC machining specific response format")
+            # Otherwise use the detected process
+            elif process == 'fdm':
+                process_name = "3D Printing (FDM)"
+            elif process == 'cnc':
+                process_name = "CNC Machining"
+            elif process == 'injection_molding':
+                process_name = "Injection Molding"
+                
+            # Start with part name and process as a header
+            response_text = f"{process_name} Analysis for {part_name}:\n\n"
+            
+            # Get manufacturability index and complexity
+            mfg_index = analysis_result.get('manufacturability_index', 0)
+            complexity = analysis_result.get('manufacturing_features', {}).get('complexity_rating', 'Unknown')
+            
+            # Start numbered list
+            item_num = 1
+            
+            # Add overall assessment as item #1 with process-specific wording
+            if process == 'fdm':
+                if mfg_index > 90:
+                    response_text += f"{item_num}. ✅ Overall: Excellent 3D printability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 70:
+                    response_text += f"{item_num}. ✓ Overall: Good 3D printability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 50:
+                    response_text += f"{item_num}. ⚠️ Overall: Fair 3D printability (Score: {mfg_index}/100)\n"
+                else:
+                    response_text += f"{item_num}. 🚨 Overall: Poor 3D printability (Score: {mfg_index}/100)\n"
+            elif process == 'cnc':
+                if mfg_index > 90:
+                    response_text += f"{item_num}. ✅ Overall: Excellent machinability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 70:
+                    response_text += f"{item_num}. ✓ Overall: Good machinability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 50:
+                    response_text += f"{item_num}. ⚠️ Overall: Fair machinability (Score: {mfg_index}/100)\n"
+                else:
+                    response_text += f"{item_num}. 🚨 Overall: Poor machinability (Score: {mfg_index}/100)\n"
+            else:
+                if mfg_index > 90:
+                    response_text += f"{item_num}. ✅ Overall: Excellent manufacturability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 70:
+                    response_text += f"{item_num}. ✓ Overall: Good manufacturability (Score: {mfg_index}/100)\n"
+                elif mfg_index > 50:
+                    response_text += f"{item_num}. ⚠️ Overall: Fair manufacturability (Score: {mfg_index}/100)\n"
+                else:
+                    response_text += f"{item_num}. 🚨 Overall: Poor manufacturability (Score: {mfg_index}/100)\n"
+            item_num += 1
+            
+            # Add complexity as item #2 with process-specific context
+            if process == 'fdm':
+                response_text += f"{item_num}. Print Complexity: {complexity}\n"
+                item_num += 1
+                
+                # Add 3D printing specific recommendations
+                response_text += f"{item_num}. 3D Printing Recommendations:\n"
+                response_text += f"   • Recommended material: PLA or ABS\n"
+                response_text += f"   • Layer height: 0.2mm\n"
+                response_text += f"   • Infill: 20-30%\n"
+                if complexity.lower() == 'high':
+                    response_text += f"   • Supports: Required\n"
+                else:
+                    response_text += f"   • Supports: Likely not needed\n"
+            elif process == 'cnc':
+                response_text += f"{item_num}. Machining Complexity: {complexity}\n"
+                item_num += 1
+                
+                # Add CNC machining specific recommendations
+                response_text += f"{item_num}. CNC Machining Recommendations:\n"
+                response_text += f"   • Recommended material: Aluminum or mild steel\n"
+                response_text += f"   • Minimum tool diameter: 3mm\n"
+                if complexity.lower() == 'high':
+                    response_text += f"   • Setup: Multi-axis machining recommended\n"
+                else:
+                    response_text += f"   • Setup: Standard 3-axis machining\n"
+            else:
+                response_text += f"{item_num}. Complexity: {complexity}\n"
+            item_num += 1
+            
+            # Add design issues with severity indicators
+            design_issues = analysis_result.get('design_issues', [])
+            
+            # For 3D printing queries, add specific 3D printing issues if none exist
+            if process == 'fdm' and not design_issues:
+                # Add some generic 3D printing considerations
+                if analysis_result.get('dimensions', {}).get('z', 0) < 1.0:
+                    design_issues.append("Layer height too thin - minimum 0.1mm recommended for FDM printing")
+                elif analysis_result.get('dimensions', {}).get('z', 0) > 200:
+                    design_issues.append("Model height exceeds typical build volume of many desktop 3D printers")
+                
+                # Add some generic 3D printing recommendations
+                design_issues.append("Consider using PLA for easiest printing or ABS for better durability")
+                design_issues.append("Print with 20% infill for a good balance of strength and material usage")
+                design_issues.append("Orient the part for minimal support requirements")
+            
+            # Get the manufacturing process from the request or response
+            process = analysis_result.get('manufacturing_process', '')
+            if not process and 'request_metadata' in analysis_result:
+                process = analysis_result.get('request_metadata', {}).get('manufacturing_process', '')
+            
+            # Process-specific section title
+            if process == 'fdm':
+                response_text += f"\n{item_num}. 3D Printing Considerations:\n"
+            elif process == 'cnc':
+                response_text += f"\n{item_num}. CNC Machining Considerations:\n"
+            else:
+                response_text += f"\n{item_num}. Manufacturability Issues:\n"
+            item_num += 1
+            
+            if not design_issues:
+                if process == 'fdm':
+                    response_text += "   ✓ No specific 3D printing issues detected. The model appears to be printable.\n"
+                    response_text += "   ℹ️ Recommended print settings: Layer height: 0.2mm, Infill: 20%, Support: No\n"
+                elif process == 'cnc':
+                    response_text += "   ✓ No specific CNC machining issues detected. The model appears to be machinable.\n"
+                else:
+                    response_text += "   ✓ No specific manufacturability issues detected.\n"
+            else:
+                for i, issue in enumerate(design_issues, 1):
+                    # Determine severity based on keywords
+                    severity = "info"
+                    issue_text = issue.lower()
+                    
+                    if any(kw in issue_text for kw in ["critical", "severe", "cannot", "impossible", "fail"]):
+                        severity = "critical"
+                        emoji = "🚨"  # Red alert for critical issues
+                    elif any(kw in issue_text for kw in ["warning", "recommend", "should", "consider", "improve"]):
+                        severity = "warning"
+                        emoji = "⚠️"  # Warning for moderate issues
+                    else:
+                        emoji = "ℹ️"  # Info for minor issues
+                        
+                    # Add process-specific context to generic issues
+                    if process == 'fdm':
+                        # Add 3D printing context to generic issues
+                        if "thin" in issue_text or "thickness" in issue_text:
+                            issue = f"{issue} (Critical for 3D printing - may cause print failure)"
+                        elif "overhang" in issue_text:
+                            issue = f"{issue} (May require supports during printing)"
+                        elif "sharp" in issue_text or "corner" in issue_text:
+                            issue = f"{issue} (Consider adding fillets for better print quality)"
+                    elif process == 'cnc':
+                        # Add CNC machining context to generic issues
+                        if "internal corner" in issue_text or "sharp corner" in issue_text:
+                            issue = f"{issue} (Not achievable with standard CNC tooling)"
+                        elif "undercut" in issue_text:
+                            issue = f"{issue} (May require multi-axis machining)"
+                    
+                    response_text += f"   {i}. {emoji} {issue}\n"
+            
+            # Add material recommendations
+            materials = analysis_result.get('material_suggestions', [])
+            if materials:
+                response_text += f"\n{item_num}. Recommended Materials:\n"
+                item_num += 1
+                for i, material in enumerate(materials, 1):
+                    response_text += f"   {i}. {material}\n"
+            
+            # Add process recommendations
+            processes = analysis_result.get('process_recommendations', [])
+            if processes:
+                response_text += f"\n{item_num}. Recommended Manufacturing Processes:\n"
+                for i, process in enumerate(processes, 1):
+                    response_text += f"   {i}. {process}\n"
+            
+            return response_text
+        except Exception as e:
+            print(f"Error formatting DFM response: {str(e)}")
+            return f"Error formatting DFM analysis results: {str(e)}"
+    
+    def get_connection_info(self):
+        """Get detailed connection information"""
+        return {
+            "connected": self.connected,
+            "quality": self.connection_quality,
+            "latency": self.last_latency,
+            "last_check": self.last_check_time,
+            "last_error": self.last_error
+        }
 
 # Singleton cloud client instance
 _cloud_client_instance = None
@@ -1127,8 +1902,21 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Set up the UI
         self.setup_ui()
         
-        # Update cloud status in UI
-        self.update_status(self.cloud_connected)
+        # Register as connection listener
+        self.cloud_client.add_connection_listener(self.update_status)
+        
+        # Update cloud status in UI with initial values
+        conn_info = self.cloud_client.get_connection_info()
+        self.update_status(
+            conn_info["connected"],
+            conn_info["quality"],
+            conn_info["latency"]
+        )
+        
+        # Set up periodic connection check
+        self.connection_timer = QtCore.QTimer()
+        self.connection_timer.timeout.connect(self.check_connection)
+        self.connection_timer.start(60000)  # Check every minute
     
     def setup_ui(self):
         """Set up the user interface"""
@@ -1157,11 +1945,20 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.status_layout.addWidget(self.status_indicator)
         self.status_layout.addWidget(self.status_text)
         
+        # Create tooltip with detailed connection info
+        self.status_widget = QtWidgets.QWidget()
+        self.status_widget.setLayout(self.status_layout)
+        self.status_widget.setToolTip("Cloud connection status")
+        
         # Add to header layout
         header_layout.addWidget(logo_label)
         header_layout.addWidget(title_label)
         header_layout.addStretch()
-        header_layout.addLayout(self.status_layout)
+        header_layout.addWidget(self.status_widget)
+        
+        # Make status clickable to retry connection
+        self.status_widget.setCursor(QtCore.Qt.PointingHandCursor)
+        self.status_widget.mousePressEvent = self.retry_connection
         
         # Add header to main layout
         layout.addLayout(header_layout)
@@ -1316,16 +2113,54 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.add_system_message(f"Error processing CAD command: {str(e)}")
             traceback.print_exc()
     
-    def update_status(self, connected):
+    def update_status(self, connected, quality="unknown", latency=0):
         """Update the cloud connection status indicator"""
         if connected:
-            self.status_indicator.setStyleSheet("color: green;")
-            self.status_text.setText("Cloud: Connected")
+            # Set color based on connection quality
+            if quality == "excellent":
+                self.status_indicator.setStyleSheet("color: #00AA00;")  # Bright green
+                status_text = "Cloud: Excellent"
+            elif quality == "good":
+                self.status_indicator.setStyleSheet("color: #00CC00;")  # Green
+                status_text = "Cloud: Good"
+            elif quality == "fair":
+                self.status_indicator.setStyleSheet("color: #CCCC00;")  # Yellow
+                status_text = "Cloud: Fair"
+            elif quality == "poor":
+                self.status_indicator.setStyleSheet("color: #CC6600;")  # Orange
+                status_text = "Cloud: Poor"
+            else:
+                self.status_indicator.setStyleSheet("color: #00CC00;")  # Default green
+                status_text = "Cloud: Connected"
+                
+            self.status_text.setText(status_text)
             self.cloud_connected = True
+            
+            # Update tooltip with detailed info
+            tooltip = f"Cloud Status: {quality.title()}\nLatency: {latency}ms"
+            self.status_widget.setToolTip(tooltip)
         else:
             self.status_indicator.setStyleSheet("color: red;")
             self.status_text.setText("Cloud: Disconnected")
             self.cloud_connected = False
+            self.status_widget.setToolTip("Cloud connection failed. Click to retry.")
+    
+    def retry_connection(self, event):
+        """Retry cloud connection when status indicator is clicked"""
+        self.add_system_message("Retrying cloud connection...")
+        success = self.cloud_client.test_connection()
+        if success:
+            self.add_system_message("Cloud connection restored!")
+        else:
+            self.add_system_message(f"Cloud connection failed: {self.cloud_client.last_error}")
+    
+    def check_connection(self):
+        """Periodically check cloud connection"""
+        # Only run check if more than 5 minutes since last check
+        current_time = time.time()
+        if current_time - self.cloud_client.last_check_time > 300:
+            print("Performing periodic connection check")
+            self.cloud_client.test_connection()
     
     def add_system_message(self, message):
         """Add a system message to the chat history"""
