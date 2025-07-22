@@ -3,8 +3,7 @@
   "cloud_api_key": "dev_api_key_for_testing",
   "default_analysis_endpoint": "/api/analysis/cad",
   "fallback_endpoints": [
-    "/api/analysis/cad",
-    "/api/analysis"
+    "/health"
   ],
   "dfm_endpoint": "/api/analysis/cad",
   "use_cloud_backend": true,

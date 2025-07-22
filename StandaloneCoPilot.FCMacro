@@ -5,10 +5,12 @@ with enhanced UI and cloud backend integration.
 
 This version is completely standalone and doesn't rely on the existing modules,
 implementing a strict singleton pattern to prevent multiple instances.
+Cloud features (DFM, cost estimation, tool recommendations) are offloaded
+to cloud services for lightweight operation.
 
 Author: Samarjit
 License: MIT
-Version: 1.0.0
+Version: 1.1.0 - Cloud Integration for DFM, Cost, and Tool Features
 """
 
 import os
@@ -20,6 +22,8 @@ import requests
 import traceback
 import re
 import math
+import urllib.request
+import urllib.parse
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 from datetime import datetime
 from PySide2 import QtWidgets, QtCore, QtGui
@@ -30,18 +34,329 @@ try:
     import Part
     import FreeCADGui
 except ImportError:
-    print("Warning: FreeCAD modules not available in this context")
-
-# Try to import required modules
-try:
-    from PySide2 import QtWidgets, QtCore, QtGui
-    import FreeCADGui
-except ImportError:
     print("Error: Required modules not found. This macro requires PySide2 and FreeCAD.")
     raise
 
 # Global singleton instance tracker
 _STANDALONE_INSTANCE = None
+
+# Add cloud services directory to path
+_THIS_DIR = os.path.dirname(os.path.abspath(__file__))
+if _THIS_DIR not in sys.path:
+    sys.path.append(_THIS_DIR)
+
+# Try to import cloud services
+try:
+    from cloud_services.cloud_integration import CloudIntegration
+    from utils.cad_extractor import extract_cad_data_for_features
+    _CLOUD_SERVICES_AVAILABLE = True
+except ImportError:
+    print("Warning: Cloud services not available. Some features will be disabled.")
+    _CLOUD_SERVICES_AVAILABLE = False
+
+# Try to import cloud integration functions
+try:
+    from cloud_integration_functions import (
+        analyze_dfm, estimate_cost, recommend_tools, 
+        compare_manufacturing_methods, call_feature
+    )
+    _CLOUD_FUNCTIONS_AVAILABLE = True
+except ImportError:
+    print("Warning: Cloud integration functions not available. Using built-in call_feature.")
+    _CLOUD_FUNCTIONS_AVAILABLE = False
+
+# ===============================
+# Manufacturing Feature Manager
+# ===============================
+class ManufacturingFeatureManager:
+    """Manages manufacturing features like DFM, cost estimation, and tool recommendations"""
+    
+    def __init__(self):
+        """Initialize the manufacturing feature manager"""
+        self.last_dfm_result = None
+        self.last_cost_result = None
+        self.last_tool_result = None
+        self.cloud_integration = None
+        
+        # Try to initialize cloud integration
+        if _CLOUD_SERVICES_AVAILABLE:
+            try:
+                from cloud_services.cloud_integration import CloudIntegration
+                this_dir = os.path.dirname(os.path.abspath(__file__))
+                config_path = os.path.join(this_dir, "cloud_config.json")
+                self.cloud_integration = CloudIntegration(config_path)
+                print("Cloud integration initialized for manufacturing features")
+            except Exception as e:
+                print(f"Error initializing cloud integration: {str(e)}")
+                traceback.print_exc()
+    
+    def analyze_dfm(self, manufacturing_process="3d_printing"):
+        """Analyze design for manufacturability"""
+        try:
+            # Use cloud integration if available
+            if self.cloud_integration:
+                result = self.cloud_integration.analyze_dfm(manufacturing_process)
+                self.last_dfm_result = result
+                return result
+            # Otherwise use cloud functions if available
+            elif _CLOUD_FUNCTIONS_AVAILABLE:
+                result = analyze_dfm(manufacturing_process)
+                self.last_dfm_result = result
+                return result
+            # Fall back to direct API call
+            else:
+                payload = {
+                    "manufacturing_process": manufacturing_process,
+                    "cad_data": extract_cad_data_for_features()
+                }
+                result = call_feature("dfm_analysis", payload)
+                self.last_dfm_result = result
+                return result
+        except Exception as e:
+            print(f"Error in DFM analysis: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "service": "dfm",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def estimate_cost(self, manufacturing_process="3d_printing", material="pla", quantity=1, region="global"):
+        """Estimate manufacturing cost"""
+        try:
+            # Use cloud integration if available
+            if self.cloud_integration:
+                result = self.cloud_integration.estimate_cost(
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    quantity=quantity,
+                    region=region
+                )
+                self.last_cost_result = result
+                return result
+            # Otherwise use cloud functions if available
+            elif _CLOUD_FUNCTIONS_AVAILABLE:
+                result = estimate_cost(
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    quantity=quantity,
+                    region=region
+                )
+                self.last_cost_result = result
+                return result
+            # Fall back to direct API call
+            else:
+                payload = {
+                    "manufacturing_process": manufacturing_process,
+                    "material": material,
+                    "quantity": quantity,
+                    "region": region,
+                    "cad_data": extract_cad_data_for_features()
+                }
+                result = call_feature("cost_estimate", payload)
+                self.last_cost_result = result
+                return result
+        except Exception as e:
+            print(f"Error in cost estimation: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "service": "cost",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def recommend_tools(self, manufacturing_process="cnc_machining", material="aluminum", machine_type=None):
+        """Get tool recommendations"""
+        try:
+            # Use cloud integration if available
+            if self.cloud_integration:
+                result = self.cloud_integration.recommend_tools(
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    machine_type=machine_type
+                )
+                self.last_tool_result = result
+                return result
+            # Otherwise use cloud functions if available
+            elif _CLOUD_FUNCTIONS_AVAILABLE:
+                result = recommend_tools(
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    machine_type=machine_type
+                )
+                self.last_tool_result = result
+                return result
+            # Fall back to direct API call
+            else:
+                payload = {
+                    "manufacturing_process": manufacturing_process,
+                    "material": material,
+                    "machine_type": machine_type,
+                    "cad_data": extract_cad_data_for_features()
+                }
+                result = call_feature("tool_recommendation", payload)
+                self.last_tool_result = result
+                return result
+        except Exception as e:
+            print(f"Error in tool recommendation: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "service": "tool_recommendation",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def compare_manufacturing_methods(self, materials=None, processes=None, quantities=None):
+        """Compare costs across different manufacturing methods"""
+        try:
+            if materials is None:
+                materials = ["pla", "abs", "nylon"]
+            if processes is None:
+                processes = ["3d_printing", "cnc_machining", "injection_molding"]
+            if quantities is None:
+                quantities = [1, 10, 100, 1000]
+                
+            # Use cloud integration if available
+            if self.cloud_integration:
+                return self.cloud_integration.compare_manufacturing_methods(
+                    materials=materials,
+                    processes=processes,
+                    quantities=quantities
+                )
+            # Otherwise use cloud functions if available
+            elif _CLOUD_FUNCTIONS_AVAILABLE:
+                return compare_manufacturing_methods(
+                    materials=materials,
+                    processes=processes,
+                    quantities=quantities
+                )
+            # Fall back to direct API call
+            else:
+                payload = {
+                    "materials": materials,
+                    "processes": processes,
+                    "quantities": quantities,
+                    "cad_data": extract_cad_data_for_features()
+                }
+                return call_feature("manufacturing_comparison", payload)
+        except Exception as e:
+            print(f"Error in manufacturing comparison: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "service": "manufacturing_comparison",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def visualize_dfm_issues(self):
+        """Visualize DFM issues in the FreeCAD view"""
+        try:
+            if self.cloud_integration:
+                self.cloud_integration.visualize_dfm_issues()
+            elif self.last_dfm_result and self.last_dfm_result.get("success", False):
+                # Basic visualization if cloud integration not available
+                issues = self.last_dfm_result.get("data", {}).get("issues", [])
+                if not issues:
+                    FreeCAD.Console.PrintMessage("No DFM issues to visualize\n")
+                    return
+                    
+                # Create visualization objects
+                doc = FreeCAD.ActiveDocument
+                if not doc:
+                    FreeCAD.Console.PrintError("No active document for visualization\n")
+                    return
+                    
+                # Create a group for DFM issues
+                dfm_group = doc.addObject("App::DocumentObjectGroup", "DFM_Issues")
+                
+                # Add visualization for each issue
+                for i, issue in enumerate(issues):
+                    issue_type = issue.get("type", "unknown")
+                    position = issue.get("position", [0, 0, 0])
+                    severity = issue.get("severity", "medium")
+                    
+                    # Create a sphere at the issue location
+                    sphere = doc.addObject("Part::Sphere", f"DFM_Issue_{i+1}")
+                    sphere.Radius = 2.0  # 2mm radius
+                    sphere.Placement = FreeCAD.Placement(
+                        FreeCAD.Vector(position[0], position[1], position[2]),
+                        FreeCAD.Rotation()
+                    )
+                    
+                    # Set color based on severity
+                    if hasattr(sphere, "ViewObject"):
+                        if severity == "high":
+                            sphere.ViewObject.ShapeColor = (1.0, 0.0, 0.0)  # Red
+                        elif severity == "medium":
+                            sphere.ViewObject.ShapeColor = (1.0, 0.5, 0.0)  # Orange
+                        else:
+                            sphere.ViewObject.ShapeColor = (1.0, 1.0, 0.0)  # Yellow
+                    
+                    # Add to group
+                    dfm_group.addObject(sphere)
+                
+                doc.recompute()
+                FreeCAD.Console.PrintMessage(f"Visualized {len(issues)} DFM issues\n")
+        except Exception as e:
+            print(f"Error visualizing DFM issues: {str(e)}")
+            traceback.print_exc()
+    
+    def visualize_tool_paths(self):
+        """Visualize tool paths in the FreeCAD view"""
+        try:
+            if self.cloud_integration:
+                self.cloud_integration.visualize_tool_paths()
+            elif self.last_tool_result and self.last_tool_result.get("success", False):
+                # Basic visualization if cloud integration not available
+                tool_paths = self.last_tool_result.get("data", {}).get("tool_paths", [])
+                if not tool_paths:
+                    FreeCAD.Console.PrintMessage("No tool paths to visualize\n")
+                    return
+                    
+                # Create visualization objects
+                doc = FreeCAD.ActiveDocument
+                if not doc:
+                    FreeCAD.Console.PrintError("No active document for visualization\n")
+                    return
+                    
+                # Create a group for tool paths
+                path_group = doc.addObject("App::DocumentObjectGroup", "Tool_Paths")
+                
+                # Add visualization for each tool path
+                for i, path in enumerate(tool_paths):
+                    points = path.get("points", [])
+                    tool_name = path.get("tool_name", f"Tool_{i+1}")
+                    
+                    if not points or len(points) < 2:
+                        continue
+                        
+                    # Create a polyline for the tool path
+                    polyline = []
+                    for point in points:
+                        polyline.append(FreeCAD.Vector(point[0], point[1], point[2]))
+                    
+                    # Create a wire from the points
+                    wire = Part.makePolygon(polyline)
+                    path_obj = doc.addObject("Part::Feature", f"Path_{tool_name}")
+                    path_obj.Shape = wire
+                    
+                    # Set color and line width
+                    if hasattr(path_obj, "ViewObject"):
+                        path_obj.ViewObject.LineColor = (0.0, 0.0, 1.0)  # Blue
+                        path_obj.ViewObject.LineWidth = 2.0
+                    
+                    # Add to group
+                    path_group.addObject(path_obj)
+                
+                doc.recompute()
+                FreeCAD.Console.PrintMessage(f"Visualized {len(tool_paths)} tool paths\n")
+        except Exception as e:
+            print(f"Error visualizing tool paths: {str(e)}")
+            traceback.print_exc()
 
 # Context manager for design context
 class DesignContextManager:
@@ -967,19 +1282,10 @@ class CloudApiClient:
             timeout = cloud_config.get("connection_timeout", 10)
             retry_count = cloud_config.get("retry_count", 3)
             
-            # Try multiple endpoints for reliability
-            endpoints_to_try = ["/api/health", "/health", "/api/status", "/"]
+            # Only use the known working endpoint to avoid 404 errors
+            endpoints_to_try = ["/health"]
             
-            # Add a test for the DFM endpoint if configured
-            if hasattr(self, 'config') and 'dfm_endpoint' in self.config:
-                dfm_endpoint = self.config['dfm_endpoint']
-                if dfm_endpoint and dfm_endpoint not in endpoints_to_try:
-                    # Add a health check version of the DFM endpoint
-                    dfm_base = dfm_endpoint.split('/check')[0] if '/check' in dfm_endpoint else dfm_endpoint
-                    dfm_health = f"{dfm_base}/health"
-                    endpoints_to_try.insert(0, dfm_health)  # Try DFM health endpoint first
-            
-            print(f"Testing connection with endpoints: {endpoints_to_try}")
+            print(f"Testing connection with endpoint: {endpoints_to_try[0]}")
             
             # Try each endpoint with retries
             for endpoint in endpoints_to_try:
@@ -1003,7 +1309,7 @@ class CloudApiClient:
                             self.connection_quality = "fair"
                         else:
                             self.connection_quality = "poor"
-                        
+                            
                         # Connection successful
                         old_status = self.connected
                         self.connected = True
@@ -1011,8 +1317,7 @@ class CloudApiClient:
                         # Notify listeners if status changed
                         if not old_status and self.connected:
                             self._notify_connection_change()
-                        
-                        print(f"Successfully connected to cloud API via {endpoint}")
+                            
                         return True
                     except Exception as e:
                         print(f"Attempt {attempt+1}/{retry_count} failed for endpoint {endpoint}: {str(e)}")
@@ -1021,7 +1326,7 @@ class CloudApiClient:
                         time.sleep(0.5)  # Brief delay between retries
             
             # If we get here, all endpoints failed
-            self.last_error = "Failed to connect to any API endpoint"
+            self.last_error = "Failed to connect to cloud API"
             old_status = self.connected
             self.connected = False
             self.connection_quality = "poor"  # Set to poor instead of unknown for UI clarity
@@ -1426,21 +1731,10 @@ class CloudApiClient:
         # Set up headers with API key if available
         headers = {"Content-Type": "application/json"}
         if self.api_key:
-            # Use the correct header format for API key based on endpoint
-            if endpoint.startswith("/api/dfm"):
-                # DFM endpoint uses Authorization header
-                headers["Authorization"] = f"Bearer {self.api_key}"
-                print("Using Bearer token authentication for DFM endpoint")
-            else:
-                # Other endpoints use X-API-Key header
-                headers["X-API-Key"] = self.api_key
-                print("Using X-API-Key authentication")
-                
-            # For maximum compatibility, include both formats
-            if "X-API-Key" not in headers:
-                headers["X-API-Key"] = self.api_key
-            if "Authorization" not in headers:
-                headers["Authorization"] = f"Bearer {self.api_key}"
+            # Use X-API-Key as the primary authentication method
+            # This is the standard expected by the cloud service
+            headers["X-API-Key"] = self.api_key
+            print("Using X-API-Key authentication")
         
         # Use provided timeout or default from config
         if timeout is None:
@@ -1899,6 +2193,10 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.nl_cad_editor = NaturalLanguageCADEditor(self.cloud_client)
         print("Natural Language CAD Editor initialized")
         
+        # Initialize Manufacturing Feature Manager for cloud features
+        self.mfg_feature_manager = ManufacturingFeatureManager()
+        print("Manufacturing Feature Manager initialized for cloud services")
+        
         # Set up the UI
         self.setup_ui()
         
@@ -1923,6 +2221,43 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Set window title and size
         self.setWindowTitle("Standalone Manufacturing Co-Pilot")
         self.resize(500, 600)
+        
+        # Set dark theme for the entire widget
+        self.setStyleSheet("""
+            QWidget {
+                background-color: #333333;
+                color: #E0E0E0;
+            }
+            QPushButton {
+                background-color: #444444;
+                color: #E0E0E0;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 5px;
+                min-height: 25px;
+            }
+            QPushButton:hover {
+                background-color: #555555;
+            }
+            QPushButton:pressed {
+                background-color: #666666;
+            }
+            QLabel {
+                color: #E0E0E0;
+            }
+            QGroupBox {
+                border: 1px solid #555555;
+                border-radius: 5px;
+                margin-top: 10px;
+                padding-top: 10px;
+                color: #E0E0E0;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top center;
+                padding: 0 5px;
+            }
+        """)
         
         # Create main layout
         layout = QtWidgets.QVBoxLayout()
@@ -1967,6 +2302,35 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.chat_history = QtWidgets.QTextEdit()
         self.chat_history.setReadOnly(True)
         self.chat_history.setMinimumHeight(300)
+        
+        # Set dark theme colors for chat history - ensure dark background and light text
+        self.chat_history.setStyleSheet("""
+            QTextEdit {
+                background-color: #1E1E1E;
+                color: #E0E0E0;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QTextEdit QWidget {
+                background-color: #1E1E1E;
+                color: #E0E0E0;
+            }
+            QScrollBar:vertical {
+                background-color: #2D2D2D;
+                width: 14px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555;
+                min-height: 20px;
+                border-radius: 7px;
+            }
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+        """)
+        
         layout.addWidget(self.chat_history)
         
         # Add input area with send button
@@ -1975,6 +2339,32 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.input_field = QtWidgets.QTextEdit()
         self.input_field.setPlaceholderText("Ask about manufacturing...")
         self.input_field.setMaximumHeight(100)
+        
+        # Set dark theme colors for input field - ensure dark background and light text
+        self.input_field.setStyleSheet("""
+            QTextEdit {
+                background-color: #1E1E1E;
+                color: #E0E0E0;
+                border: 1px solid #555555;
+                border-radius: 4px;
+                padding: 4px;
+            }
+            QTextEdit QWidget {
+                background-color: #1E1E1E;
+                color: #E0E0E0;
+            }
+            QScrollBar:vertical {
+                background-color: #2D2D2D;
+                width: 14px;
+                margin: 0px;
+            }
+            QScrollBar::handle:vertical {
+                background-color: #555555;
+                min-height: 20px;
+                border-radius: 7px;
+            }
+        """)
+        
         input_layout.addWidget(self.input_field)
         
         self.send_button = QtWidgets.QPushButton("Send")
@@ -2004,6 +2394,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         button_layout.addWidget(self.clear_button)
         
         layout.addLayout(button_layout)
+        
+        # Add cloud manufacturing features section
+        self.add_manufacturing_features_ui(layout)
         
         # Add initial message
         self.add_system_message("Welcome to the Manufacturing Co-Pilot!")
@@ -2248,6 +2641,291 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         """Handle clear button click"""
         self.chat_history.clear()
         self.add_system_message("Chat history cleared.")
+        
+    def add_manufacturing_features_ui(self, layout):
+        """Add cloud manufacturing features UI elements"""
+        # Create group box for manufacturing features
+        mfg_group = QtWidgets.QGroupBox("Cloud Manufacturing Features")
+        mfg_layout = QtWidgets.QVBoxLayout()
+        
+        # Add description label
+        desc_label = QtWidgets.QLabel("Access cloud-based manufacturing intelligence:")
+        mfg_layout.addWidget(desc_label)
+        
+        # Create button grid layout
+        button_grid = QtWidgets.QGridLayout()
+        
+        # DFM Analysis button
+        self.dfm_button = QtWidgets.QPushButton("DFM Analysis")
+        self.dfm_button.setToolTip("Analyze design for manufacturability issues")
+        self.dfm_button.clicked.connect(self.on_dfm_clicked)
+        button_grid.addWidget(self.dfm_button, 0, 0)
+        
+        # Cost Estimation button
+        self.cost_button = QtWidgets.QPushButton("Cost Estimation")
+        self.cost_button.setToolTip("Estimate manufacturing costs")
+        self.cost_button.clicked.connect(self.on_cost_clicked)
+        button_grid.addWidget(self.cost_button, 0, 1)
+        
+        # Tool Recommendations button
+        self.tools_button = QtWidgets.QPushButton("Tool Recommendations")
+        self.tools_button.setToolTip("Get tool and machining recommendations")
+        self.tools_button.clicked.connect(self.on_tools_clicked)
+        button_grid.addWidget(self.tools_button, 1, 0)
+        
+        # Manufacturing Method Comparison button
+        self.compare_button = QtWidgets.QPushButton("Compare Methods")
+        self.compare_button.setToolTip("Compare different manufacturing methods")
+        self.compare_button.clicked.connect(self.on_compare_clicked)
+        button_grid.addWidget(self.compare_button, 1, 1)
+        
+        # Add button grid to layout
+        mfg_layout.addLayout(button_grid)
+        
+        # Add status indicator for cloud features
+        cloud_status_layout = QtWidgets.QHBoxLayout()
+        self.cloud_feature_status = QtWidgets.QLabel("Ready")
+        cloud_status_layout.addWidget(QtWidgets.QLabel("Status:"))
+        cloud_status_layout.addWidget(self.cloud_feature_status)
+        cloud_status_layout.addStretch()
+        mfg_layout.addLayout(cloud_status_layout)
+        
+        # Set the layout to the group box
+        mfg_group.setLayout(mfg_layout)
+        
+        # Add the group box to the main layout
+        layout.addWidget(mfg_group)
+    
+    def on_dfm_clicked(self):
+        """Handle DFM analysis button click"""
+        self.add_system_message("Running DFM analysis...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before running DFM analysis.")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Processing DFM analysis...")
+            
+            # Run DFM analysis using the manufacturing feature manager
+            result = self.mfg_feature_manager.analyze_dfm()
+            
+            if result and result.get('success'):
+                # Format the DFM results for display
+                score = result.get('manufacturability_score', 0)
+                issues = result.get('issues', [])
+                recommendations = result.get('recommendations', [])
+                
+                # Create a formatted message
+                message = f"<b>DFM Analysis Results</b><br>"
+                message += f"<b>Manufacturability Score:</b> {score}/100<br><br>"
+                
+                if issues:
+                    message += "<b>Issues Found:</b><br>"
+                    for i, issue in enumerate(issues):
+                        severity = issue.get('severity', 'medium')
+                        color = "red" if severity == "high" else "orange" if severity == "medium" else "green"
+                        message += f"<span style='color:{color}'>{i+1}. {issue.get('description')}</span><br>"
+                    message += "<br>"
+                else:
+                    message += "<b>No manufacturability issues found.</b><br><br>"
+                
+                if recommendations:
+                    message += "<b>Recommendations:</b><br>"
+                    for i, rec in enumerate(recommendations):
+                        message += f"{i+1}. {rec}<br>"
+                
+                # Add the formatted message to chat
+                self.add_assistant_message(message)
+                
+                # Visualize issues if available
+                if issues and hasattr(self.mfg_feature_manager, 'visualize_dfm_issues'):
+                    self.mfg_feature_manager.visualize_dfm_issues(issues)
+                    self.add_system_message("DFM issues visualized in the 3D view.")
+            else:
+                error_msg = result.get('error', 'Unknown error during DFM analysis') if result else "Failed to get DFM analysis results"
+                self.add_system_message(f"Error: {error_msg}")
+                self.add_assistant_message("I couldn't complete the DFM analysis. Please check if your model is valid and try again.")
+        except Exception as e:
+            self.add_system_message(f"Error during DFM analysis: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+    
+    def on_cost_clicked(self):
+        """Handle cost estimation button click"""
+        self.add_system_message("Running cost estimation...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before running cost estimation.")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Processing cost estimation...")
+            
+            # Run cost estimation using the manufacturing feature manager
+            result = self.mfg_feature_manager.estimate_cost()
+            
+            if result and result.get('success'):
+                # Format the cost results for display
+                total_cost = result.get('total_cost', 0)
+                currency = result.get('currency', 'USD')
+                breakdown = result.get('cost_breakdown', {})
+                optimization = result.get('optimization_suggestions', [])
+                
+                # Create a formatted message
+                message = f"<b>Cost Estimation Results</b><br>"
+                message += f"<b>Total Estimated Cost:</b> {currency} {total_cost:.2f}<br><br>"
+                
+                if breakdown:
+                    message += "<b>Cost Breakdown:</b><br>"
+                    for category, amount in breakdown.items():
+                        message += f"{category}: {currency} {float(amount):.2f}<br>"
+                    message += "<br>"
+                
+                if optimization:
+                    message += "<b>Cost Optimization Suggestions:</b><br>"
+                    for i, suggestion in enumerate(optimization):
+                        message += f"{i+1}. {suggestion}<br>"
+                
+                # Add the formatted message to chat
+                self.add_assistant_message(message)
+            else:
+                error_msg = result.get('error', 'Unknown error during cost estimation') if result else "Failed to get cost estimation results"
+                self.add_system_message(f"Error: {error_msg}")
+                self.add_assistant_message("I couldn't complete the cost estimation. Please check if your model is valid and try again.")
+        except Exception as e:
+            self.add_system_message(f"Error during cost estimation: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+    
+    def on_tools_clicked(self):
+        """Handle tool recommendations button click"""
+        self.add_system_message("Getting tool recommendations...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before getting tool recommendations.")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Processing tool recommendations...")
+            
+            # Get tool recommendations using the manufacturing feature manager
+            result = self.mfg_feature_manager.recommend_tools()
+            
+            if result and result.get('success'):
+                # Format the tool recommendations for display
+                tools = result.get('recommended_tools', [])
+                parameters = result.get('machining_parameters', {})
+                
+                # Create a formatted message
+                message = f"<b>Tool Recommendations</b><br><br>"
+                
+                if tools:
+                    message += "<b>Recommended Tools:</b><br>"
+                    for i, tool in enumerate(tools):
+                        tool_name = tool.get('name', f"Tool {i+1}")
+                        tool_type = tool.get('type', 'Unknown')
+                        diameter = tool.get('diameter', 0)
+                        message += f"{i+1}. {tool_name} ({tool_type}, {diameter}mm)<br>"
+                    message += "<br>"
+                else:
+                    message += "<b>No specific tools recommended.</b><br><br>"
+                
+                if parameters:
+                    message += "<b>Machining Parameters:</b><br>"
+                    for param, value in parameters.items():
+                        message += f"{param}: {value}<br>"
+                
+                # Add the formatted message to chat
+                self.add_assistant_message(message)
+                
+                # Visualize tool paths if available
+                if hasattr(self.mfg_feature_manager, 'visualize_tool_paths'):
+                    self.mfg_feature_manager.visualize_tool_paths()
+                    self.add_system_message("Tool paths visualized in the 3D view.")
+            else:
+                error_msg = result.get('error', 'Unknown error getting tool recommendations') if result else "Failed to get tool recommendations"
+                self.add_system_message(f"Error: {error_msg}")
+                self.add_assistant_message("I couldn't get tool recommendations. Please check if your model is valid and try again.")
+        except Exception as e:
+            self.add_system_message(f"Error getting tool recommendations: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+    
+    def on_compare_clicked(self):
+        """Handle manufacturing method comparison button click"""
+        self.add_system_message("Comparing manufacturing methods...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before comparing manufacturing methods.")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Comparing manufacturing methods...")
+            
+            # Compare manufacturing methods using the manufacturing feature manager
+            result = self.mfg_feature_manager.compare_manufacturing_methods()
+            
+            if result and result.get('success'):
+                # Format the comparison results for display
+                comparisons = result.get('comparisons', [])
+                recommendation = result.get('recommended_method', {})
+                
+                # Create a formatted message
+                message = f"<b>Manufacturing Method Comparison</b><br><br>"
+                
+                if recommendation:
+                    method_name = recommendation.get('name', 'Unknown')
+                    reason = recommendation.get('reason', 'No specific reason provided')
+                    message += f"<b>Recommended Method:</b> {method_name}<br>"
+                    message += f"<b>Reason:</b> {reason}<br><br>"
+                
+                if comparisons:
+                    message += "<b>Method Comparison:</b><br>"
+                    message += "<table border='1' cellpadding='3' style='border-collapse: collapse;'>"
+                    message += "<tr><th>Method</th><th>Cost</th><th>Time</th><th>Quality</th><th>Suitability</th></tr>"
+                    
+                    for comp in comparisons:
+                        method = comp.get('method', 'Unknown')
+                        cost = comp.get('cost', 'N/A')
+                        time = comp.get('time', 'N/A')
+                        quality = comp.get('quality', 'N/A')
+                        suitability = comp.get('suitability', 0)
+                        
+                        # Convert suitability to stars
+                        stars = '★' * int(suitability) + '☆' * (5 - int(suitability))
+                        
+                        message += f"<tr><td>{method}</td><td>{cost}</td><td>{time}</td><td>{quality}</td><td>{stars}</td></tr>"
+                    
+                    message += "</table>"
+                
+                # Add the formatted message to chat
+                self.add_assistant_message(message)
+            else:
+                error_msg = result.get('error', 'Unknown error comparing manufacturing methods') if result else "Failed to compare manufacturing methods"
+                self.add_system_message(f"Error: {error_msg}")
+                self.add_assistant_message("I couldn't compare manufacturing methods. Please check if your model is valid and try again.")
+        except Exception as e:
+            self.add_system_message(f"Error comparing manufacturing methods: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+
     
     def closeEvent(self, event):
         """Handle window close event"""
