@@ -50,12 +50,15 @@ def get_cloud_integration():
     
     return _CLOUD_INTEGRATION
 
-def analyze_dfm(manufacturing_process="3d_printing"):
+def analyze_dfm(manufacturing_process="3d_printing", material="pla", production_volume=1, advanced_analysis=True):
     """
     Analyze design for manufacturability using cloud service
     
     Args:
         manufacturing_process: Target manufacturing process
+        material: Material to use for manufacturing
+        production_volume: Production quantity
+        advanced_analysis: Whether to use advanced DFM analysis
         
     Returns:
         Dict containing DFM analysis results
@@ -71,18 +74,92 @@ def analyze_dfm(manufacturing_process="3d_printing"):
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
             }
         
-        # Call DFM service
-        result = cloud_integration.analyze_dfm(manufacturing_process)
+        # Call cloud service for DFM analysis
+        try:
+            # Debug: Print parameters
+            print(f"Calling cloud service: {cloud_integration.base_url}{cloud_integration.dfm_endpoint}")
+            
+            # Call the cloud service
+            result = cloud_integration.analyze_dfm(
+                manufacturing_process=manufacturing_process,
+                material=material,
+                production_volume=production_volume,
+                advanced_analysis=advanced_analysis
+            )
+            
+            # Make sure result has a data key
+            if "data" not in result:
+                result["data"] = {}
+                print("DEBUG: Created data dictionary in result")      
+        except Exception as e:
+            print(f"Error in DFM analysis: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "error": str(e),
+                "service": "dfm",
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
         
         # Display results in console
         if result.get("success", False):
             FreeCAD.Console.PrintMessage("DFM Analysis completed successfully\n")
             
+            # Debug: Print the structure of the response
+            print("DEBUG: Analyzing DFM response structure")
+            if "data" in result:
+                print(f"DEBUG: Result data keys: {list(result['data'].keys()) if isinstance(result['data'], dict) else 'Not a dictionary'}")
+            else:
+                print("DEBUG: No 'data' key in result")
+                print(f"DEBUG: Available keys in result: {list(result.keys())}")
+            
             # Get DFM report
+            print("DEBUG: Attempting to get DFM report")
             report = cloud_integration.get_dfm_report()
-            FreeCAD.Console.PrintMessage(f"{report}\n")
+            print(f"DEBUG: Got DFM report of length {len(report) if report else 0}")
+            
+            # Debug: Print report content
+            if report:
+                print("\n=== DFM REPORT PREVIEW ===\n")
+                print(report[:200] + "..." if len(report) > 200 else report)
+                print("\n=== END DFM REPORT PREVIEW ===\n")
+                if "data" not in result:
+                    result["data"] = {}
+                    print("DEBUG: Created new data dictionary in result")
+                else:
+                    print(f"DEBUG: Existing data keys: {list(result['data'].keys())}")
+                    
+                # Extract data from the DFM service for the UI
+                score = cloud_integration.dfm_service.get_manufacturability_score()
+                issues = cloud_integration.dfm_service.get_dfm_issues()
+                recommendations = cloud_integration.dfm_service.get_improvement_recommendations()
+                
+                # Create a new data structure for the UI
+                result["data"] = {
+                    "manufacturability_score": score,
+                    "issues": issues,
+                    "recommendations": recommendations,
+                    "report_text": report
+                }
+                
+                print(f"DEBUG: Created new data structure for UI with score: {score}")
+                print(f"DEBUG: Added {len(issues)} issues to new data structure")
+                print(f"DEBUG: Added {len(recommendations)} recommendations to new data structure")
+                
+                print(f"DEBUG: Added score: {score} to result data")
+                print(f"DEBUG: Added {len(issues)} issues to result data")
+                print(f"DEBUG: Added {len(recommendations)} recommendations to result data")
+                print(f"DEBUG: Added report_text of length {len(report)} to result data")
+                print("DEBUG: Final result data keys: {}".format(list(result["data"].keys())))
+                
+                # Print the first part of the report for debugging
+                print("DEBUG: First 100 chars of report_text: {}".format(report[:100] if report else "None"))
+            else:
+                print("DEBUG: Empty DFM report returned")
+                FreeCAD.Console.PrintWarning("No DFM analysis results available to display\n")
             
             # Visualize issues
+            print("DEBUG: Attempting to visualize DFM issues")
             cloud_integration.visualize_dfm_issues()
         else:
             FreeCAD.Console.PrintError(f"DFM Analysis failed: {result.get('error', 'Unknown error')}\n")
@@ -314,7 +391,12 @@ def call_feature(name, payload=None, base_url=None):
         if cloud_integration:
             # Map feature name to appropriate function
             if name == "dfm_analysis" or name == "dfm_overlay":
-                return analyze_dfm(payload.get("manufacturing_process", "3d_printing"))
+                return analyze_dfm(
+                    manufacturing_process=payload.get("manufacturing_process", "3d_printing"),
+                    material=payload.get("material", "pla"),
+                    production_volume=payload.get("production_volume", 1),
+                    advanced_analysis=payload.get("advanced_analysis", True)
+                )
                 
             elif name == "cost_estimate":
                 return estimate_cost(

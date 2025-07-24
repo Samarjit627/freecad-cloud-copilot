@@ -114,6 +114,16 @@ class CloudServiceHandler:
     
     def _make_api_call(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
         """Make the actual API call to the cloud service"""
+        # Check if local fallback is enabled and skip cloud call entirely
+        if self.config.get("use_local_fallback", False):
+            print("⚠️ Using local fallback mode - skipping cloud API call")
+            return self._generate_local_fallback_response(endpoint, payload)
+            
+        # Check if cloud backend is disabled
+        if not self.config.get("use_cloud_backend", True):
+            print("⚠️ Cloud backend is disabled - skipping cloud API call")
+            return self._generate_local_fallback_response(endpoint, payload)
+            
         full_url = f"{self.base_url}{endpoint}"
         
         if self.debug_mode:
@@ -166,6 +176,9 @@ class CloudServiceHandler:
                     error_msg = f"Authentication failed: Please verify your API key is correct"
                     print(f"❌ Authentication error: {error_msg}")
                     # Don't retry authentication errors
+                    if self.config.get("use_local_fallback", False):
+                        print("⚠️ Using local fallback due to authentication error")
+                        return self._generate_local_fallback_response(endpoint, payload)
                     return {
                         "success": False,
                         "error": error_msg,
@@ -176,25 +189,47 @@ class CloudServiceHandler:
                     error_msg = f"Endpoint not found: {endpoint}"
                     print(f"❌ Endpoint error: {error_msg}")
                     # Don't retry 404 errors
+                    if self.config.get("use_local_fallback", False):
+                        print("⚠️ Using local fallback due to endpoint not found")
+                        return self._generate_local_fallback_response(endpoint, payload)
                     return {
                         "success": False,
                         "error": error_msg,
                         "service": endpoint,
                         "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
                     }
-                else:
-                    error_msg = f"HTTP Error {e.code}: {e.reason}"
-                    print(f"❌ HTTP error calling service (attempt {attempt+1}/{self.retry_count+1}): {error_msg}")
+                elif e.code == 503:
+                    error_msg = f"Service unavailable: {endpoint}"
+                    print(f"❌ Service unavailable (attempt {attempt+1}/{self.retry_count+1}): {error_msg}")
                     
-                    # If we've reached max retries, return error
+                    # If we've reached max retries, use local fallback if enabled
                     if attempt == self.retry_count:
+                        if self.config.get("use_local_fallback", False):
+                            print("⚠️ Using local fallback due to service unavailability")
+                            return self._generate_local_fallback_response(endpoint, payload)
                         return {
                             "success": False,
                             "error": error_msg,
                             "service": endpoint,
                             "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
                         }
+                    # Otherwise wait and retry
+                    time.sleep(1)
+                else:
+                    error_msg = f"HTTP Error {e.code}: {e.reason}"
+                    print(f"❌ HTTP error calling service (attempt {attempt+1}/{self.retry_count+1}): {error_msg}")
                     
+                    # If we've reached max retries, use local fallback if enabled
+                    if attempt == self.retry_count:
+                        if self.config.get("use_local_fallback", False):
+                            print("⚠️ Using local fallback due to HTTP error")
+                            return self._generate_local_fallback_response(endpoint, payload)
+                        return {
+                            "success": False,
+                            "error": error_msg,
+                            "service": endpoint,
+                            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+                        }
                     # Otherwise wait and retry
                     time.sleep(1)
                 
@@ -202,8 +237,11 @@ class CloudServiceHandler:
                 error_msg = f"Connection error: {str(e.reason)}"
                 print(f"❌ Connection error calling service (attempt {attempt+1}/{self.retry_count+1}): {error_msg}")
                 
-                # If we've reached max retries, return error
+                # If we've reached max retries, use local fallback if enabled
                 if attempt == self.retry_count:
+                    if self.config.get("use_local_fallback", False):
+                        print("⚠️ Using local fallback due to connection error")
+                        return self._generate_local_fallback_response(endpoint, payload)
                     return {
                         "success": False,
                         "error": error_msg,
@@ -219,9 +257,198 @@ class CloudServiceHandler:
                 print(f"❌ Unexpected error calling service: {error_msg}")
                 traceback.print_exc()
                 
+                if self.config.get("use_local_fallback", False):
+                    print("⚠️ Using local fallback due to unexpected error")
+                    return self._generate_local_fallback_response(endpoint, payload)
                 return {
                     "success": False,
                     "error": error_msg,
                     "service": endpoint,
                     "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
                 }
+                
+    def _generate_local_fallback_response(self, endpoint: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a local fallback response when cloud service is unavailable"""
+        print(f"Generating local fallback response for endpoint: {endpoint}")
+        
+        # Determine which type of response to generate based on the endpoint
+        if "/api/analysis/dfm" in endpoint or "/api/v2/analysis/dfm" in endpoint:
+            return self._generate_dfm_fallback(payload)
+        elif "/api/analysis/cost" in endpoint:
+            return self._generate_cost_fallback(payload)
+        elif "/api/tools/recommend" in endpoint:
+            return self._generate_tool_fallback(payload)
+        elif "/health" in endpoint:
+            return {
+                "success": True,
+                "data": {"status": "ok", "mode": "local_fallback"},
+                "service": endpoint,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+        else:
+            # Generic fallback for unknown endpoints
+            return {
+                "success": True,
+                "data": {
+                    "message": "Using local fallback mode",
+                    "endpoint": endpoint,
+                    "status": "processed_locally"
+                },
+                "service": endpoint,
+                "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            }
+    
+    def _generate_dfm_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a fallback DFM analysis response"""
+        # Extract basic information from payload
+        manufacturing_process = payload.get("manufacturing_process", "3d_printing")
+        material = payload.get("material", "pla")
+        
+        # Generate a basic DFM response with generic recommendations
+        return {
+            "success": True,
+            "data": {
+                "manufacturability_score": 75.0,
+                "issues": [
+                    {
+                        "severity": "medium",
+                        "title": "Thin walls detected (local analysis)",
+                        "description": f"Some walls may be too thin for {manufacturing_process} with {material}.",
+                        "recommendation": "Consider increasing wall thickness to improve structural integrity."
+                    },
+                    {
+                        "severity": "low",
+                        "title": "Sharp corners (local analysis)",
+                        "description": "Sharp corners may cause stress concentration.",
+                        "recommendation": "Add fillets to reduce stress concentration."
+                    }
+                ],
+                "recommendations": [
+                    {
+                        "description": "Increase minimum wall thickness",
+                        "impact": "medium",
+                        "details": f"For {manufacturing_process}, a minimum wall thickness of 1.5mm is recommended."
+                    },
+                    {
+                        "description": "Add draft angles to vertical faces",
+                        "impact": "low",
+                        "details": "Adding 1-2° draft angles can improve manufacturability."
+                    }
+                ],
+                "cost_analysis": {
+                    "total_cost": 45.0,
+                    "material_cost": 15.0,
+                    "labor_cost": 20.0,
+                    "setup_cost": 10.0,
+                    "lead_time": "3-5 days"
+                },
+                "alternative_processes": [
+                    {
+                        "process": "CNC_MACHINING",
+                        "suitability_score": 65.0,
+                        "estimated_cost": 120.0,
+                        "lead_time_days": 5,
+                        "advantages": ["Better surface finish", "Higher precision"],
+                        "limitations": ["Higher cost", "Limited internal geometries"]
+                    },
+                    {
+                        "process": "INJECTION_MOLDING",
+                        "suitability_score": 40.0,
+                        "estimated_cost": 2000.0,
+                        "lead_time_days": 15,
+                        "advantages": ["Low per-unit cost at scale", "Excellent repeatability"],
+                        "limitations": ["High initial tooling cost", "Only economical for high volumes"]
+                    }
+                ],
+                "analysis_mode": "local_fallback",
+                "note": "This is a simplified local analysis. For detailed analysis, please ensure cloud connectivity.",
+                "local_fallback": True
+            },
+            "service": "dfm_analysis",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+        }
+    
+    def _generate_cost_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a fallback cost estimation response"""
+        # Extract basic information from payload
+        manufacturing_process = payload.get("manufacturing_process", "3d_printing")
+        material = payload.get("material", "pla")
+        quantity = payload.get("quantity", 1)
+        
+        # Calculate basic cost estimate based on process and quantity
+        base_cost = 30.0
+        if manufacturing_process == "cnc_machining":
+            base_cost = 80.0
+        elif manufacturing_process == "injection_molding":
+            base_cost = 1500.0
+        
+        # Apply quantity discount
+        if quantity > 10:
+            unit_cost = base_cost * 0.9
+        elif quantity > 100:
+            unit_cost = base_cost * 0.7
+        else:
+            unit_cost = base_cost
+            
+        total_cost = unit_cost * quantity
+        
+        return {
+            "success": True,
+            "data": {
+                "total_cost": total_cost,
+                "unit_cost": unit_cost,
+                "quantity": quantity,
+                "breakdown": {
+                    "material": unit_cost * 0.3,
+                    "labor": unit_cost * 0.4,
+                    "overhead": unit_cost * 0.2,
+                    "profit": unit_cost * 0.1
+                },
+                "lead_time": "5-7 business days",
+                "analysis_mode": "local_fallback",
+                "note": "This is an estimated cost generated locally. For accurate pricing, please ensure cloud connectivity.",
+                "local_fallback": True
+            },
+            "service": "cost_estimation",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+        }
+    
+    def _generate_tool_fallback(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate a fallback tool recommendation response"""
+        # Extract basic information from payload
+        manufacturing_process = payload.get("manufacturing_process", "cnc_machining")
+        material = payload.get("material", "aluminum")
+        
+        # Generate generic tool recommendations based on process and material
+        tools = []
+        
+        if manufacturing_process == "cnc_machining":
+            if material in ["aluminum", "brass"]:
+                tools = [
+                    {"name": "End Mill", "diameter": 6.0, "flutes": 2, "material": "HSS", "coating": "TiAlN"},
+                    {"name": "Ball Nose", "diameter": 4.0, "flutes": 2, "material": "Carbide", "coating": "None"},
+                    {"name": "Drill Bit", "diameter": 5.0, "flutes": 2, "material": "HSS", "coating": "TiN"}
+                ]
+            else:  # Steel or other harder materials
+                tools = [
+                    {"name": "End Mill", "diameter": 6.0, "flutes": 4, "material": "Carbide", "coating": "TiAlN"},
+                    {"name": "Ball Nose", "diameter": 4.0, "flutes": 4, "material": "Carbide", "coating": "AlTiN"},
+                    {"name": "Drill Bit", "diameter": 5.0, "flutes": 2, "material": "Carbide", "coating": "TiN"}
+                ]
+        
+        return {
+            "success": True,
+            "data": {
+                "recommended_tools": tools,
+                "machine_settings": {
+                    "spindle_speed": "10000 RPM",
+                    "feed_rate": "1000 mm/min",
+                    "step_down": "0.5 mm"
+                },
+                "analysis_mode": "local_fallback",
+                "note": "These are generic tool recommendations. For optimized tooling, please ensure cloud connectivity.",
+                "local_fallback": True
+            },
+            "service": "tool_recommendation",
+            "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+        }

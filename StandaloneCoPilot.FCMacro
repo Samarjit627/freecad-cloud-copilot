@@ -15,12 +15,14 @@ Version: 1.1.0 - Cloud Integration for DFM, Cost, and Tool Features
 
 import os
 import sys
-import json
 import time
-import random
-import requests
+import json
+import base64
+import tempfile
 import traceback
 import re
+import random
+import requests
 import math
 import urllib.request
 import urllib.parse
@@ -49,6 +51,7 @@ if _THIS_DIR not in sys.path:
 try:
     from cloud_services.cloud_integration import CloudIntegration
     from utils.cad_extractor import extract_cad_data_for_features
+    from text_to_cad_integration import TextToCADIntegration
     _CLOUD_SERVICES_AVAILABLE = True
 except ImportError:
     print("Warning: Cloud services not available. Some features will be disabled.")
@@ -90,28 +93,37 @@ class ManufacturingFeatureManager:
                 print(f"Error initializing cloud integration: {str(e)}")
                 traceback.print_exc()
     
-    def analyze_dfm(self, manufacturing_process="3d_printing"):
-        """Analyze design for manufacturability"""
+    def analyze_dfm(self, manufacturing_process="3d_printing", material="pla", production_volume=1, advanced_analysis=True):
+        """Analyze design for manufacturability using industry-grade DFM engine"""
         try:
             # Use cloud integration if available
             if self.cloud_integration:
-                result = self.cloud_integration.analyze_dfm(manufacturing_process)
+                result = self.cloud_integration.analyze_dfm(
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    production_volume=production_volume,
+                    advanced_analysis=advanced_analysis
+                )
                 self.last_dfm_result = result
                 return result
             # Otherwise use cloud functions if available
             elif _CLOUD_FUNCTIONS_AVAILABLE:
-                result = analyze_dfm(manufacturing_process)
+                result = analyze_dfm(manufacturing_process, material, production_volume)
                 self.last_dfm_result = result
                 return result
             # Fall back to direct API call
             else:
                 payload = {
                     "manufacturing_process": manufacturing_process,
+                    "material": material,
+                    "production_volume": production_volume,
+                    "advanced_analysis": advanced_analysis,
                     "cad_data": extract_cad_data_for_features()
                 }
                 result = call_feature("dfm_analysis", payload)
                 self.last_dfm_result = result
                 return result
+                
         except Exception as e:
             print(f"Error in DFM analysis: {str(e)}")
             traceback.print_exc()
@@ -253,57 +265,160 @@ class ManufacturingFeatureManager:
             }
     
     def visualize_dfm_issues(self):
-        """Visualize DFM issues in the FreeCAD view"""
+        """Visualize DFM issues in the FreeCAD view using enhanced visualization"""
         try:
             if self.cloud_integration:
+                # Use the enhanced visualization from the DFM service
                 self.cloud_integration.visualize_dfm_issues()
             elif self.last_dfm_result and self.last_dfm_result.get("success", False):
                 # Basic visualization if cloud integration not available
                 issues = self.last_dfm_result.get("data", {}).get("issues", [])
                 if not issues:
-                    FreeCAD.Console.PrintMessage("No DFM issues to visualize\n")
+                    print("No DFM issues to visualize")
                     return
-                    
-                # Create visualization objects
+                
+                # Get active document
                 doc = FreeCAD.ActiveDocument
                 if not doc:
-                    FreeCAD.Console.PrintError("No active document for visualization\n")
+                    print("No active document")
                     return
+                
+                # Remove any existing DFM visualization
+                self._remove_existing_dfm_visualization(doc)
                     
                 # Create a group for DFM issues
                 dfm_group = doc.addObject("App::DocumentObjectGroup", "DFM_Issues")
                 
-                # Add visualization for each issue
+                # Create visualization for each issue with color coding by severity
                 for i, issue in enumerate(issues):
-                    issue_type = issue.get("type", "unknown")
-                    position = issue.get("position", [0, 0, 0])
+                    # Get issue details
+                    description = issue.get("description", f"Issue {i+1}")
                     severity = issue.get("severity", "medium")
+                    location = issue.get("location", None)
+                    
+                    # Determine color based on severity
+                    if severity == "critical" or severity == "high":
+                        color = (1.0, 0.0, 0.0, 0.7)  # Red with transparency
+                    elif severity == "medium":
+                        color = (1.0, 0.7, 0.0, 0.7)  # Orange with transparency
+                    else:
+                        color = (0.0, 0.7, 1.0, 0.7)  # Blue with transparency
                     
                     # Create a sphere at the issue location
-                    sphere = doc.addObject("Part::Sphere", f"DFM_Issue_{i+1}")
-                    sphere.Radius = 2.0  # 2mm radius
-                    sphere.Placement = FreeCAD.Placement(
-                        FreeCAD.Vector(position[0], position[1], position[2]),
-                        FreeCAD.Rotation()
-                    )
+                    if location:
+                        x, y, z = location
+                    else:
+                        # If no specific location, place along the model bounding box
+                        bbox = self._get_model_bounding_box(doc)
+                        x = bbox[0] + (i % 3) * (bbox[3] - bbox[0]) / 3
+                        y = bbox[1] + ((i // 3) % 3) * (bbox[4] - bbox[1]) / 3
+                        z = bbox[2] + (i // 9) * (bbox[5] - bbox[2]) / 3
                     
-                    # Set color based on severity
-                    if hasattr(sphere, "ViewObject"):
-                        if severity == "high":
-                            sphere.ViewObject.ShapeColor = (1.0, 0.0, 0.0)  # Red
-                        elif severity == "medium":
-                            sphere.ViewObject.ShapeColor = (1.0, 0.5, 0.0)  # Orange
-                        else:
-                            sphere.ViewObject.ShapeColor = (1.0, 1.0, 0.0)  # Yellow
+                    # Create sphere
+                    sphere = doc.addObject("Part::Sphere", f"Issue_{i+1}")
+                    sphere.Radius = min(10, max(5, self._get_model_size(doc) / 20))
+                    sphere.Placement.Base = FreeCAD.Vector(x, y, z)
+                    
+                    # Set color and transparency
+                    if hasattr(sphere.ViewObject, "ShapeColor"):
+                        sphere.ViewObject.ShapeColor = color[:3]
+                    if hasattr(sphere.ViewObject, "Transparency"):
+                        sphere.ViewObject.Transparency = int(color[3] * 100)
                     
                     # Add to group
                     dfm_group.addObject(sphere)
+                    
+                    # Add text label
+                    label = self._create_text_label(doc, description, FreeCAD.Vector(x, y, z + sphere.Radius * 1.2))
+                    if label:
+                        dfm_group.addObject(label)
                 
+                # Recompute document
                 doc.recompute()
-                FreeCAD.Console.PrintMessage(f"Visualized {len(issues)} DFM issues\n")
+                return True
+                    
         except Exception as e:
             print(f"Error visualizing DFM issues: {str(e)}")
             traceback.print_exc()
+            return False
+    
+    def _remove_existing_dfm_visualization(self, doc):
+        """Remove any existing DFM visualization objects"""
+        try:
+            # Find and remove existing DFM issue group
+            for obj in doc.Objects:
+                if obj.Name == "DFM_Issues" and obj.TypeId == "App::DocumentObjectGroup":
+                    doc.removeObject(obj.Name)
+                    break
+        except Exception as e:
+            print(f"Error removing existing DFM visualization: {str(e)}")
+    
+    def _get_model_bounding_box(self, doc):
+        """Get the bounding box of the model"""
+        try:
+            # Find all visible shapes
+            shapes = []
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape") and hasattr(obj.ViewObject, "Visibility") and obj.ViewObject.Visibility:
+                    shapes.append(obj.Shape)
+            
+            if not shapes:
+                return (-50, -50, -50, 50, 50, 50)  # Default bounding box
+            
+            # Calculate combined bounding box
+            bbox = shapes[0].BoundBox
+            for shape in shapes[1:]:
+                bbox.add(shape.BoundBox)
+            
+            return (bbox.XMin, bbox.YMin, bbox.ZMin, bbox.XMax, bbox.YMax, bbox.ZMax)
+        except Exception as e:
+            print(f"Error getting model bounding box: {str(e)}")
+            return (-50, -50, -50, 50, 50, 50)  # Default bounding box
+    
+    def _get_model_size(self, doc):
+        """Get the approximate size of the model"""
+        try:
+            bbox = self._get_model_bounding_box(doc)
+            size_x = bbox[3] - bbox[0]
+            size_y = bbox[4] - bbox[1]
+            size_z = bbox[5] - bbox[2]
+            return max(size_x, size_y, size_z)
+        except Exception as e:
+            print(f"Error getting model size: {str(e)}")
+            return 100  # Default size
+    
+    def _create_text_label(self, doc, text, position):
+        """Create a text label at the specified position"""
+        try:
+            # Check if Draft workbench is available
+            if hasattr(FreeCAD, "getDraftWorkingPlane"):
+                import Draft
+                label = Draft.makeText([text], point=position)
+                return label
+            return None
+        except Exception as e:
+            print(f"Error creating text label: {str(e)}")
+            return None
+    
+    def get_cost_analysis(self):
+        """Get detailed cost analysis from the DFM service"""
+        try:
+            if self.cloud_integration and self.last_dfm_result and self.last_dfm_result.get("success", False):
+                return self.cloud_integration.get_cost_analysis()
+            return None
+        except Exception as e:
+            print(f"Error getting cost analysis: {str(e)}")
+            return None
+    
+    def get_alternative_processes(self):
+        """Get alternative manufacturing processes from the DFM service"""
+        try:
+            if self.cloud_integration and self.last_dfm_result and self.last_dfm_result.get("success", False):
+                return self.cloud_integration.get_alternative_processes()
+            return None
+        except Exception as e:
+            print(f"Error getting alternative processes: {str(e)}")
+            return None
     
     def visualize_tool_paths(self):
         """Visualize tool paths in the FreeCAD view"""
@@ -547,6 +662,16 @@ class NaturalLanguageCADEditor:
         self.cloud_client = cloud_client
         self.ai_processor = CloudAIProcessor(cloud_client)
         self.context = DesignContextManager()
+        
+        # Initialize Text-to-CAD integration
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        config_path = os.path.join(this_dir, "cloud_config.json")
+        try:
+            self.text_to_cad = TextToCADIntegration(config_path)
+            print(f"Text-to-CAD integration initialized, connected: {self.text_to_cad.connected}")
+        except Exception as e:
+            print(f"Error initializing Text-to-CAD integration: {str(e)}")
+            self.text_to_cad = None
         self.command_handlers = {}
         
         # Register command handlers
@@ -564,11 +689,14 @@ class NaturalLanguageCADEditor:
     def register_command_handler(self, keyword, handler):
         """Register a command handler for a keyword"""
         self.command_handlers[keyword.lower()] = handler
-    
     def process_command(self, text):
-        """Process command with AI enhancement"""
+        """Process a natural language CAD command"""
         print(f"Processing CAD command: {text}")
         
+        # Check if this is a Text-to-CAD request
+        if self.text_to_cad and self.text_to_cad.is_text_to_cad_request(text):
+            return self.handle_text_to_cad_request(text)
+            
         # Check if this is a complex command that needs AI processing
         if self.is_complex_command(text):
             # Use AI processor
@@ -1210,6 +1338,47 @@ class NaturalLanguageCADEditor:
             print(f"Error adding fillets: {str(e)}")
             return False
 
+    def handle_text_to_cad_request(self, text):
+        """Handle a Text-to-CAD request using the cloud service"""
+        if not self.text_to_cad:
+            return {
+                "success": False,
+                "message": "Text-to-CAD integration is not available"
+            }
+            
+        try:
+            print(f"Processing Text-to-CAD request: {text}")
+            
+            # Create a progress callback function
+            def progress_callback(message):
+                print(f"Text-to-CAD progress: {message}")
+            
+            # Process the request using the improved TextToCADIntegration
+            result = self.text_to_cad.handle_text_to_cad_request(text, progress_callback)
+            
+            if result.get("success", False):
+                return {
+                    "success": True,
+                    "message": result.get("message", "CAD model created successfully"),
+                    "engineering_analysis": result.get("engineering_analysis", "")
+                }
+            else:
+                error_msg = result.get("message", "Unknown error in Text-to-CAD request")
+                print(f"Text-to-CAD request failed: {error_msg}")
+                return {
+                    "success": False,
+                    "message": f"Failed to process Text-to-CAD request: {error_msg}",
+                    "fallback_available": result.get("fallback_available", False)
+                }
+                
+        except Exception as e:
+            print(f"Error in Text-to-CAD request: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "message": f"Error processing Text-to-CAD request: {str(e)}"
+            }
+
 class CloudApiClient:
     """Client for communicating with the Manufacturing Co-Pilot Cloud API"""
     
@@ -1353,10 +1522,7 @@ class CloudApiClient:
             except Exception as e:
                 print(f"Connection with default API key also failed: {str(e)}")
             
-            # Notify listeners if status changed
-            if old_status and not self.connected:
-                self._notify_connection_change()
-            
+            # If we still can't connect, return a local fallback response
             return False
         except Exception as e:
             self.last_error = str(e)
@@ -1459,7 +1625,7 @@ class CloudApiClient:
                 message = payload.get('message', '').lower()
                 
                 # More detailed process detection
-                if 'cnc' in message or 'machining' in message or 'milling' in message:
+                if 'cnc' in message or 'machin' in message or 'mill' in message:
                     process = 'cnc'
                     print(f"DEBUG: Detected CNC machining process from query: '{message}'")
                 elif '3d print' in message or 'fdm' in message or 'printing' in message or 'printed' in message:
@@ -1937,7 +2103,7 @@ class CloudApiClient:
                         emoji = "⚠️"  # Warning for moderate issues
                     else:
                         emoji = "ℹ️"  # Info for minor issues
-                    
+                        
                     # Format the issue and suggestion
                     issue_text = f"{emoji} {issue}"
                     if suggestion:
@@ -2222,6 +2388,10 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.setWindowTitle("Standalone Manufacturing Co-Pilot")
         self.resize(500, 600)
         
+        # Initialize chat entries list
+        self.chat_entries = []
+        print("DEBUG: Initialized chat_entries list in setup_ui")
+        
         # Set dark theme for the entire widget
         self.setStyleSheet("""
             QWidget {
@@ -2431,8 +2601,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Show processing indicator
         self.add_system_message("Processing...")
         
-        # Check if this is a CAD command
-        if self.is_cad_command(message):
+        # Try text-to-CAD first (if available)
+        if hasattr(self, 'nl_cad_editor') and hasattr(self.nl_cad_editor, 'text_to_cad') and self.nl_cad_editor.text_to_cad.is_text_to_cad_request(message):
+            self.process_cad_command(message)
+        # Check if this is a regular CAD command
+        elif self.is_cad_command(message):
             self.process_cad_command(message)
         else:
             # Send message to cloud service for chat
@@ -2485,6 +2658,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             # Add system message
             self.add_system_message(f"Creating CAD model from: '{text}'")
             
+            # Update status indicator
+            self.cloud_feature_status.setText("Processing Text-to-CAD request...")
+            
             # Process command with NL CAD editor
             result = self.nl_cad_editor.process_command(text)
             
@@ -2492,8 +2668,15 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 # Add success message
                 self.add_system_message(f"✅ {result['message']}")
                 
-                # Add assistant message with details
-                self.add_assistant_message(f"I've created the CAD model based on your description. You can see it in the 3D view.")
+                # Check for engineering analysis from Text-to-CAD
+                if 'engineering_analysis' in result and result['engineering_analysis']:
+                    # Format engineering analysis as a detailed message
+                    analysis_message = f"I've created the CAD model based on your description. You can see it in the 3D view.\n\n"
+                    analysis_message += f"**Engineering Analysis:**\n{result['engineering_analysis']}"
+                    self.add_assistant_message(analysis_message)
+                else:
+                    # Add standard assistant message with details
+                    self.add_assistant_message(f"I've created the CAD model based on your description. You can see it in the 3D view.")
             else:
                 # Add error message
                 self.add_system_message(f"❌ {result['message']}")
@@ -2505,6 +2688,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             # Add error message
             self.add_system_message(f"Error processing CAD command: {str(e)}")
             traceback.print_exc()
+        finally:
+            # Reset status indicator
+            self.cloud_feature_status.setText("Ready")
     
     def update_status(self, connected, quality="unknown", latency=0):
         """Update the cloud connection status indicator"""
@@ -2557,32 +2743,146 @@ class StandaloneCoPilot(QtWidgets.QWidget):
     
     def add_system_message(self, message):
         """Add a system message to the chat history"""
+        print(f"DEBUG: add_system_message called with message: {message}")
         timestamp = datetime.now().strftime("%H:%M")
-        self.chat_history.append(f"<b>[{timestamp}] System:</b> {message}")
+        chat_entry = f"<b>[{timestamp}] System:</b> {message}"
+        
+        # Initialize chat_entries as a list if it doesn't exist
+        if not hasattr(self, 'chat_entries') or self.chat_entries is None:
+            print("DEBUG: Initializing chat_entries as a list in add_system_message")
+            self.chat_entries = []
+            
+        # Ensure chat_entries is a list before appending
+        if not isinstance(self.chat_entries, list):
+            print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list in add_system_message")
+            self.chat_entries = [str(self.chat_entries)]
+            
+        self.chat_entries.append(chat_entry)
+        print("DEBUG: Updated chat_entries with system message, refreshing display")
+        # Force refresh of the chat display
+        self._update_chat_display()
         
     def remove_last_processing_message(self):
         """Remove the last 'Processing...' message from chat history"""
-        # Get current HTML content
-        html = self.chat_history.toHtml()
+        print("DEBUG: Removing last processing message")
         
+        # Initialize chat_entries if needed
+        if not hasattr(self, 'chat_entries') or not isinstance(self.chat_entries, list):
+            print("DEBUG: No chat_entries list to remove from")
+            return
+            
         # Find and remove the last processing message
-        processing_text = "<b>[\d+:\d+] System:</b> Processing..."
-        import re
-        html = re.sub(processing_text, "", html, count=1)
-        
-        # Set the modified HTML content
-        self.chat_history.setHtml(html)
+        for i in range(len(self.chat_entries) - 1, -1, -1):
+            if "Processing..." in self.chat_entries[i]:
+                print(f"DEBUG: Found processing message at index {i}")
+                self.chat_entries.pop(i)
+                print("DEBUG: Removed processing message, refreshing display")
+                self._update_chat_display()
+                return
+                
+        print("DEBUG: No processing message found to remove")
     
     def add_user_message(self, message):
         """Add a user message to the chat history"""
+        print(f"DEBUG: add_user_message called with message: {message}")
         timestamp = datetime.now().strftime("%H:%M")
-        self.chat_history.append(f"<b>[{timestamp}] You:</b> {message}")
+        chat_entry = f"<b>[{timestamp}] You:</b> {message}"
+        
+        # Initialize chat_entries as a list if it doesn't exist
+        if not hasattr(self, 'chat_entries') or self.chat_entries is None:
+            print("DEBUG: Initializing chat_entries as a list in add_user_message")
+            self.chat_entries = []
+            
+        # Ensure chat_entries is a list before appending
+        if not isinstance(self.chat_entries, list):
+            print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list in add_user_message")
+            self.chat_entries = [str(self.chat_entries)]
+            
+        self.chat_entries.append(chat_entry)
+        print("DEBUG: Updated chat_entries with user message, refreshing display")
+        # Force refresh of the chat display
+        self._update_chat_display()
     
     def add_assistant_message(self, message):
         """Add an assistant message to the chat history"""
+        print(f"DEBUG: add_assistant_message called with message length: {len(message)}")
         timestamp = datetime.now().strftime("%H:%M")
-        self.chat_history.append(f"<b>[{timestamp}] Manufacturing Co-Pilot:</b> {message}")
-    
+        chat_entry = f"<b>[{timestamp}] Manufacturing Co-Pilot:</b> {message}"
+        print(f"DEBUG: Adding entry to chat_entries, length: {len(chat_entry)}")
+        
+        # Initialize chat_entries as a list if it doesn't exist
+        if not hasattr(self, 'chat_entries') or self.chat_entries is None:
+            print("DEBUG: Initializing chat_entries as a list")
+            self.chat_entries = []
+            
+        # Ensure chat_entries is a list before appending
+        if not isinstance(self.chat_entries, list):
+            print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list")
+            self.chat_entries = [str(self.chat_entries)]
+            
+        self.chat_entries.append(chat_entry)
+        print("DEBUG: Updated chat_entries, refreshing display")
+        # Force refresh of the chat display
+        self._update_chat_display()
+        
+    def _update_chat_display(self):
+        """Update the chat display with the current chat history"""
+        print("DEBUG: _update_chat_display called")
+        
+        try:
+            # Check if chat_entries attribute exists and is a list
+            if not hasattr(self, 'chat_entries'):
+                print("DEBUG: Initializing chat_entries as a list")
+                self.chat_entries = []
+            
+            # Ensure chat_entries is a list
+            if not isinstance(self.chat_entries, list):
+                print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list")
+                self.chat_entries = [str(self.chat_entries)]
+            
+            # Check if chat_history attribute exists and is a QTextEdit widget
+            if hasattr(self, 'chat_history') and isinstance(self.chat_history, QtWidgets.QTextEdit):
+                print("DEBUG: chat_history is a QTextEdit widget")
+                print(f"DEBUG: Found {len(self.chat_entries)} chat entries")
+                
+                # Join all entries with proper HTML line breaks
+                html_content = "<html><body>"
+                for entry in self.chat_entries:
+                    html_content += entry + "<br><br>"
+                html_content += "</body></html>"
+                
+                # Set the HTML content to the widget
+                print(f"DEBUG: Setting HTML content of length {len(html_content)}")
+                self.chat_history.setHtml(html_content)
+                print("DEBUG: Updated chat_history widget with HTML content")
+                
+                # Scroll to bottom
+                scrollbar = self.chat_history.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+                print("DEBUG: Scrolled to bottom of chat_history")
+            else:
+                print("DEBUG: chat_history is not a QTextEdit widget, outputting to console instead")
+                print("\n=== CHAT HISTORY ===\n")
+                for entry in self.chat_entries:
+                    # Strip HTML tags for console output
+                    plain_text = re.sub('<[^<]+?>', '', entry)
+                    print(plain_text)
+                print("\n=== END CHAT HISTORY ===\n")
+        except Exception as e:
+            print(f"ERROR: Failed to update chat display: {str(e)}")
+            traceback.print_exc()
+            
+    def on_clear_clicked(self):
+        """Handle clear button click"""
+        self.chat_history.clear()
+        self.add_system_message("Chat history cleared.")
+
+    def add_manufacturing_features_ui(self, layout):
+        """Add cloud manufacturing features UI elements"""
+        # Create group box for manufacturing features
+        mfg_group = QtWidgets.QGroupBox("Cloud Manufacturing Features")
+        mfg_layout = QtWidgets.QVBoxLayout()
+        
     def on_analyze_clicked(self):
         """Handle analyze button click"""
         self.add_system_message("Analyzing current model...")
@@ -2656,8 +2956,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         button_grid = QtWidgets.QGridLayout()
         
         # DFM Analysis button
-        self.dfm_button = QtWidgets.QPushButton("DFM Analysis")
-        self.dfm_button.setToolTip("Analyze design for manufacturability issues")
+        self.dfm_button = QtWidgets.QPushButton("Advanced DFM Analysis")
+        self.dfm_button.setToolTip("Analyze design for manufacturability using industry-grade DFM engine")
         self.dfm_button.clicked.connect(self.on_dfm_clicked)
         button_grid.addWidget(self.dfm_button, 0, 0)
         
@@ -2697,53 +2997,270 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         layout.addWidget(mfg_group)
     
     def on_dfm_clicked(self):
-        """Handle DFM analysis button click"""
-        self.add_system_message("Running DFM analysis...")
+        """Handle DFM analysis button click with advanced options"""
+        self.add_system_message("Preparing advanced DFM analysis...")
         try:
             # Check if there's an active document
             if not FreeCAD.ActiveDocument:
                 self.add_system_message("No active document found")
                 self.add_assistant_message("Please open or create a model before running DFM analysis.")
                 return
-                
-            # Update status
-            self.cloud_feature_status.setText("Processing DFM analysis...")
             
-            # Run DFM analysis using the manufacturing feature manager
-            result = self.mfg_feature_manager.analyze_dfm()
+            # Create dialog for advanced DFM options
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Advanced DFM Analysis Options")
+            dialog.setMinimumWidth(400)
+            
+            # Create form layout for options
+            form_layout = QtWidgets.QFormLayout(dialog)
+            
+            # Manufacturing process selection
+            process_combo = QtWidgets.QComboBox()
+            process_combo.addItems([
+                "3D Printing (FDM)", 
+                "CNC Machining", 
+                "Injection Molding",
+                "Sheet Metal Forming",
+                "Die Casting"
+            ])
+            form_layout.addRow("Manufacturing Process:", process_combo)
+            
+            # Material selection
+            material_combo = QtWidgets.QComboBox()
+            material_combo.addItems([
+                "PLA", "ABS", "Nylon",  # 3D Printing materials
+                "Aluminum", "Steel", "Brass",  # Metals
+                "Polypropylene", "ABS", "Polycarbonate"  # Injection molding materials
+            ])
+            form_layout.addRow("Material:", material_combo)
+            
+            # Production volume
+            volume_spin = QtWidgets.QSpinBox()
+            volume_spin.setRange(1, 1000000)
+            volume_spin.setValue(100)
+            volume_spin.setSingleStep(10)
+            form_layout.addRow("Production Volume:", volume_spin)
+            
+            # Advanced analysis checkbox
+            advanced_check = QtWidgets.QCheckBox("Enable advanced analysis")
+            advanced_check.setChecked(True)
+            advanced_check.setToolTip("Includes detailed cost analysis and alternative process recommendations")
+            form_layout.addRow("", advanced_check)
+            
+            # Add buttons
+            button_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            form_layout.addRow(button_box)
+            
+            # Show dialog and get results
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                self.add_system_message("DFM analysis cancelled")
+                return
+            
+            # Get selected options
+            process_text = process_combo.currentText()
+            material_text = material_combo.currentText().lower()
+            production_volume = volume_spin.value()
+            advanced_analysis = advanced_check.isChecked()
+            
+            # Map process text to process code
+            process_map = {
+                "3D Printing (FDM)": "3d_printing",
+                "CNC Machining": "cnc_machining",
+                "Injection Molding": "injection_molding",
+                "Sheet Metal Forming": "sheet_metal",
+                "Die Casting": "die_casting"
+            }
+            process_code = process_map.get(process_text, "3d_printing")
+            
+            # Update status
+            self.cloud_feature_status.setText("Processing advanced DFM analysis...")
+            self.add_system_message(f"Running advanced DFM analysis for {process_text} with {material_text} material...")
+            
+            # Run DFM analysis using the manufacturing feature manager with advanced options
+            result = self.mfg_feature_manager.analyze_dfm(
+                manufacturing_process=process_code,
+                material=material_text,
+                production_volume=production_volume,
+                advanced_analysis=advanced_analysis
+            )
             
             if result and result.get('success'):
-                # Format the DFM results for display
-                score = result.get('manufacturability_score', 0)
-                issues = result.get('issues', [])
-                recommendations = result.get('recommendations', [])
+                print("DEBUG: DFM analysis successful, processing UI display")
+                print(f"DEBUG: Result keys: {list(result.keys())}")
+                
+                # Get the data from the result
+                data = result.get('data', {})
+                print(f"DEBUG: Data keys in result: {list(data.keys())}")
+                
+                # Try to get data from the transformed format first
+                score = data.get('manufacturability_score', 0)
+                issues = data.get('issues', [])
+                recommendations = data.get('recommendations', [])
+                report_text = data.get('report_text', '')
+                
+                # If we don't have a score, try to get it from the original format
+                if score == 0 and 'overall_manufacturability_score' in data:
+                    score = data.get('overall_manufacturability_score', 0)
+                    print("DEBUG: Using overall_manufacturability_score from transformed data")
+                    
+                # If we don't have issues, try to get them from the original format
+                if not issues and 'manufacturing_issues' in data:
+                    issues = data.get('manufacturing_issues', [])
+                    print(f"DEBUG: Using manufacturing_issues from transformed data: {issues}")
+                    
+                # If we don't have issues, try to get them from design_issues
+                if not issues and 'design_issues' in data:
+                    design_issues = data.get('design_issues', [])
+                    print(f"DEBUG: Found {len(design_issues)} design_issues")
+                    
+                    # Convert design_issues to our format
+                    for issue in design_issues:
+                        if isinstance(issue, str):
+                            issues.append({
+                                'severity': 'medium',
+                                'description': issue
+                            })
+                        elif isinstance(issue, dict):
+                            issues.append(issue)
+                    
+                    print(f"DEBUG: Converted {len(issues)} design_issues to issues format")
+                    
+                # If we don't have recommendations, try to get them from the original format
+                if not recommendations and 'expert_recommendations' in data:
+                    recommendations = data.get('expert_recommendations', [])
+                    print("DEBUG: Using expert_recommendations from transformed data")
+                
+                print(f"DEBUG: UI received score: {score}")
+                print(f"DEBUG: UI received {len(issues)} issues")
+                print(f"DEBUG: UI received {len(recommendations)} recommendations")
+                print(f"DEBUG: UI received report_text of length {len(report_text)}")
+                if report_text:
+                    print(f"DEBUG: First 100 chars of report_text: {report_text[:100]}")
+                else:
+                    print("DEBUG: No report_text received, generating from available data")
+                    # Generate report text from available data
+                    report_lines = []
+                    report_lines.append("=== DESIGN FOR MANUFACTURING ANALYSIS ===")
+                    report_lines.append(f"Manufacturability Score: {score}/100")
+                    report_lines.append("")
+                    
+                    # Add issues
+                    report_lines.append(f"--- Manufacturing Issues ({len(issues)}) ---")
+                    if issues:
+                        for issue in issues:
+                            if isinstance(issue, dict):
+                                description = issue.get('description', 'Unknown issue')
+                                severity = issue.get('severity', 'medium')
+                                recommendation = issue.get('recommendation', '')
+                                
+                                # Add severity indicator
+                                if severity == 'critical':
+                                    report_lines.append(f"❌ {description}")
+                                elif severity == 'high':
+                                    report_lines.append(f"⚠️ {description}")
+                                else:
+                                    report_lines.append(f"ℹ️ {description}")
+                                    
+                                if recommendation:
+                                    report_lines.append(f"   → {recommendation}")
+                            else:
+                                report_lines.append(f"• {issue}")
+                    else:
+                        report_lines.append("No manufacturability issues found.")
+                    
+                    # Add recommendations
+                    if recommendations:
+                        report_lines.append("\n--- Expert Recommendations ---")
+                        for rec in recommendations:
+                            if isinstance(rec, dict):
+                                description = rec.get('description', 'Unknown recommendation')
+                                report_lines.append(f"• {description}")
+                            else:
+                                report_lines.append(f"• {rec}")
+                    
+                    report_text = "\n".join(report_lines)
+                    print(f"DEBUG: Generated report text of length {len(report_text)}")
+                    data['report_text'] = report_text
                 
                 # Create a formatted message
-                message = f"<b>DFM Analysis Results</b><br>"
+                message = f"<b>Advanced DFM Analysis Results</b><br>"
+                message += f"<b>Process:</b> {process_text}<br>"
+                message += f"<b>Material:</b> {material_text}<br>"
+                message += f"<b>Production Volume:</b> {production_volume} units<br>"
                 message += f"<b>Manufacturability Score:</b> {score}/100<br><br>"
                 
+                # Check if we have a pre-formatted report text
+                report_text = data.get('report_text', '')
+                if report_text:
+                    print(f"DEBUG: Processing report_text for display, length: {len(report_text)}")
+                    # Convert the report text to HTML
+                    report_html = report_text.replace('\n', '<br>')
+                    print(f"DEBUG: HTML report length: {len(report_html)}")
+                    message += f"<div style='background-color: #2d2d2d; color: #ffffff; padding: 10px; border-radius: 5px;'>{report_html}</div><br>"
+                    print("DEBUG: Added report HTML to message")
+                    
+                    # Also print the report to the console for debugging
+                    print("\n=== DFM REPORT TEXT ===\n")
+                    print(report_text)
+                    print("\n=== END DFM REPORT TEXT ===\n")
+                else:
+                    print("DEBUG: No report_text available for display")
+                
+                # Display issues with severity color coding
                 if issues:
-                    message += "<b>Issues Found:</b><br>"
+                    message += "<b>Manufacturing Issues:</b><br>"
                     for i, issue in enumerate(issues):
                         severity = issue.get('severity', 'medium')
-                        color = "red" if severity == "high" else "orange" if severity == "medium" else "green"
+                        color = "red" if severity in ["critical", "high"] else "orange" if severity == "medium" else "blue"
                         message += f"<span style='color:{color}'>{i+1}. {issue.get('description')}</span><br>"
                     message += "<br>"
                 else:
                     message += "<b>No manufacturability issues found.</b><br><br>"
                 
+                # Get cost analysis if advanced analysis was enabled
+                if advanced_analysis:
+                    cost_analysis = self.mfg_feature_manager.get_cost_analysis()
+                    if cost_analysis:
+                        message += "<b>Cost Analysis:</b><br>"
+                        message += f"Total Cost: ${cost_analysis.get('total_cost', 0):.2f}<br>"
+                        
+                        # Show cost breakdown
+                        breakdown = cost_analysis.get('cost_breakdown', {})
+                        if breakdown:
+                            message += "<u>Cost Breakdown:</u><br>"
+                            for category, amount in breakdown.items():
+                                message += f"- {category}: ${float(amount):.2f}<br>"
+                            message += "<br>"
+                    
+                    # Get alternative processes
+                    alt_processes = self.mfg_feature_manager.get_alternative_processes()
+                    if alt_processes:
+                        message += "<b>Alternative Manufacturing Processes:</b><br>"
+                        for proc in alt_processes:
+                            proc_name = proc.get('process_name', 'Unknown')
+                            suitability = proc.get('suitability_score', 0)
+                            est_cost = proc.get('estimated_cost', 0)
+                            message += f"- {proc_name}: Suitability {suitability}/100, Est. Cost: ${est_cost:.2f}<br>"
+                        message += "<br>"
+                
+                # Display expert recommendations
                 if recommendations:
-                    message += "<b>Recommendations:</b><br>"
+                    message += "<b>Expert Recommendations:</b><br>"
                     for i, rec in enumerate(recommendations):
                         message += f"{i+1}. {rec}<br>"
                 
                 # Add the formatted message to chat
+                print("DEBUG: Adding DFM analysis results to chat")
                 self.add_assistant_message(message)
+                print("DEBUG: DFM analysis results added to chat")
                 
-                # Visualize issues if available
-                if issues and hasattr(self.mfg_feature_manager, 'visualize_dfm_issues'):
-                    self.mfg_feature_manager.visualize_dfm_issues(issues)
-                    self.add_system_message("DFM issues visualized in the 3D view.")
+                # Visualize issues in 3D view
+                self.mfg_feature_manager.visualize_dfm_issues()
+                self.add_system_message("DFM analysis complete. Issues visualized in the 3D view.")
             else:
                 error_msg = result.get('error', 'Unknown error during DFM analysis') if result else "Failed to get DFM analysis results"
                 self.add_system_message(f"Error: {error_msg}")
@@ -2756,27 +3273,112 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.cloud_feature_status.setText("Ready")
     
     def on_cost_clicked(self):
-        """Handle cost estimation button click"""
-        self.add_system_message("Running cost estimation...")
+        """Handle cost estimation button click with enhanced options"""
+        self.add_system_message("Preparing cost estimation...")
         try:
             # Check if there's an active document
             if not FreeCAD.ActiveDocument:
                 self.add_system_message("No active document found")
                 self.add_assistant_message("Please open or create a model before running cost estimation.")
                 return
-                
+            
+            # Create dialog for cost estimation options
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Advanced Cost Estimation Options")
+            dialog.setMinimumWidth(400)
+            
+            # Create form layout for options
+            form_layout = QtWidgets.QFormLayout(dialog)
+            
+            # Manufacturing process selection
+            process_combo = QtWidgets.QComboBox()
+            process_combo.addItems([
+                "3D Printing (FDM)", 
+                "CNC Machining", 
+                "Injection Molding",
+                "Sheet Metal Forming",
+                "Die Casting"
+            ])
+            form_layout.addRow("Manufacturing Process:", process_combo)
+            
+            # Material selection
+            material_combo = QtWidgets.QComboBox()
+            material_combo.addItems([
+                "PLA", "ABS", "Nylon",  # 3D Printing materials
+                "Aluminum", "Steel", "Brass",  # Metals
+                "Polypropylene", "ABS", "Polycarbonate"  # Injection molding materials
+            ])
+            form_layout.addRow("Material:", material_combo)
+            
+            # Production volume
+            volume_spin = QtWidgets.QSpinBox()
+            volume_spin.setRange(1, 1000000)
+            volume_spin.setValue(100)
+            volume_spin.setSingleStep(10)
+            form_layout.addRow("Production Volume:", volume_spin)
+            
+            # Region selection
+            region_combo = QtWidgets.QComboBox()
+            region_combo.addItems(["Global", "North America", "Europe", "Asia", "Other"])
+            form_layout.addRow("Region:", region_combo)
+            
+            # Add buttons
+            button_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            form_layout.addRow(button_box)
+            
+            # Show dialog and get results
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                self.add_system_message("Cost estimation cancelled")
+                return
+            
+            # Get selected options
+            process_text = process_combo.currentText()
+            material_text = material_combo.currentText().lower()
+            production_volume = volume_spin.value()
+            region_text = region_combo.currentText().lower().replace(" ", "_")
+            
+            # Map process text to process code
+            process_map = {
+                "3D Printing (FDM)": "3d_printing",
+                "CNC Machining": "cnc_machining",
+                "Injection Molding": "injection_molding",
+                "Sheet Metal Forming": "sheet_metal",
+                "Die Casting": "die_casting"
+            }
+            process_code = process_map.get(process_text, "3d_printing")
+            
             # Update status
             self.cloud_feature_status.setText("Processing cost estimation...")
+            self.add_system_message(f"Running cost estimation for {process_text} with {material_text} material...")
             
-            # Run cost estimation using the manufacturing feature manager
-            result = self.mfg_feature_manager.estimate_cost()
+            # Run cost estimation using the manufacturing feature manager with advanced options
+            result = self.mfg_feature_manager.estimate_cost(
+                manufacturing_process=process_code,
+                material=material_text,
+                quantity=production_volume,
+                region=region_text
+            )
             
             if result and result.get('success'):
-                # Format the cost results for display
-                total_cost = result.get('total_cost', 0)
-                currency = result.get('currency', 'USD')
-                breakdown = result.get('cost_breakdown', {})
-                optimization = result.get('optimization_suggestions', [])
+                # Try to get enhanced cost analysis from DFM engine first
+                cost_analysis = self.mfg_feature_manager.get_cost_analysis()
+                
+                if cost_analysis:
+                    # Use the enhanced cost analysis from DFM engine
+                    total_cost = cost_analysis.get('total_cost', 0)
+                    currency = cost_analysis.get('currency', 'USD')
+                    breakdown = cost_analysis.get('cost_breakdown', {})
+                    optimization = cost_analysis.get('optimization_suggestions', [])
+                else:
+                    # Fall back to standard cost estimation
+                    total_cost = result.get('total_cost', 0)
+                    currency = result.get('currency', 'USD')
+                    breakdown = result.get('cost_breakdown', {})
+                    optimization = result.get('optimization_suggestions', [])
                 
                 # Create a formatted message
                 message = f"<b>Cost Estimation Results</b><br>"
@@ -2807,28 +3409,100 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.cloud_feature_status.setText("Ready")
     
     def on_tools_clicked(self):
-        """Handle tool recommendations button click"""
-        self.add_system_message("Getting tool recommendations...")
+        """Handle tool recommendations button click with enhanced options"""
+        self.add_system_message("Preparing tool recommendations...")
         try:
             # Check if there's an active document
             if not FreeCAD.ActiveDocument:
                 self.add_system_message("No active document found")
-                self.add_assistant_message("Please open or create a model before getting tool recommendations.")
+                self.add_assistant_message("Please open or create a model before running tool recommendations.")
                 return
-                
+            
+            # Create dialog for tool recommendation options
+            dialog = QtWidgets.QDialog(self)
+            dialog.setWindowTitle("Advanced Tool Recommendation Options")
+            dialog.setMinimumWidth(400)
+            
+            # Create form layout for options
+            form_layout = QtWidgets.QFormLayout(dialog)
+            
+            # Manufacturing process selection (focus on machining processes)
+            process_combo = QtWidgets.QComboBox()
+            process_combo.addItems([
+                "CNC Machining", 
+                "Milling",
+                "Turning",
+                "Drilling",
+                "EDM"
+            ])
+            form_layout.addRow("Manufacturing Process:", process_combo)
+            
+            # Material selection
+            material_combo = QtWidgets.QComboBox()
+            material_combo.addItems([
+                "Aluminum", "Steel", "Stainless Steel", "Brass", "Titanium", 
+                "Plastic", "Composite", "Wood"
+            ])
+            form_layout.addRow("Material:", material_combo)
+            
+            # Machine type selection
+            machine_combo = QtWidgets.QComboBox()
+            machine_combo.addItems([
+                "3-Axis CNC", "5-Axis CNC", "CNC Lathe", "CNC Mill", "Universal"
+            ])
+            form_layout.addRow("Machine Type:", machine_combo)
+            
+            # Add buttons
+            button_box = QtWidgets.QDialogButtonBox(
+                QtWidgets.QDialogButtonBox.Ok | QtWidgets.QDialogButtonBox.Cancel
+            )
+            button_box.accepted.connect(dialog.accept)
+            button_box.rejected.connect(dialog.reject)
+            form_layout.addRow(button_box)
+            
+            # Show dialog and get results
+            if dialog.exec_() != QtWidgets.QDialog.Accepted:
+                self.add_system_message("Tool recommendations cancelled")
+                return
+            
+            # Get selected options
+            process_text = process_combo.currentText()
+            material_text = material_combo.currentText().lower()
+            machine_type = machine_combo.currentText().lower().replace("-", "_").replace(" ", "_")
+            
+            # Map process text to process code
+            process_map = {
+                "CNC Machining": "cnc_machining",
+                "Milling": "milling",
+                "Turning": "turning",
+                "Drilling": "drilling",
+                "EDM": "edm"
+            }
+            process_code = process_map.get(process_text, "cnc_machining")
+            
             # Update status
             self.cloud_feature_status.setText("Processing tool recommendations...")
+            self.add_system_message(f"Running tool recommendations for {process_text} with {material_text} material...")
             
-            # Get tool recommendations using the manufacturing feature manager
-            result = self.mfg_feature_manager.recommend_tools()
+            # Run tool recommendations using the manufacturing feature manager with advanced options
+            result = self.mfg_feature_manager.recommend_tools(
+                manufacturing_process=process_code,
+                material=material_text,
+                machine_type=machine_type
+            )
             
             if result and result.get('success'):
-                # Format the tool recommendations for display
-                tools = result.get('recommended_tools', [])
-                parameters = result.get('machining_parameters', {})
+                # Get data from the result
+                data = result.get('data', {})
+                tools = data.get('tools', [])
+                machine_type_result = data.get('machine_type', machine_type)
+                material_result = data.get('material', material_text)
                 
                 # Create a formatted message
-                message = f"<b>Tool Recommendations</b><br><br>"
+                message = f"<b>Advanced Tool Recommendations</b><br>"
+                message += f"<b>Process:</b> {process_text}<br>"
+                message += f"<b>Machine Type:</b> {machine_type_result}<br>"
+                message += f"<b>Material:</b> {material_result}<br><br>"
                 
                 if tools:
                     message += "<b>Recommended Tools:</b><br>"
@@ -2836,15 +3510,27 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                         tool_name = tool.get('name', f"Tool {i+1}")
                         tool_type = tool.get('type', 'Unknown')
                         diameter = tool.get('diameter', 0)
-                        message += f"{i+1}. {tool_name} ({tool_type}, {diameter}mm)<br>"
-                    message += "<br>"
+                        speed = tool.get('speed', 0)
+                        feed = tool.get('feed', 0)
+                        
+                        message += f"<b>{i+1}. {tool_name}</b> ({tool_type})<br>"
+                        message += f"   Diameter: {diameter}mm | Speed: {speed} RPM | Feed: {feed} mm/min<br>"
+                        
+                        # Add efficiency rating if available
+                        if 'efficiency_rating' in tool:
+                            efficiency = tool.get('efficiency_rating', 0)
+                            message += f"   Efficiency Rating: {efficiency}/100<br>"
+                        
+                        # Add tool path strategy if available
+                        if 'recommended_strategy' in tool:
+                            strategy = tool.get('recommended_strategy', '')
+                            message += f"   Recommended Strategy: {strategy}<br>"
+                        
+                        if 'description' in tool:
+                            message += f"   <i>{tool['description']}</i><br>"
+                        message += "<br>"
                 else:
-                    message += "<b>No specific tools recommended.</b><br><br>"
-                
-                if parameters:
-                    message += "<b>Machining Parameters:</b><br>"
-                    for param, value in parameters.items():
-                        message += f"{param}: {value}<br>"
+                    message += "<b>No tool recommendations available for this model.</b><br>"
                 
                 # Add the formatted message to chat
                 self.add_assistant_message(message)
@@ -2854,11 +3540,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     self.mfg_feature_manager.visualize_tool_paths()
                     self.add_system_message("Tool paths visualized in the 3D view.")
             else:
-                error_msg = result.get('error', 'Unknown error getting tool recommendations') if result else "Failed to get tool recommendations"
+                error_msg = result.get('error', 'Unknown error during tool recommendations') if result else "Failed to get tool recommendations"
                 self.add_system_message(f"Error: {error_msg}")
                 self.add_assistant_message("I couldn't get tool recommendations. Please check if your model is valid and try again.")
         except Exception as e:
-            self.add_system_message(f"Error getting tool recommendations: {str(e)}")
+            self.add_system_message(f"Error during tool recommendations: {str(e)}")
             traceback.print_exc()
         finally:
             # Reset status
