@@ -17,6 +17,42 @@ try:
 except ImportError:
     print("Warning: FreeCAD modules not available in this context")
 
+def get_center_of_mass(shape, axis):
+    """
+    Safely get the center of mass coordinate for a shape
+    
+    Args:
+        shape: FreeCAD shape object
+        axis: Coordinate axis ('x', 'y', or 'z')
+        
+    Returns:
+        float: Coordinate value or 0.0 if not available
+    """
+    try:
+        # For Part.Compound objects that don't have CenterOfMass directly
+        if not hasattr(shape, 'CenterOfMass'):
+            # Use bounding box center as fallback
+            bbox = shape.BoundBox
+            if axis == 'x':
+                return (bbox.XMin + bbox.XMax) / 2.0
+            elif axis == 'y':
+                return (bbox.YMin + bbox.YMax) / 2.0
+            elif axis == 'z':
+                return (bbox.ZMin + bbox.ZMax) / 2.0
+            return 0.0
+        
+        # For shapes with CenterOfMass attribute
+        if axis == 'x':
+            return shape.CenterOfMass.x
+        elif axis == 'y':
+            return shape.CenterOfMass.y
+        elif axis == 'z':
+            return shape.CenterOfMass.z
+        return 0.0
+    except Exception:
+        # Return 0.0 as fallback if any error occurs
+        return 0.0
+
 def extract_cad_data_for_features():
     """
     Extract comprehensive CAD data for use with microservice features
@@ -83,9 +119,9 @@ def extract_cad_data_for_features():
                         "height": bbox.ZLength
                     },
                     "center_of_mass": {
-                        "x": shape.CenterOfMass.x,
-                        "y": shape.CenterOfMass.y,
-                        "z": shape.CenterOfMass.z
+                        "x": get_center_of_mass(shape, 'x'),
+                        "y": get_center_of_mass(shape, 'y'),
+                        "z": get_center_of_mass(shape, 'z')
                     },
                     "geometry": {
                         "faces": len(shape.Faces) if hasattr(shape, 'Faces') else 0,
