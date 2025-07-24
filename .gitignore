@@ -60,3 +60,4 @@ cloud_backend/deploy_*.sh
 *.bak
 *.tmp
 *.log
+.env
