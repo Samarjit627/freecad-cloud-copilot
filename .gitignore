@@ -42,3 +42,21 @@ Thumbs.db
 
 # Local configuration
 local_settings.py
+cloud_config_local.json
+
+# Test and debug files
+*_test.py
+debug_*.py
+test_*.json
+
+# Multiple versions of Dockerfiles and deployment scripts
+# Keep only the main ones
+cloud_backend/Dockerfile.*
+cloud_backend/deploy_*.sh
+!cloud_backend/Dockerfile
+!cloud_backend/deploy.sh
+
+# Temporary and backup files
+*.bak
+*.tmp
+*.log
