@@ -49,6 +49,19 @@ cloud_config_local.json
 debug_*.py
 test_*.json
 
+# Backup and temporary files
+*.backup
+*.before_fix
+*.original
+old_function.txt
+
+# Virtual environments
+venv_py312/
+venv_py312_new/
+
+# Logs
+logs/
+
 # Multiple versions of Dockerfiles and deployment scripts
 # Keep only the main ones
 cloud_backend/Dockerfile.*
