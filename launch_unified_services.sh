@@ -3,7 +3,7 @@
 # Starts both the unified server and the local server
 
 # Default ports
-UNIFIED_SERVER_PORT=8080
+UNIFIED_SERVER_PORT=8083
 LOCAL_SERVER_PORT=8090
 
 # Colors for terminal output

@@ -10,7 +10,7 @@ import sys
 import time
 
 # Configuration
-BASE_URL = "http://localhost:8080"
+BASE_URL = "http://localhost:8090"
 API_KEY = "test-api-key"
 HEADERS = {
     "Content-Type": "application/json",

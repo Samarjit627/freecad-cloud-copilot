@@ -9,7 +9,7 @@ import traceback
 from fastapi import APIRouter, Depends, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import DFM services
 from services.dfm_engine import DFMEngine
@@ -85,7 +85,7 @@ async def analyze_design(request: DFMRequest, api_key: str = Depends(verify_api_
         # Perform DFM analysis
         start_time = time.time()
         result = dfm_engine.analyze(
-            cad_data=cad_data.dict(),
+            cad_data=cad_data.model_dump(),
             material=user_requirements.material,
             process=user_requirements.target_process,
             production_volume=user_requirements.production_volume,

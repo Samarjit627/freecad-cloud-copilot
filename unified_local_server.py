@@ -34,7 +34,7 @@ class UnifiedCloudProxy:
     Handles both DFM analysis and Text-to-CAD requests
     """
     
-    def __init__(self, cloud_url: str = "http://localhost:8080"):
+    def __init__(self, cloud_url: str = "http://localhost:8084"):
         """Initialize the cloud proxy with the unified server URL"""
         self.cloud_url = cloud_url
         self.api_key = API_KEY
@@ -348,18 +348,47 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             }
             
             self.wfile.write(json.dumps(response).encode())
+        elif self.path == '/list-capabilities':
+            # Forward capabilities request to the unified server
+            try:
+                # Verify API key
+                api_key = self.headers.get('X-API-Key')
+                if api_key != API_KEY:
+                    self._set_headers(401)
+                    response = {"status": "error", "message": "Invalid API key"}
+                    self.wfile.write(json.dumps(response).encode())
+                    return
+                    
+                # Forward the request to the unified server
+                url = f"{self.cloud_proxy.cloud_url}/list-capabilities"
+                headers = {"X-API-Key": self.cloud_proxy.api_key}
+                
+                req = urllib.request.Request(url, headers=headers)
+                with urllib.request.urlopen(req, timeout=10) as response:
+                    result = json.loads(response.read().decode('utf-8'))
+                    
+                # Send response
+                self._set_headers()
+                self.wfile.write(json.dumps(result).encode())
+                
+            except Exception as e:
+                # Error handling
+                logger.error(f"Error forwarding capabilities request: {e}")
+                self._set_headers(500)
+                response = {"status": "error", "message": str(e)}
+                self.wfile.write(json.dumps(response).encode())
         else:
             # Unknown endpoint
             self._set_headers(404)
             response = {"status": "error", "message": "Endpoint not found"}
             self.wfile.write(json.dumps(response).encode())
-    
+
     def do_POST(self):
         """Handle POST requests"""
         if self.path == '/api/v2/analyze':
             # DFM analysis endpoint
             self._handle_dfm_analysis()
-        elif self.path == '/api/v1/text-to-cad':
+        elif self.path == '/api/v1/text-to-cad' or self.path == '/text-to-cad':
             # Text-to-CAD endpoint
             self._handle_text_to_cad()
         else:
@@ -367,7 +396,7 @@ class RequestHandler(http.server.BaseHTTPRequestHandler):
             self._set_headers(404)
             response = {"status": "error", "message": "Endpoint not found"}
             self.wfile.write(json.dumps(response).encode())
-    
+
     def _handle_dfm_analysis(self):
         """Handle DFM analysis requests"""
         # Verify API key

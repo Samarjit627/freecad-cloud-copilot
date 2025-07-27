@@ -7,13 +7,14 @@ if [ ! -d "venv" ]; then
     python3 -m venv venv
 fi
 
-# Activate virtual environment
+# Activate virtual environment if it exists
 echo "Activating virtual environment..."
-source venv/bin/activate
+source ../venv_py312/bin/activate || true
 
-# Install dependencies
+# Install dependencies with specific versions to avoid compatibility issues
 echo "Installing dependencies..."
-pip install -r requirements.txt
+pip install fastapi==0.95.2 uvicorn==0.22.0 pydantic==1.10.8
+pip install python-dotenv requests
 
 # Create .env file from template if it doesn't exist
 if [ ! -f ".env" ]; then
@@ -28,4 +29,6 @@ mkdir -p routers/__pycache__
 
 # Run the server
 echo "Starting unified server..."
-python -m uvicorn main:app --host 0.0.0.0 --port ${PORT:-8080} --reload
+# Get port from environment variable or use default
+port=${PORT:-8081}
+python3 -m uvicorn main:app --host 0.0.0.0 --port $port --reload

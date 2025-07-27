@@ -9,7 +9,7 @@ import traceback
 from fastapi import APIRouter, Depends, HTTPException, Security, Request
 from fastapi.security import APIKeyHeader
 from typing import Dict, Any, List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 # Import Text-to-CAD services
 from services.text_to_cad_engine import TextToCADEngine

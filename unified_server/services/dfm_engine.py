@@ -118,7 +118,9 @@ class DFMEngine:
             })
         
         # Check for support structures needed
-        if geometry.get("overhangs", False) and process == "FDM_PRINTING":
+        # We'll check if this is an FDM printing process based on min_feature_size
+        is_fdm = process_data.get("min_feature_size", 0) >= 0.3
+        if geometry.get("overhangs", False) and is_fdm:
             issues.append({
                 "type": "overhangs",
                 "severity": "medium",
@@ -179,13 +181,13 @@ class DFMEngine:
                 })
         
         # Add material or process recommendations if appropriate
-        if material == "PLA" and process == "FDM_PRINTING" and random.random() < 0.5:
+        if material.upper() == "PLA" and random.random() < 0.5:
             recommendations.append({
                 "type": "material_change",
                 "description": "Consider PETG for better mechanical properties if the part needs durability"
             })
             
-        if process == "INJECTION_MOLDING" and random.random() < 0.5:
+        if process.upper() == "INJECTION_MOLDING" and random.random() < 0.5:
             recommendations.append({
                 "type": "design_for_process",
                 "description": "Add draft angles to vertical walls to facilitate part ejection"
@@ -235,9 +237,10 @@ class DFMEngine:
     def _calculate_lead_time(self, process: str, production_volume: int) -> Dict[str, Any]:
         """Calculate manufacturing lead time"""
         # Base lead time in days
-        if process == "INJECTION_MOLDING":
+        process_upper = process.upper()
+        if process_upper == "INJECTION_MOLDING":
             base_lead_time = 30  # Longer for tooling creation
-        elif process in ["CNC_MACHINING"]:
+        elif process_upper in ["CNC_MACHINING"]:
             base_lead_time = 10
         else:  # 3D printing processes
             base_lead_time = 5

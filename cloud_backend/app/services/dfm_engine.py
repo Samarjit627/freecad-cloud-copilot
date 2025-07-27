@@ -9,7 +9,7 @@ from typing import Dict, List, Any, Optional, Tuple
 
 from ..models.dfm_models import (
     ProcessType, MaterialType, DFMAnalysisRequest, DFMAnalysisResponse,
-    ManufacturingIssue, CostAnalysis, ProcessSuitability, Point3D
+    ManufacturingIssue, CostAnalysis, ProcessSuitability, Point3D, CADGeometry
 )
 
 # Import analysis methods
