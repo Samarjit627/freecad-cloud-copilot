@@ -1,5 +1,5 @@
 {
-  "cloud_api_url": "http://localhost:8080",
+  "cloud_api_url": "http://localhost:8091",
   "cloud_api_key": "test-api-key",
   "default_analysis_endpoint": "/api/v2/analyze",
   "fallback_endpoints": [
@@ -12,7 +12,7 @@
   "connection_timeout": 10,
   "retry_count": 1,
   "use_dedicated_dfm_endpoint": false,
-  "use_local_fallback": false,
-  "text_to_cad_endpoint": "http://localhost:9999",
+  "use_local_fallback": true,
+  "text_to_cad_endpoint": "http://localhost:8084",
   "text_to_cad_api_key": "test-api-key"
 }
