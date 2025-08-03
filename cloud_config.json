@@ -1,6 +1,6 @@
 {
   "cloud_api_url": "http://localhost:8091",
-  "cloud_api_key": "test-api-key",
+  "cloud_api_key": "${ANTHROPIC_API_KEY}",
   "default_analysis_endpoint": "/api/v2/analyze",
   "fallback_endpoints": [
     "/health"

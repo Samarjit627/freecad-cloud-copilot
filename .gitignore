@@ -1,5 +1,12 @@
 # Python
 __pycache__/
+
+# Environment variables and secrets
+.env
+.env.local
+.env.production
+*.env
+cloud_config_local.json
 *.py[cod]
 *$py.class
 *.so
