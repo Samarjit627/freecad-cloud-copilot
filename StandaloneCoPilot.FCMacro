@@ -104,6 +104,59 @@ class ManufacturingFeatureManager:
                     production_volume=production_volume,
                     advanced_analysis=advanced_analysis
                 )
+                
+                # Check if cloud service failed to provide detailed analysis
+                if result and result.get('success'):
+                    data = result.get('data', {})
+                    design_issues = data.get('design_issues', [])
+                    
+                    # Check if cloud returned "Unable to perform detailed analysis"
+                    has_insufficient_analysis = any(
+                        isinstance(issue, str) and 'Unable to perform detailed analysis' in issue
+                        for issue in design_issues
+                    )
+                    
+                    if has_insufficient_analysis:
+                        print("🔄 Cloud DFM returned insufficient analysis, creating hybrid analysis...")
+                        
+                        try:
+                            from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer
+                            
+                            # Extract CAD data for local analysis
+                            cad_data = extract_cad_data_for_features()
+                            
+                            # Initialize enhanced local analyzer
+                            local_analyzer = EnhancedLocalDFMAnalyzer()
+                            
+                            # Perform enhanced local analysis
+                            local_result = local_analyzer.analyze_dfm(
+                                cad_data=cad_data,
+                                manufacturing_process=manufacturing_process,
+                                material=material,
+                                production_volume=production_volume
+                            )
+                            
+                            if local_result.get('success'):
+                                print("✅ Enhanced local DFM analysis successful!")
+                                
+                                # Create hybrid result combining cloud + local insights
+                                hybrid_result = self._create_hybrid_dfm_result(
+                                    cloud_result=result,
+                                    local_result=local_result,
+                                    manufacturing_process=manufacturing_process,
+                                    material=material,
+                                    production_volume=production_volume
+                                )
+                                
+                                print("🎆 Hybrid DFM analysis complete - combining cloud AI + local expertise!")
+                                self.last_dfm_result = hybrid_result
+                                return hybrid_result
+                            else:
+                                print("❌ Enhanced local DFM analysis failed, using cloud result")
+                                
+                        except Exception as local_e:
+                            print(f"Enhanced local DFM analysis error: {str(local_e)}")
+                
                 self.last_dfm_result = result
                 return result
             # Otherwise use cloud functions if available
@@ -127,12 +180,107 @@ class ManufacturingFeatureManager:
         except Exception as e:
             print(f"Error in DFM analysis: {str(e)}")
             traceback.print_exc()
+            
+            # Try enhanced local DFM analysis as fallback
+            try:
+                print("🔄 Attempting enhanced local DFM analysis...")
+                from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer
+                
+                # Extract CAD data for local analysis
+                cad_data = extract_cad_data_for_features()
+                
+                # Initialize enhanced local analyzer
+                local_analyzer = EnhancedLocalDFMAnalyzer()
+                
+                # Perform enhanced local analysis
+                result = local_analyzer.analyze_dfm(
+                    cad_data=cad_data,
+                    manufacturing_process=manufacturing_process,
+                    material=material,
+                    production_volume=production_volume
+                )
+                
+                if result.get('success'):
+                    print("✅ Enhanced local DFM analysis successful!")
+                    self.last_dfm_result = result
+                    return result
+                else:
+                    print("❌ Enhanced local DFM analysis failed")
+                    
+            except Exception as local_e:
+                print(f"Enhanced local DFM analysis error: {str(local_e)}")
+            
             return {
                 "success": False,
                 "error": str(e),
                 "service": "dfm",
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
             }
+    
+    def _create_hybrid_dfm_result(self, cloud_result, local_result, manufacturing_process, material, production_volume):
+        """Create a hybrid DFM result combining cloud AI insights with enhanced local analysis"""
+        try:
+            # Get data from both sources
+            cloud_data = cloud_result.get('data', {})
+            local_data = local_result.get('data', {})
+            
+            # Start with the enhanced local analysis as the base (more accurate for Indian market)
+            hybrid_data = local_data.copy()
+            
+            # Enhance with cloud AI insights where available
+            # 1. Use cloud's material suggestions if they exist and are meaningful
+            cloud_materials = cloud_data.get('material_suggestions', [])
+            if cloud_materials and cloud_materials != ['ABS', 'PLA', 'Aluminum']:  # Not generic
+                hybrid_data['alternative_materials'] = cloud_materials
+            
+            # 2. Use cloud's process recommendations if they exist and are meaningful
+            cloud_processes = cloud_data.get('process_recommendations', [])
+            if cloud_processes and cloud_processes != ['3D Printing', 'CNC Machining']:  # Not generic
+                hybrid_data['alternative_processes_ai'] = cloud_processes
+            
+            # 3. Combine manufacturing features analysis
+            cloud_features = cloud_data.get('manufacturing_features', {})
+            if cloud_features:
+                hybrid_data['ai_insights'] = {
+                    'complexity_rating': cloud_features.get('complexity_rating', 'Unknown'),
+                    'moldability_score': cloud_features.get('moldability_score', 0),
+                    'ai_analysis_available': True
+                }
+            else:
+                hybrid_data['ai_insights'] = {
+                    'ai_analysis_available': False,
+                    'note': 'Cloud AI analysis not available for this geometry'
+                }
+            
+            # 4. Enhanced analysis summary
+            hybrid_data['analysis_summary'] = {
+                'primary_analysis': 'Enhanced Local DFM (Indian Market Focus)',
+                'ai_enhancement': 'Cloud AI Insights' if cloud_features else 'Not Available',
+                'cost_analysis': 'Verified Indian Market Rates',
+                'supplier_context': 'Indian Manufacturing Ecosystem',
+                'confidence_level': 'High' if cloud_features else 'Medium'
+            }
+            
+            # 5. Add hybrid service identifier
+            hybrid_result = {
+                'success': True,
+                'data': hybrid_data,
+                'service': 'hybrid_dfm_cloud_local',
+                'timestamp': local_result.get('timestamp', ''),
+                'analysis_components': {
+                    'enhanced_local_dfm': True,
+                    'cloud_ai_insights': bool(cloud_features),
+                    'indian_market_context': True,
+                    'verified_rates': True
+                }
+            }
+            
+            return hybrid_result
+            
+        except Exception as e:
+            print(f"Error creating hybrid DFM result: {str(e)}")
+            # Fallback to local result if hybrid creation fails
+            return local_result
     
     def estimate_cost(self, manufacturing_process="3d_printing", material="pla", quantity=1, region="global"):
         """Estimate manufacturing cost"""
@@ -3142,11 +3290,30 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     print(f"DEBUG: First 100 chars of report_text: {report_text[:100]}")
                 else:
                     print("DEBUG: No report_text received, generating from available data")
-                    # Generate report text from available data
+                    # Generate comprehensive report text from all available data
                     report_lines = []
                     report_lines.append("=== DESIGN FOR MANUFACTURING ANALYSIS ===")
                     report_lines.append(f"Manufacturability Score: {score}/100")
+                    
+                    # Add overall rating if available
+                    overall_rating = data.get('overall_rating', '')
+                    if overall_rating:
+                        report_lines.append(f"Overall Rating: {overall_rating}")
                     report_lines.append("")
+                    
+                    # Add geometry summary if available
+                    geometry_summary = data.get('geometry_summary', {})
+                    if geometry_summary:
+                        report_lines.append("--- Geometry Analysis ---")
+                        if 'volume' in geometry_summary:
+                            report_lines.append(f"Volume: {geometry_summary['volume']:.2f} mm³")
+                        if 'faces' in geometry_summary:
+                            report_lines.append(f"Faces: {geometry_summary['faces']}")
+                        if 'holes' in geometry_summary:
+                            report_lines.append(f"Holes: {geometry_summary['holes']}")
+                        if 'fillets' in geometry_summary:
+                            report_lines.append(f"Fillets: {geometry_summary['fillets']}")
+                        report_lines.append("")
                     
                     # Add issues
                     report_lines.append(f"--- Manufacturing Issues ({len(issues)}) ---")
@@ -3171,19 +3338,159 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                                 report_lines.append(f"• {issue}")
                     else:
                         report_lines.append("No manufacturability issues found.")
+                    report_lines.append("")
                     
-                    # Add recommendations
+                    # Add cost analysis if available
+                    cost_analysis = data.get('cost_analysis', {})
+                    if cost_analysis:
+                        report_lines.append("--- Cost Analysis ---")
+                        if 'estimated_cost_per_part' in cost_analysis:
+                            cost = cost_analysis['estimated_cost_per_part']
+                            if isinstance(cost, dict):
+                                if 'inr' in cost:
+                                    report_lines.append(f"Estimated Cost: ₹{cost['inr']:.2f} per part")
+                                if 'usd' in cost:
+                                    report_lines.append(f"Estimated Cost (USD): ${cost['usd']:.2f} per part")
+                                    report_lines.append(f"Exchange Rate: 1 USD = ₹83 (approx)")
+                            else:
+                                report_lines.append(f"Estimated Cost: ₹{cost:.2f} per part")
+                        
+                        if 'material_cost' in cost_analysis:
+                            report_lines.append(f"Material Cost: ₹{cost_analysis['material_cost']:.2f}")
+                        if 'processing_cost' in cost_analysis:
+                            report_lines.append(f"Processing Cost: ₹{cost_analysis['processing_cost']:.2f}")
+                        if 'tooling_cost' in cost_analysis:
+                            report_lines.append(f"Tooling Cost: ₹{cost_analysis['tooling_cost']:.2f}")
+                        report_lines.append("")
+                    
+                    # Add process recommendations
+                    process_recs = data.get('process_recommendations', [])
+                    if process_recs:
+                        report_lines.append("--- Process Recommendations ---")
+                        for proc in process_recs:
+                            if isinstance(proc, dict):
+                                process_name = proc.get('process', 'Unknown Process')
+                                suitability = proc.get('suitability_score', 'N/A')
+                                cost = proc.get('estimated_cost', 'N/A')
+                                report_lines.append(f"• {process_name}: Suitability {suitability}/100, Cost: {cost}")
+                                
+                                advantages = proc.get('advantages', [])
+                                if advantages:
+                                    for adv in advantages:
+                                        report_lines.append(f"  ✓ {adv}")
+                                        
+                                limitations = proc.get('limitations', [])
+                                if limitations:
+                                    for lim in limitations:
+                                        report_lines.append(f"  ⚠ {lim}")
+                            else:
+                                report_lines.append(f"• {proc}")
+                        report_lines.append("")
+                    
+                    # Add AI insights if available (from hybrid analysis)
+                    ai_insights = data.get('ai_insights', {})
+                    if ai_insights:
+                        report_lines.append("--- AI Insights ---")
+                        if ai_insights.get('ai_analysis_available'):
+                            complexity = ai_insights.get('complexity_rating', 'Unknown')
+                            moldability = ai_insights.get('moldability_score', 0)
+                            report_lines.append(f"Complexity Rating: {complexity}")
+                            report_lines.append(f"Moldability Score: {moldability}/10")
+                            report_lines.append("AI Analysis: Available")
+                        else:
+                            report_lines.append("AI Analysis: Not Available")
+                            note = ai_insights.get('note', '')
+                            if note:
+                                report_lines.append(f"Note: {note}")
+                        report_lines.append("")
+                    
+                    # Add Indian market context
+                    indian_context = data.get('indian_market_context', {})
+                    if indian_context:
+                        report_lines.append("--- Indian Market Context ---")
+                        if 'suppliers' in indian_context:
+                            suppliers = indian_context['suppliers']
+                            if suppliers:
+                                report_lines.append("Recommended Suppliers:")
+                                for supplier in suppliers:
+                                    if isinstance(supplier, dict):
+                                        name = supplier.get('name', 'Unknown')
+                                        location = supplier.get('location', 'Unknown')
+                                        specialization = supplier.get('specialization', '')
+                                        report_lines.append(f"  • {name} ({location}) - {specialization}")
+                                    else:
+                                        report_lines.append(f"  • {supplier}")
+                        
+                        if 'lead_times' in indian_context:
+                            lead_times = indian_context['lead_times']
+                            report_lines.append(f"Typical Lead Times: {lead_times}")
+                        
+                        if 'market_rates' in indian_context:
+                            rates = indian_context['market_rates']
+                            if isinstance(rates, dict):
+                                for process, rate in rates.items():
+                                    report_lines.append(f"Market Rate ({process}): {rate}")
+                            else:
+                                report_lines.append(f"Market Rates: {rates}")
+                        
+                        if 'quality_standards' in indian_context:
+                            standards = indian_context['quality_standards']
+                            report_lines.append(f"Quality Standards: {standards}")
+                        report_lines.append("")
+                    
+                    # Add analysis summary if available (from hybrid analysis)
+                    analysis_summary = data.get('analysis_summary', {})
+                    if analysis_summary:
+                        report_lines.append("--- Analysis Summary ---")
+                        primary = analysis_summary.get('primary_analysis', '')
+                        if primary:
+                            report_lines.append(f"Primary Analysis: {primary}")
+                        
+                        ai_enhancement = analysis_summary.get('ai_enhancement', '')
+                        if ai_enhancement:
+                            report_lines.append(f"AI Enhancement: {ai_enhancement}")
+                        
+                        cost_analysis = analysis_summary.get('cost_analysis', '')
+                        if cost_analysis:
+                            report_lines.append(f"Cost Analysis: {cost_analysis}")
+                        
+                        confidence = analysis_summary.get('confidence_level', '')
+                        if confidence:
+                            report_lines.append(f"Confidence Level: {confidence}")
+                        report_lines.append("")
+                    
+                    # Add alternative materials from cloud AI (if available)
+                    alt_materials = data.get('alternative_materials', [])
+                    if alt_materials:
+                        report_lines.append("--- AI-Recommended Alternative Materials ---")
+                        for material in alt_materials:
+                            report_lines.append(f"• {material}")
+                        report_lines.append("")
+                    
+                    # Add alternative processes from cloud AI (if available)
+                    alt_processes = data.get('alternative_processes_ai', [])
+                    if alt_processes:
+                        report_lines.append("--- AI-Recommended Alternative Processes ---")
+                        for process in alt_processes:
+                            report_lines.append(f"• {process}")
+                        report_lines.append("")
+                    
+                    # Add expert recommendations
                     if recommendations:
-                        report_lines.append("\n--- Expert Recommendations ---")
+                        report_lines.append("--- Expert Recommendations ---")
                         for rec in recommendations:
                             if isinstance(rec, dict):
                                 description = rec.get('description', 'Unknown recommendation')
-                                report_lines.append(f"• {description}")
+                                priority = rec.get('priority', '')
+                                if priority:
+                                    report_lines.append(f"• [{priority}] {description}")
+                                else:
+                                    report_lines.append(f"• {description}")
                             else:
                                 report_lines.append(f"• {rec}")
                     
                     report_text = "\n".join(report_lines)
-                    print(f"DEBUG: Generated report text of length {len(report_text)}")
+                    print(f"DEBUG: Generated comprehensive report text of length {len(report_text)}")
                     data['report_text'] = report_text
                 
                 # Create a formatted message
@@ -3226,7 +3533,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     cost_analysis = self.mfg_feature_manager.get_cost_analysis()
                     if cost_analysis:
                         message += "<b>Cost Analysis:</b><br>"
-                        message += f"Total Cost: ${cost_analysis.get('total_cost', 0):.2f}<br>"
+                        total_cost = cost_analysis.get('total_cost', 0)
+                        message += f"Total Cost: ₹{total_cost:.2f}<br>"
                         
                         # Show cost breakdown
                         breakdown = cost_analysis.get('cost_breakdown', {})
@@ -3244,7 +3552,22 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                             proc_name = proc.get('process_name', 'Unknown')
                             suitability = proc.get('suitability_score', 0)
                             est_cost = proc.get('estimated_cost', 0)
-                            message += f"- {proc_name}: Suitability {suitability}/100, Est. Cost: ${est_cost:.2f}<br>"
+                            # Convert cost to INR if it's in USD
+                            if isinstance(est_cost, str) and '$' in est_cost:
+                                # Extract numeric value and convert
+                                import re
+                                usd_match = re.search(r'\$([\d.]+)', est_cost)
+                                if usd_match:
+                                    usd_value = float(usd_match.group(1))
+                                    inr_value = usd_value * 83
+                                    cost_display = f"₹{inr_value:.2f}"
+                                else:
+                                    cost_display = est_cost.replace('$', '₹')
+                            elif isinstance(est_cost, (int, float)):
+                                cost_display = f"₹{est_cost:.2f}"
+                            else:
+                                cost_display = str(est_cost).replace('$', '₹')
+                            message += f"- {proc_name}: Suitability {suitability}/100, Est. Cost: {cost_display}<br>"
                         message += "<br>"
                 
                 # Display expert recommendations

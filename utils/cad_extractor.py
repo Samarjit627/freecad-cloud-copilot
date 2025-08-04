@@ -56,6 +56,7 @@ def get_center_of_mass(shape, axis):
 def extract_cad_data_for_features():
     """
     Extract comprehensive CAD data for use with microservice features
+    Selection-aware: analyzes selected objects if any, otherwise all objects
     
     Returns:
         dict: Structured CAD data suitable for microservices
@@ -69,11 +70,94 @@ def extract_cad_data_for_features():
             
         doc = FreeCAD.ActiveDocument
         
+        # Determine which objects to analyze (selection-aware)
+        selected_objects = []
+        analysis_mode = "all_objects"
+        
+        try:
+            # Check if any objects are selected
+            if hasattr(FreeCAD, 'Selection') and FreeCAD.Selection.getSelection():
+                selected_objects = FreeCAD.Selection.getSelection()
+                analysis_mode = "selected_objects"
+                print(f"DFM Analysis: Analyzing {len(selected_objects)} selected object(s)")
+                for obj in selected_objects:
+                    print(f"  - {obj.Label} ({obj.Name})")
+            else:
+                # No selection, analyze all objects with enhanced detection
+                print(f"DEBUG: Total objects in document: {len(doc.Objects)}")
+                
+                # Enhanced object detection with better validation
+                valid_objects = []
+                for obj in doc.Objects:
+                    print(f"DEBUG: Checking object {obj.Label} ({obj.Name}) - Type: {obj.TypeId}")
+                    
+                    # Check if object has shape (solid CAD objects)
+                    if hasattr(obj, 'Shape'):
+                        try:
+                            shape = obj.Shape
+                            if shape and hasattr(shape, 'isValid'):
+                                if shape.isValid():
+                                    # Additional checks for meaningful geometry
+                                    if hasattr(shape, 'Volume') and shape.Volume > 0:
+                                        print(f"DEBUG: Valid solid object found: {obj.Label} - Volume: {shape.Volume}")
+                                        valid_objects.append(obj)
+                                    elif hasattr(shape, 'Area') and shape.Area > 0:
+                                        print(f"DEBUG: Valid surface object found: {obj.Label} - Area: {shape.Area}")
+                                        valid_objects.append(obj)
+                                    else:
+                                        print(f"DEBUG: Object {obj.Label} has no volume or area")
+                                else:
+                                    print(f"DEBUG: Object {obj.Label} has invalid shape")
+                            else:
+                                print(f"DEBUG: Object {obj.Label} has no shape or isValid method")
+                        except Exception as shape_e:
+                            print(f"DEBUG: Error checking shape for {obj.Label}: {shape_e}")
+                    # Check if object is a mesh (imported STL, OBJ, etc.)
+                    elif hasattr(obj, 'Mesh') and obj.TypeId.startswith('Mesh::'):
+                        try:
+                            mesh = obj.Mesh
+                            if mesh and hasattr(mesh, 'CountPoints') and mesh.CountPoints > 0:
+                                print(f"DEBUG: Valid mesh object found: {obj.Label} - Points: {mesh.CountPoints}, Facets: {mesh.CountFacets}")
+                                valid_objects.append(obj)
+                            else:
+                                print(f"DEBUG: Mesh object {obj.Label} has no points")
+                        except Exception as mesh_e:
+                            print(f"DEBUG: Error checking mesh for {obj.Label}: {mesh_e}")
+                    else:
+                        print(f"DEBUG: Object {obj.Label} has no Shape or Mesh attribute")
+                
+                # Also check for imported objects that might be in containers
+                for obj in doc.Objects:
+                    if hasattr(obj, 'Group') and obj.Group:
+                        print(f"DEBUG: Found group object {obj.Label} with {len(obj.Group)} children")
+                        for child in obj.Group:
+                            if hasattr(child, 'Shape') and child.Shape and child.Shape.isValid():
+                                if child not in valid_objects:
+                                    print(f"DEBUG: Adding group child: {child.Label}")
+                                    valid_objects.append(child)
+                
+                selected_objects = valid_objects
+                analysis_mode = "all_objects"
+                print(f"DFM Analysis: No selection detected, analyzing all {len(selected_objects)} valid object(s)")
+        except Exception as e:
+            print(f"Warning: Could not determine selection, analyzing all objects: {e}")
+            # Fallback with minimal validation
+            selected_objects = []
+            for obj in doc.Objects:
+                try:
+                    if hasattr(obj, 'Shape') and obj.Shape:
+                        selected_objects.append(obj)
+                except:
+                    pass
+            analysis_mode = "all_objects_fallback"
+        
         # Initialize data structure
         cad_data = {
             "document": {
                 "name": doc.Name,
                 "object_count": len(doc.Objects),
+                "analyzed_objects": len(selected_objects),
+                "analysis_mode": analysis_mode,
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
             },
             "objects": [],
@@ -83,12 +167,12 @@ def extract_cad_data_for_features():
             "analysis_metadata": {}
         }
         
-        # Process each object
+        # Process selected objects only
         total_volume = 0
         min_x, min_y, min_z = float('inf'), float('inf'), float('inf')
         max_x, max_y, max_z = float('-inf'), float('-inf'), float('-inf')
         
-        for obj in doc.Objects:
+        for obj in selected_objects:
             obj_data = {
                 "name": obj.Name,
                 "label": obj.Label,
@@ -96,7 +180,7 @@ def extract_cad_data_for_features():
                 "visible": True
             }
             
-            # Extract shape information if available
+            # Extract shape information if available (solid CAD objects)
             if hasattr(obj, 'Shape') and obj.Shape.isValid():
                 shape = obj.Shape
                 bbox = shape.BoundBox
@@ -131,6 +215,56 @@ def extract_cad_data_for_features():
                 })
                 
                 total_volume += shape.Volume
+            
+            # Extract mesh information if available (imported STL, OBJ, etc.)
+            elif hasattr(obj, 'Mesh') and obj.TypeId.startswith('Mesh::'):
+                mesh = obj.Mesh
+                bbox = mesh.BoundBox
+                
+                # Update overall bounding box
+                min_x = min(min_x, bbox.XMin)
+                min_y = min(min_y, bbox.YMin)
+                min_z = min(min_z, bbox.ZMin)
+                max_x = max(max_x, bbox.XMax)
+                max_y = max(max_y, bbox.YMax)
+                max_z = max(max_z, bbox.ZMax)
+                
+                # Estimate volume for mesh (approximate)
+                try:
+                    mesh_volume = mesh.Volume if hasattr(mesh, 'Volume') else 0
+                    if mesh_volume <= 0:
+                        # Fallback: estimate volume from bounding box
+                        mesh_volume = bbox.XLength * bbox.YLength * bbox.ZLength * 0.5  # rough estimate
+                except:
+                    mesh_volume = bbox.XLength * bbox.YLength * bbox.ZLength * 0.5
+                
+                # Object-specific data for mesh
+                obj_data.update({
+                    "volume": mesh_volume,
+                    "surface_area": mesh.Area if hasattr(mesh, 'Area') else 0,
+                    "dimensions": {
+                        "length": bbox.XLength,
+                        "width": bbox.YLength,
+                        "height": bbox.ZLength
+                    },
+                    "center_of_mass": {
+                        "x": (bbox.XMin + bbox.XMax) / 2,
+                        "y": (bbox.YMin + bbox.YMax) / 2,
+                        "z": (bbox.ZMin + bbox.ZMax) / 2
+                    },
+                    "geometry": {
+                        "faces": mesh.CountFacets if hasattr(mesh, 'CountFacets') else 0,
+                        "edges": 0,  # Meshes don't have edges in the CAD sense
+                        "vertices": mesh.CountPoints if hasattr(mesh, 'CountPoints') else 0
+                    },
+                    "mesh_info": {
+                        "points": mesh.CountPoints if hasattr(mesh, 'CountPoints') else 0,
+                        "facets": mesh.CountFacets if hasattr(mesh, 'CountFacets') else 0,
+                        "is_mesh": True
+                    }
+                })
+                
+                total_volume += mesh_volume
                 
                 # Analyze manufacturing features
                 try:
@@ -197,8 +331,28 @@ def extract_cad_data_for_features():
         cad_data["analysis_metadata"] = {
             "extraction_method": "freecad_macro",
             "freecad_version": FreeCAD.Version(),
-            "extraction_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
+            "extraction_timestamp": time.strftime("%Y-%m-%dT%H:%M:%S"),
+            "selection_aware": True,
+            "analysis_mode": analysis_mode,
+            "objects_analyzed": len(selected_objects),
+            "market_context": "india",  # Default to Indian market context
+            "extraction_version": "2.0_selection_aware"
         }
+        
+        # Debug output for troubleshooting
+        print(f"\n=== CAD EXTRACTION DEBUG INFO ===")
+        print(f"Analysis mode: {analysis_mode}")
+        print(f"Objects analyzed: {len(selected_objects)}")
+        print(f"Total volume: {total_volume:.2f} mm³")
+        print(f"Objects with geometry: {len(cad_data['objects'])}")
+        if cad_data['objects']:
+            for i, obj in enumerate(cad_data['objects'][:2]):  # Show first 2 objects
+                print(f"  Object {i+1}: {obj.get('label', 'N/A')}")
+                print(f"    Volume: {obj.get('volume', 0):.2f} mm³")
+                print(f"    Faces: {obj.get('geometry', {}).get('faces', 0)}")
+                print(f"    Holes: {len(obj.get('holes', []))}")
+                print(f"    Fillets: {len(obj.get('fillets', []))}")
+        print(f"=== END CAD EXTRACTION DEBUG ===")
         
         return cad_data
         
