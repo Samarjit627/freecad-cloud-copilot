@@ -537,7 +537,7 @@ class DFMService:
                 
                 # Create a small sphere at the issue location
                 sphere = doc.addObject("Part::Sphere", f"DFM_Issue_{i+1}")
-                sphere.Radius = 2.0  # 2mm radius
+                sphere.Radius = 0.5  # 0.5mm radius - much smaller marker
                 sphere.Placement.Base = FreeCAD.Vector(x, y, z)
                 
                 # Set color based on severity
