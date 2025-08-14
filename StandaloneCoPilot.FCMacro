@@ -14,21 +14,25 @@ Version: 1.1.0 - Cloud Integration for DFM, Cost, and Tool Features
 """
 
 import os
-import sys
-import time
+import FreeCAD
+import FreeCADGui
 import json
-import base64
-import tempfile
+import os
+import sys
 import traceback
-import re
-import random
-import requests
+import time
 import math
+import threading
+from datetime import datetime
+import Mesh, MeshPart
+from collections import defaultdict
+from math import inf
 import urllib.request
 import urllib.parse
 from typing import Dict, List, Any, Optional, Tuple, Union, Callable
 from datetime import datetime
 from PySide2 import QtWidgets, QtCore, QtGui
+from PySide2.QtWidgets import QApplication
 
 # Try to import FreeCAD modules
 try:
@@ -46,6 +50,478 @@ _STANDALONE_INSTANCE = None
 _THIS_DIR = os.path.dirname(os.path.abspath(__file__))
 if _THIS_DIR not in sys.path:
     sys.path.append(_THIS_DIR)
+
+# Try to import TextToCADIntegration
+try:
+    from text_to_cad_integration import TextToCADIntegration
+    _TEXT_TO_CAD_AVAILABLE = True
+except ImportError:
+    print("Warning: TextToCADIntegration not available")
+    _TEXT_TO_CAD_AVAILABLE = False
+
+# Try to import Anthropic for Claude integration
+try:
+    import anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    print("Warning: Anthropic library not available for Claude integration")
+    _ANTHROPIC_AVAILABLE = False
+
+# Environment variable loading for Claude
+def load_anthropic_api_key():
+    """Load Anthropic API key from environment or .env file"""
+    # Try environment variable first
+    api_key = os.environ.get('ANTHROPIC_API_KEY')
+    if api_key:
+        return api_key
+    
+    # Try .env file
+    try:
+        env_file = os.path.join(_THIS_DIR, '.env')
+        if os.path.exists(env_file):
+            with open(env_file, 'r') as f:
+                for line in f:
+                    if line.startswith('ANTHROPIC_API_KEY='):
+                        return line.split('=', 1)[1].strip().strip('"\'')
+    except Exception as e:
+        print(f"Warning: Could not load .env file: {e}")
+    
+    return None
+
+# ========== PROFESSIONAL DFM OVERLAY/TOOLTIP SYSTEM ==========
+# Professional DFM overlay system with per-issue mesh overlays and 3D view tooltips
+
+# ---------- STYLE ----------
+SEVERITY_STYLE = {
+    "critical": {"color": (1.0, 0.0, 0.0),   "transparency": 35},  # #FF0000
+    "high":     {"color": (1.0, 0.302, 0.0), "transparency": 35},  # #FF4D00
+    "medium":   {"color": (1.0, 0.702, 0.0), "transparency": 30},  # #FFB300
+    "low":      {"color": (0.0, 0.5, 1.0),   "transparency": 30},  # #0080FF
+}
+OVERLAY_PART_PREFIX = "DFM_OVERLAYS_FOR_"   # container that inherits transforms
+ISSUE_PREFIX        = "DFM_Issue_"          # each issue is its own object
+FACET_TEMP_SUFFIX   = "_FacetColor"
+
+# Registries / globals
+_DFM_BASES = set()
+_DFM_OBSERVER = None
+_DFM_TOOLTIP = None
+
+# ---------- GEOM HELPERS ----------
+def V(t): return FreeCAD.Vector(float(t[0]), float(t[1]), float(t[2]))
+
+def get_mesh_from_object(obj, lin_def=0.1, ang_def=0.5):
+    # Mesh::Feature → copy; Part::Feature (STEP) → tessellate
+    if hasattr(obj, "Mesh"):
+        return obj.Mesh.copy()
+    if hasattr(obj, "Shape"):
+        return MeshPart.meshFromShape(Shape=obj.Shape,
+                                      LinearDeflection=float(lin_def),
+                                      AngularDeflection=float(ang_def))
+    raise ValueError(f"Object {obj.Name} is not meshable.")
+
+def build_centers_and_tris(mesh):
+    centers, tris = [], []
+    for f in mesh.Facets:
+        p1, p2, p3 = f.Points
+        a, b, c = V(p1), V(p2), V(p3)
+        centers.append(FreeCAD.Vector((a.x+b.x+c.x)/3.0, (a.y+b.y+c.y)/3.0, (a.z+b.z+c.z)/3.0))
+        tris.append((a,b,c))
+    return centers, tris
+
+def nearest_face_index(p, centers):
+    best_i, best_d2 = -1, inf
+    for i, c in enumerate(centers):
+        d2 = (c - p).Length ** 2
+        if d2 < best_d2:
+            best_i, best_d2 = i, d2
+    return best_i
+
+def project_point_to_triangle(p, a, b, c):
+    ab, ac = b-a, c-a
+    n = ab.cross(ac)
+    nn = n.dot(n)
+    if nn == 0:
+        return min((a,b,c), key=lambda q: (q-p).Length)
+    proj = p - n * ((p - a).dot(n) / nn)
+    v0, v1, v2 = ab, ac, proj - a
+    d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
+    d20, d21 = v2.dot(v0), v2.dot(v1)
+    denom = d00*d11 - d01*d01
+    if denom == 0:
+        return min((a,b,c), key=lambda q: (q-p).Length)
+    v = (d11*d20 - d01*d21) / denom
+    w = (d00*d21 - d01*d20) / denom
+    u = 1.0 - v - w
+    u = max(0.0, min(1.0, u))
+    v = max(0.0, min(1.0, v))
+    if u + v > 1.0:
+        s = u + v
+        u, v = u/s, v/s
+    w = 1.0 - u - v
+    return a*u + b*v + c*w
+
+def faces_within_radius(point, centers, r_mm):
+    r2 = r_mm * r_mm
+    return [i for i, c in enumerate(centers) if (c - point).Length**2 <= r2]
+
+# ---------- CONTAINERS / TRANSFORMS ----------
+def _overlay_part_name(base_name): return OVERLAY_PART_PREFIX + base_name
+
+def _ensure_overlay_part(base_obj):
+    doc = FreeCAD.ActiveDocument
+    name = _overlay_part_name(base_obj.Name)
+    part = doc.getObject(name)
+    if not part:
+        part = doc.addObject("App::Part", name)
+    part.Placement = base_obj.Placement
+    return part
+
+def _clear_overlays_for(base_obj):
+    doc = FreeCAD.ActiveDocument
+    part = doc.getObject(_overlay_part_name(base_obj.Name))
+    if part:
+        for ch in list(part.Group):
+            doc.removeObject(ch.Name)
+        doc.removeObject(part.Name)
+        doc.recompute()
+    _DFM_BASES.discard(base_obj.Name)
+
+def sync_overlay_part_to_base(base_obj_name):
+    doc = FreeCAD.ActiveDocument
+    base = doc.getObject(base_obj_name)
+    if not base: return
+    part = doc.getObject(_overlay_part_name(base_obj_name))
+    if not part: return
+    part.Placement = base.Placement
+
+# ---------- PER-ISSUE OVERLAY BUILDER (Method 2) ----------
+def _build_issue_overlay(mesh, face_indices, issue_idx, base_obj, severity, tooltip_text):
+    if not face_indices:
+        return None
+    new_mesh = Mesh.Mesh()
+    for idx in face_indices:
+        facet = mesh.Facets[int(idx)]
+        p1, p2, p3 = facet.Points
+        new_mesh.addFacet(V(p1), V(p2), V(p3))
+
+    doc = FreeCAD.ActiveDocument
+    name = f"{ISSUE_PREFIX}{issue_idx:03d}"
+    obj = doc.addObject("Mesh::Feature", name)
+    obj.Mesh = new_mesh
+
+    # Attach metadata for tooltip
+    if not hasattr(obj, "addProperty"):
+        return obj
+    if "IssueTooltip" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "IssueTooltip", "DFM", "Tooltip text for this DFM issue.")
+    if "IssueSeverity" not in obj.PropertiesList:
+        obj.addProperty("App::PropertyString", "IssueSeverity", "DFM", "Severity bucket.")
+    obj.IssueTooltip = tooltip_text
+    obj.IssueSeverity = severity
+
+    # Style
+    style = SEVERITY_STYLE.get(severity, SEVERITY_STYLE["medium"])
+    vo = obj.ViewObject
+    vo.ShapeColor = style["color"]
+    vo.Transparency = int(style["transparency"])
+    vo.DisplayMode = "Shaded"
+    vo.Lighting = "One side"
+
+    # Parent under overlay part so transforms follow the base
+    part = _ensure_overlay_part(base_obj)
+    part.addObject(obj)
+    obj.Placement = FreeCAD.Placement()  # identity; inherit from part
+
+    return obj
+
+def dfm_visualize_per_issue(obj_name, issues, radius_mm=3.0, clear=True, lin_def=0.1, ang_def=0.5):
+    """
+    One overlay object per issue. Each gets IssueTooltip and IssueSeverity properties.
+    """
+    doc = FreeCAD.ActiveDocument
+    base = doc.getObject(obj_name)
+    if not base:
+        raise ValueError(f"Base object '{obj_name}' not found.")
+
+    if clear:
+        _clear_overlays_for(base)
+
+    mesh = get_mesh_from_object(base, lin_def, ang_def)
+    centers, tris = build_centers_and_tris(mesh)
+
+    created = []
+    for k, it in enumerate(issues, start=1):
+        pos = it.get("position")
+        if not pos or len(pos) != 3:
+            continue
+
+        p = FreeCAD.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+        fi = nearest_face_index(p, centers)
+        if fi < 0: 
+            continue
+        a, b, c = tris[fi]
+        p_proj = project_point_to_triangle(p, a, b, c)
+        face_ids = faces_within_radius(p_proj, centers, radius_mm) or [fi]
+
+        sev = (it.get("severity") or "medium").strip().lower()
+        if sev not in SEVERITY_STYLE:
+            sev = "medium"
+
+        # Text for tooltip – choose the exact message you pass in
+        tooltip_text = it.get("tooltip") or it.get("title") or "DFM Issue"
+        if it.get("description"):
+            tooltip_text = f"{tooltip_text}: {it['description']}"
+
+        obj = _build_issue_overlay(mesh, face_ids, k, base, sev, tooltip_text)
+        if obj:
+            created.append(obj)
+
+    sync_overlay_part_to_base(base.Name)
+    _DFM_BASES.add(base.Name)
+    FreeCAD.ActiveDocument.recompute()
+    return created
+
+# ---------- 3D-VIEW TOOLTIP CONTROLLER ----------
+class _DfmTooltipController(QtWidgets.QLabel):
+    """
+    Shows a styled tooltip on top of the 3D view when hovering a DFM_Issue_* object.
+    Click pins/unpins the tooltip.
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(QtCore.Qt.ToolTip)
+        self.setAttribute(QtCore.Qt.WA_TransparentForMouseEvents, False)
+        self.setStyleSheet("""
+            QLabel {
+                background: rgba(30,30,30,220);
+                color: #fff;
+                border: 1px solid rgba(255,255,255,60);
+                border-radius: 6px;
+                padding: 6px 8px;
+                font-size: 11pt;
+            }
+        """)
+        self._pinned = False
+        self.hide()
+
+    def show_text(self, text, global_pos):
+        self.setText(text)
+        self.adjustSize()
+        self.move(global_pos + QtCore.QPoint(12, 16))
+        if not self._pinned:
+            self.show()
+
+    def pin_toggle(self):
+        if self.isVisible():
+            self._pinned = not self._pinned
+            # Slight visual cue on pin
+            if self._pinned:
+                self.setStyleSheet(self.styleSheet() + "QLabel { border: 2px solid #4da3ff; }")
+            else:
+                self.setStyleSheet(self.styleSheet().replace("border: 2px solid #4da3ff;", "border: 1px solid rgba(255,255,255,60);"))
+
+    def hide_if_unpinned(self):
+        if not self._pinned:
+            self.hide()
+
+class _DfmDocObserver(object):
+    """
+    Auto-sync overlay part Placement with its base when base moves.
+    Also wires up a hover/click handler that shows the tooltip.
+    """
+    def __init__(self):
+        self._handler_installed = False
+        self._view = FreeCADGui.ActiveDocument.ActiveView
+
+        # Qt overlay tooltip widget
+        global _DFM_TOOLTIP
+        if _DFM_TOOLTIP is None:
+            try:
+                # Try to parent it to the 3D view widget so it stays on top
+                parent_widget = self._view.getWidget()
+                _DFM_TOOLTIP = _DfmTooltipController(parent=parent_widget)
+            except Exception as e:
+                FreeCAD.Console.PrintWarning(f"[DFM] Could not get 3D view widget: {e}, using no parent\n")
+                # Fallback: create tooltip without parent
+                _DFM_TOOLTIP = _DfmTooltipController(parent=None)
+
+        # Install event callback once
+        if not self._handler_installed:
+            try:
+                self._view.addEventCallback("SoEvent", self._on_event)
+                self._handler_installed = True
+            except Exception as e:
+                FreeCAD.Console.PrintWarning(f"[DFM] Could not install event callback: {e}\n")
+
+    def slotChangedObject(self, obj, prop):
+        try:
+            if prop == "Placement" and obj is not None and obj.Name in _DFM_BASES:
+                part = FreeCAD.ActiveDocument.getObject(_overlay_part_name(obj.Name))
+                if part:
+                    part.Placement = obj.Placement
+        except Exception as e:
+            FreeCAD.Console.PrintError(f"[DFM] Observer error: {e}\n")
+
+    def slotDeletedObject(self, obj):
+        try:
+            if obj is None: return
+            name = getattr(obj, "Name", None)
+            if not name: return
+            if name in _DFM_BASES:
+                part = FreeCAD.ActiveDocument.getObject(_overlay_part_name(name))
+                if part:
+                    for ch in list(part.Group):
+                        FreeCAD.ActiveDocument.removeObject(ch.Name)
+                    FreeCAD.ActiveDocument.removeObject(part.Name)
+                _DFM_BASES.discard(name)
+        except Exception as e:
+            FreeCAD.Console.PrintError(f"[DFM] Observer delete error: {e}\n")
+
+    def _on_event(self, info):
+        """
+        Hover: show IssueTooltip in 3D view when cursor is over a DFM_Issue_* object.
+        Left click: pin/unpin tooltip.
+        """
+        try:
+            etype = info.get("Type", "")
+            pos = info.get("Position")  # Qt coords relative to view
+            if pos is None:
+                return
+
+            # Click toggles pin when tooltip is visible/overlays
+            if etype == "BUTTONDOWN" and info.get("Button") == "BUTTON1":
+                if _DFM_TOOLTIP:
+                    _DFM_TOOLTIP.pin_toggle()
+                return
+
+            # Mouse move → hit test
+            if etype == "MOUSEMOVE":
+                view = self._view
+                hit = view.getObjectInfo(pos)
+                # getObjectInfo returns dict with "Object", "Component", etc. when hitting a shape/mesh
+                if hit and isinstance(hit, dict):
+                    obj_name = hit.get("Object")
+                    if obj_name and obj_name.startswith(ISSUE_PREFIX):
+                        obj = FreeCAD.ActiveDocument.getObject(obj_name)
+                        if obj and hasattr(obj, "IssueTooltip"):
+                            # Translate view coords to global screen coords for widget placement
+                            g = view.getWidget().mapToGlobal(QtCore.QPoint(pos[0], pos[1]))
+                            _DFM_TOOLTIP.show_text(obj.IssueTooltip, g)
+                            return
+                # If not over an issue overlay, hide if not pinned
+                if _DFM_TOOLTIP:
+                    _DFM_TOOLTIP.hide_if_unpinned()
+        except Exception as e:
+            FreeCAD.Console.PrintError(f"[DFM] Hover handler error: {e}\n")
+
+def enable_auto_sync_and_tooltips():
+    global _DFM_OBSERVER
+    if _DFM_OBSERVER is None:
+        try:
+            _DFM_OBSERVER = _DfmDocObserver()
+            FreeCAD.addDocumentObserver(_DFM_OBSERVER)
+            FreeCAD.Console.PrintMessage("[DFM] Auto-sync + 3D tooltips enabled.\n")
+        except Exception as e:
+            FreeCAD.Console.PrintWarning(f"[DFM] Could not enable full tooltip system: {e}\n")
+            FreeCAD.Console.PrintMessage("[DFM] Using fallback selection-based tooltips.\n")
+
+def disable_auto_sync_and_tooltips():
+    global _DFM_OBSERVER
+    try:
+        if _DFM_OBSERVER is not None:
+            view = FreeCADGui.ActiveDocument.ActiveView
+            view.removeEventCallback("SoEvent", _DFM_OBSERVER._on_event)
+            FreeCAD.removeDocumentObserver(_DFM_OBSERVER)
+    except Exception:
+        pass
+    _DFM_OBSERVER = None
+    FreeCAD.Console.PrintMessage("[DFM] Auto-sync + 3D tooltips disabled.\n")
+
+# ---------- PUBLIC API ----------
+def dfm_draw_per_issue_overlays(obj_name, issues, radius_mm=3.0, clear=True,
+                                lin_def=0.1, ang_def=0.5):
+    """
+    Main entry: builds ONE overlay per issue (surface-aligned triangles),
+    assigns per-issue tooltip text, and enables hover tooltips.
+    """
+    out = dfm_visualize_per_issue(obj_name, issues, radius_mm, clear, lin_def, ang_def)
+    enable_auto_sync_and_tooltips()
+    return out
+
+def dfm_toggle_overlays(obj_name, visible=True):
+    part = FreeCAD.ActiveDocument.getObject(OVERLAY_PART_PREFIX + obj_name)
+    if not part:
+        FreeCAD.Console.PrintMessage("[DFM] No overlays to toggle.\n")
+        return
+    part.ViewObject.Visibility = bool(visible)
+    for ch in part.Group:
+        ch.ViewObject.Visibility = bool(visible)
+
+# ========== END PROFESSIONAL DFM OVERLAY/TOOLTIP SYSTEM ==========
+
+# Try to import Claude AI (Anthropic) for conversational CAD generation
+try:
+    import anthropic
+    ANTHROPIC_AVAILABLE = True
+    print("[OK] Claude AI (Anthropic) integration available")
+except ImportError:
+    ANTHROPIC_AVAILABLE = False
+    print("⚠️ Claude AI integration not available - install anthropic package")
+
+# Robust environment variable loading for FreeCAD's Python environment
+ANTHROPIC_API_KEY = None
+try:
+    import os
+    
+    # Method 1: Try environment variables first
+    ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY') or os.environ.get('ANTHROPIC_API_KEY')
+    
+    # Method 2: If not found, try to load directly from .env file (FreeCAD-compatible)
+    if not ANTHROPIC_API_KEY:
+        project_dir = os.path.dirname(os.path.abspath(__file__))
+        env_file = os.path.join(project_dir, '.env')
+        
+        if os.path.exists(env_file):
+            print(f"Loading environment variables directly from {env_file}")
+            with open(env_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if line and not line.startswith('#') and '=' in line:
+                        key, value = line.split('=', 1)
+                        key = key.strip()
+                        value = value.strip().strip('"').strip("'")
+                        if key == 'ANTHROPIC_API_KEY':
+                            ANTHROPIC_API_KEY = value
+                            os.environ[key] = value  # Set in environment for other components
+                            break
+    
+    # Method 3: Try python-dotenv if available (fallback)
+    if not ANTHROPIC_API_KEY:
+        try:
+            from dotenv import load_dotenv
+            project_dir = os.path.dirname(os.path.abspath(__file__))
+            env_file = os.path.join(project_dir, '.env')
+            if os.path.exists(env_file):
+                load_dotenv(env_file)
+                ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+                print(f"[OK] Environment variables loaded via python-dotenv from {env_file}")
+            else:
+                load_dotenv()
+                ANTHROPIC_API_KEY = os.getenv('ANTHROPIC_API_KEY')
+                print("[OK] Environment variables loaded via python-dotenv")
+        except ImportError:
+            print("⚠️ python-dotenv not available - using direct file reading")
+    
+    if ANTHROPIC_API_KEY:
+        print("[OK] ANTHROPIC_API_KEY found - Claude integration enabled")
+        print(f"   API key starts with: {ANTHROPIC_API_KEY[:10]}...")
+    else:
+        print("⚠️ ANTHROPIC_API_KEY not found - Claude integration disabled")
+        
+except Exception as e:
+    print(f"⚠️ Error loading ANTHROPIC_API_KEY: {e}")
+    ANTHROPIC_API_KEY = None
 
 # Try to import cloud services
 try:
@@ -67,6 +543,203 @@ try:
 except ImportError:
     print("Warning: Cloud integration functions not available. Using built-in call_feature.")
     _CLOUD_FUNCTIONS_AVAILABLE = False
+
+# ===============================
+# DFM Selection Observer for Tooltips
+# ===============================
+class DFMSelectionObserver:
+    """Observer to handle selection of DFM highlighted objects and show tooltips"""
+    
+    def __init__(self, task_panel=None):
+        self.task_panel = task_panel
+        self.dfm_highlights = {}  # Store highlight info: {object_name: issue_description}
+        print(f"DEBUG: DFMSelectionObserver initialized with task_panel: {task_panel is not None}")
+    
+    def addSelection(self, doc, obj, sub, pnt):
+        """Called when an object is selected"""
+        try:
+            obj_name = obj
+            print(f"DEBUG: DFM Selection - Object: {obj_name}, Sub: {sub}, Point: {pnt}")
+            print(f"DEBUG: Available DFM highlights: {list(self.dfm_highlights.keys())}")
+            
+            # Get the actual FreeCAD object to check its properties
+            try:
+                import FreeCAD
+                if hasattr(FreeCAD, 'ActiveDocument') and FreeCAD.ActiveDocument:
+                    fc_obj = FreeCAD.ActiveDocument.getObject(obj_name)
+                    if fc_obj:
+                        print(f"DEBUG: Object type: {fc_obj.TypeId}, Label: {fc_obj.Label}")
+                        if hasattr(fc_obj, 'Name'):
+                            print(f"DEBUG: Object Name: {fc_obj.Name}")
+            except Exception as e:
+                print(f"DEBUG: Could not get FreeCAD object details: {e}")
+            
+            # Check if this is a DFM highlighted object (direct match)
+            if obj_name in self.dfm_highlights:
+                print(f"DEBUG: [OK] Direct match found for DFM highlight: {obj_name}")
+            # Also check if the object name starts with DFM_Issue_ (in case of naming variations)
+            elif obj_name.startswith('DFM_Issue_'):
+                print(f"DEBUG: [OK] DFM_Issue pattern match found: {obj_name}")
+                # Try to find the closest match in our highlights
+                for highlight_key in self.dfm_highlights.keys():
+                    if highlight_key == obj_name or obj_name in highlight_key:
+                        obj_name = highlight_key
+                        print(f"DEBUG: Using highlight key: {highlight_key}")
+                        break
+            else:
+                print(f"DEBUG: ❌ No DFM highlight match found for: {obj_name}")
+                # Check if any DFM highlights exist in the document
+                try:
+                    import FreeCAD
+                    if hasattr(FreeCAD, 'ActiveDocument') and FreeCAD.ActiveDocument:
+                        doc_obj_names = [obj.Name for obj in FreeCAD.ActiveDocument.Objects]
+                        dfm_objects = [name for name in doc_obj_names if name.startswith('DFM_Issue_')]
+                        print(f"DEBUG: DFM objects in document: {dfm_objects}")
+                except:
+                    pass
+            
+            # Process the DFM highlight if found
+            if obj_name in self.dfm_highlights:
+                issue_description = self.dfm_highlights[obj_name]
+                print(f"DEBUG: DFM Tooltip - {issue_description}")
+                
+                # Show tooltip in FreeCAD status bar
+                try:
+                    import FreeCADGui
+                    if hasattr(FreeCADGui, 'getMainWindow'):
+                        main_window = FreeCADGui.getMainWindow()
+                        if hasattr(main_window, 'statusBar'):
+                            status_bar = main_window.statusBar()
+                            status_bar.showMessage(f"DFM Issue: {issue_description}", 5000)  # Show for 5 seconds
+                            print("DEBUG: DFM tooltip shown in status bar")
+                except Exception as e:
+                    print(f"DEBUG: Failed to show status bar message: {e}")
+                
+                # Show as popup tooltip in 3D view with enhanced visibility
+                try:
+                    import FreeCADGui
+                    from PySide2 import QtWidgets, QtCore, QtGui
+                    
+                    # Get the 3D view widget
+                    mdi = FreeCADGui.getMainWindow().findChild(QtWidgets.QMdiArea)
+                    if mdi and mdi.activeSubWindow():
+                        view_widget = mdi.activeSubWindow().widget()
+                        if view_widget:
+                            # Create a more visible tooltip with rich formatting
+                            cursor_pos = QtGui.QCursor.pos()
+                            
+                            # Enhanced tooltip with better formatting
+                            tooltip_text = f"""<div style='background-color: #ffffcc; padding: 8px; border: 2px solid #ff6600; border-radius: 4px;'>
+<b style='color: #cc0000;'>🔍 DFM Manufacturing Issue</b><br/>
+<span style='color: #000000;'>{issue_description}</span><br/>
+<i style='color: #666666; font-size: 10px;'>Click for details in Manufacturing Issues section</i>
+</div>"""
+                            
+                            # Show enhanced tooltip at cursor position
+                            QtWidgets.QToolTip.showText(cursor_pos, tooltip_text, view_widget, QtCore.QRect(), 8000)  # Show for 8 seconds
+                            print("DEBUG: Enhanced DFM tooltip shown as 3D view popup")
+                            
+                            # Also create a temporary message box for critical issues
+                            if 'critical' in issue_description.lower() or 'thin wall' in issue_description.lower():
+                                try:
+                                    # Create a non-blocking message for critical issues
+                                    msg = QtWidgets.QMessageBox()
+                                    msg.setIcon(QtWidgets.QMessageBox.Warning)
+                                    msg.setWindowTitle("Critical DFM Issue Detected")
+                                    msg.setText(f"⚠️ {issue_description}")
+                                    msg.setInformativeText("This issue requires immediate attention for successful manufacturing.")
+                                    msg.setStandardButtons(QtWidgets.QMessageBox.Ok)
+                                    msg.setDefaultButton(QtWidgets.QMessageBox.Ok)
+                                    
+                                    # Show non-blocking
+                                    msg.show()
+                                    print("DEBUG: Critical issue popup shown")
+                                except Exception as popup_e:
+                                    print(f"DEBUG: Failed to show critical issue popup: {popup_e}")
+                                    
+                except Exception as e:
+                    print(f"DEBUG: Failed to show 3D view tooltip: {e}")
+                    # Fallback to simple tooltip
+                    try:
+                        from PySide2 import QtWidgets
+                        QtWidgets.QToolTip.showText(QtGui.QCursor.pos(), f"DFM Issue: {issue_description}")
+                        print("DEBUG: Fallback tooltip shown")
+                    except:
+                        pass
+                
+                # Show detailed information in chat interface if available
+                try:
+                    if self.task_panel and hasattr(self.task_panel, 'add_system_message'):
+                        # Find the full issue details from the stored highlights
+                        full_issue_info = None
+                        for highlight_key, highlight_data in self.dfm_highlights.items():
+                            if highlight_key == obj_name and isinstance(highlight_data, dict):
+                                full_issue_info = highlight_data
+                                break
+                        
+                        if full_issue_info:
+                            severity = full_issue_info.get('severity', 'unknown')
+                            issue_type = full_issue_info.get('type', 'unknown')
+                            recommendations = full_issue_info.get('recommendations', [])
+                            
+                            # Create detailed message for chat interface
+                            severity_emoji = {
+                                'critical': '🔴',
+                                'high': '🟠', 
+                                'medium': '🟡',
+                                'low': '🔵'
+                            }.get(severity, '⚪')
+                            
+                            detailed_msg = f"""
+{severity_emoji} **Selected DFM Issue Details:**
+**Type:** {issue_type.replace('_', ' ').title()}
+**Severity:** {severity.title()}
+**Description:** {issue_description}
+
+**Recommendations:**"""
+                            
+                            if recommendations:
+                                for i, rec in enumerate(recommendations[:3], 1):  # Show first 3 recommendations
+                                    detailed_msg += f"\n{i}. {rec}"
+                            else:
+                                detailed_msg += "\n• Review geometry for manufacturability"
+                            
+                            self.task_panel.add_system_message(detailed_msg)
+                            print("DEBUG: Detailed DFM issue info added to chat interface")
+                        else:
+                            # Fallback message
+                            self.task_panel.add_system_message(f"🔍 **Selected DFM Issue:** {issue_description}")
+                            print("DEBUG: Basic DFM issue info added to chat interface")
+                except Exception as chat_e:
+                    print(f"DEBUG: Failed to show issue in chat interface: {chat_e}")
+                
+                # Also show in console for debugging
+                try:
+                    import FreeCAD
+                    FreeCAD.Console.PrintMessage(f"DFM Issue Selected: {issue_description}\n")
+                except:
+                    pass
+                    
+        except Exception as e:
+            print(f"DEBUG: DFM Selection error: {e}")
+    
+    def update_highlights(self, highlights_dict):
+        """Update the stored highlight information"""
+        self.dfm_highlights = highlights_dict
+        print(f"DEBUG: Updated DFM highlights: {list(highlights_dict.keys())}")
+        
+    def set_task_panel(self, task_panel):
+        """Update the task panel reference for tooltip display"""
+        self.task_panel = task_panel
+        print(f"DEBUG: DFM observer task panel updated: {task_panel is not None}")
+    
+    def setSelection(self, doc):
+        """Called when selection is set"""
+        pass
+    
+    def clearSelection(self, doc):
+        """Called when selection is cleared"""
+        pass
 
 # ===============================
 # Manufacturing Feature Manager
@@ -117,13 +790,38 @@ class ManufacturingFeatureManager:
                     )
                     
                     if has_insufficient_analysis:
-                        print("🔄 Cloud DFM returned insufficient analysis, creating hybrid analysis...")
+                        print("🔄 Cloud DFM returned insufficient analysis, using comprehensive geometric analysis...")
                         
                         try:
-                            from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer
+                            # DIRECT COMPREHENSIVE GEOMETRIC ANALYSIS
+                            print("🔍 Performing comprehensive geometric analysis...")
                             
-                            # Extract CAD data for local analysis
+                            # Extract CAD data for analysis
                             cad_data = extract_cad_data_for_features()
+                            
+                            # Perform comprehensive geometric analysis using our implemented logic
+                            geometric_issues = self._perform_comprehensive_geometric_analysis()
+                            
+                            if geometric_issues and len(geometric_issues) > 0:
+                                print(f"🎯 Comprehensive analysis found {len(geometric_issues)} specific geometric issues")
+                                
+                                # Create enhanced result with geometric findings
+                                enhanced_result = self._create_geometric_dfm_result(
+                                    cloud_result=result,
+                                    geometric_issues=geometric_issues,
+                                    manufacturing_process=manufacturing_process,
+                                    material=material,
+                                    production_volume=production_volume
+                                )
+                                
+                                print("🎆 Comprehensive geometric analysis complete - real manufacturing issues identified!")
+                                self.last_dfm_result = enhanced_result
+                                return enhanced_result
+                            else:
+                                print("⚠️ No specific geometric issues found, using cloud result")
+                            
+                            # FALLBACK TO BASIC ANALYSIS IF NO GEOMETRIC ISSUES FOUND
+                            print("🔄 Using basic manufacturability analysis...")
                             
                             # Initialize enhanced local analyzer
                             local_analyzer = EnhancedLocalDFMAnalyzer()
@@ -137,7 +835,7 @@ class ManufacturingFeatureManager:
                             )
                             
                             if local_result.get('success'):
-                                print("✅ Enhanced local DFM analysis successful!")
+                                print("[OK] Enhanced local DFM analysis successful!")
                                 
                                 # Create hybrid result combining cloud + local insights
                                 hybrid_result = self._create_hybrid_dfm_result(
@@ -201,7 +899,7 @@ class ManufacturingFeatureManager:
                 )
                 
                 if result.get('success'):
-                    print("✅ Enhanced local DFM analysis successful!")
+                    print("[OK] Enhanced local DFM analysis successful!")
                     self.last_dfm_result = result
                     return result
                 else:
@@ -252,7 +950,13 @@ class ManufacturingFeatureManager:
                     'note': 'Cloud AI analysis not available for this geometry'
                 }
             
-            # 4. Enhanced analysis summary
+            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (PROBLEM AREAS BUTTON FIX)
+            cloud_design_issues = cloud_data.get('design_issues', [])
+            if cloud_design_issues:
+                hybrid_data['design_issues'] = cloud_design_issues
+                print(f"DEBUG: Preserved {len(cloud_design_issues)} design_issues in hybrid result")
+            
+            # 5. Enhanced analysis summary
             hybrid_data['analysis_summary'] = {
                 'primary_analysis': 'Enhanced Local DFM (Indian Market Focus)',
                 'ai_enhancement': 'Cloud AI Insights' if cloud_features else 'Not Available',
@@ -281,6 +985,129 @@ class ManufacturingFeatureManager:
             print(f"Error creating hybrid DFM result: {str(e)}")
             # Fallback to local result if hybrid creation fails
             return local_result
+    
+    def _create_claude_dfm_result(self, cloud_result, claude_result, manufacturing_process, material, production_volume):
+        """Create a DFM result combining cloud data with Claude's advanced issue detection"""
+        try:
+            # Get data from both sources
+            cloud_data = cloud_result.get('data', {})
+            claude_issues = claude_result.get('issues', [])
+            claude_recommendations = claude_result.get('recommendations', [])
+            severity_summary = claude_result.get('severity_summary', {})
+            
+            # Create enhanced data structure with Claude's findings
+            enhanced_data = {
+                # Preserve cloud geometry analysis
+                'geometry_summary': cloud_data.get('geometry_summary', {}),
+                'cost_analysis': cloud_data.get('cost_analysis', {}),
+                'process_recommendations': cloud_data.get('process_recommendations', []),
+                'material_suggestions': cloud_data.get('material_suggestions', []),
+                
+                # Add Claude's advanced issue detection
+                'manufacturing_issues': [],
+                'design_issues': [],  # For UI compatibility
+                'manufacturability_score': self._calculate_score_from_issues(claude_issues),
+                'overall_rating': self._get_rating_from_score(self._calculate_score_from_issues(claude_issues)),
+                
+                # Enhanced recommendations combining both sources
+                'recommendations': claude_recommendations,
+                
+                # Claude-specific insights
+                'claude_analysis': {
+                    'issues_detected': len(claude_issues),
+                    'severity_breakdown': severity_summary,
+                    'analysis_type': 'advanced_ai_detection',
+                    'manufacturing_focus': manufacturing_process
+                },
+                
+                # Analysis metadata
+                'analysis_summary': {
+                    'primary_analysis': 'Claude AI Advanced DFM Detection',
+                    'ai_enhancement': 'Anthropic Claude API',
+                    'issue_detection': 'Real Manufacturing Problems Identified',
+                    'confidence_level': 'Very High'
+                }
+            }
+            
+            # Convert Claude issues to both formats for compatibility
+            for issue in claude_issues:
+                # Format for manufacturing_issues (detailed)
+                manufacturing_issue = {
+                    'title': issue.get('title', 'Manufacturing Issue'),
+                    'severity': issue.get('severity', 'medium'),
+                    'description': issue.get('description', ''),
+                    'recommendation': issue.get('recommendation', ''),
+                    'type': issue.get('type', 'manufacturing_issue'),
+                    'location': issue.get('location', 'geometry'),
+                    'impact': issue.get('impact', 'Affects manufacturing quality'),
+                    'position': issue.get('position', {'x': 0, 'y': 0, 'z': 0})
+                }
+                enhanced_data['manufacturing_issues'].append(manufacturing_issue)
+                
+                # Format for design_issues (UI compatibility)
+                design_issue = {
+                    'severity': issue.get('severity', 'medium'),
+                    'description': f"{issue.get('title', 'Issue')}: {issue.get('description', '')}",
+                    'recommendation': issue.get('recommendation', ''),
+                    'type': issue.get('type', 'manufacturing_issue'),
+                    'position': issue.get('position', {'x': 0, 'y': 0, 'z': 0})
+                }
+                enhanced_data['design_issues'].append(design_issue)
+            
+            print(f"DEBUG: Claude result created with {len(enhanced_data['manufacturing_issues'])} issues")
+            print(f"DEBUG: Claude result created with {len(enhanced_data['design_issues'])} design_issues")
+            
+            # Create final result structure
+            claude_dfm_result = {
+                'success': True,
+                'data': enhanced_data,
+                'service': 'claude_dfm_advanced',
+                'timestamp': claude_result.get('timestamp', ''),
+                'analysis_components': {
+                    'claude_ai_detection': True,
+                    'cloud_geometry_analysis': True,
+                    'real_issue_identification': True,
+                    'manufacturing_focused': True
+                }
+            }
+            
+            return claude_dfm_result
+            
+        except Exception as e:
+            print(f"Error creating Claude DFM result: {str(e)}")
+            # Fallback to cloud result if Claude integration fails
+            return cloud_result
+    
+    def _calculate_score_from_issues(self, issues):
+        """Calculate manufacturability score based on Claude's issue detection"""
+        if not issues:
+            return 95  # High score if no issues found
+        
+        # Start with perfect score and deduct based on severity
+        score = 100
+        for issue in issues:
+            severity = issue.get('severity', 'medium')
+            if severity == 'critical':
+                score -= 25
+            elif severity == 'high':
+                score -= 15
+            elif severity == 'medium':
+                score -= 8
+            elif severity == 'low':
+                score -= 3
+        
+        return max(score, 10)  # Minimum score of 10
+    
+    def _get_rating_from_score(self, score):
+        """Convert numeric score to rating"""
+        if score >= 90:
+            return 'excellent'
+        elif score >= 75:
+            return 'good'
+        elif score >= 60:
+            return 'fair'
+        else:
+            return 'poor'
     
     def estimate_cost(self, manufacturing_process="3d_printing", material="pla", quantity=1, region="global"):
         """Estimate manufacturing cost"""
@@ -415,21 +1242,40 @@ class ManufacturingFeatureManager:
     def visualize_dfm_issues(self):
         """Visualize DFM issues in the FreeCAD view using enhanced visualization"""
         try:
-            if self.cloud_integration:
-                # Use the enhanced visualization from the DFM service
-                self.cloud_integration.visualize_dfm_issues()
-            elif self.last_dfm_result and self.last_dfm_result.get("success", False):
+            # BYPASS the problematic cloud_integration method and use direct visualization
+            # The cloud_integration.visualize_dfm_issues() has a get_dfm_issues() call that returns wrong cached data
+            print("DEBUG: Using direct visualization to bypass cloud_integration issues")
+            
+            if self.last_dfm_result and self.last_dfm_result.get("success", False):
                 # Basic visualization if cloud integration not available
-                issues = self.last_dfm_result.get("data", {}).get("issues", [])
+                data = self.last_dfm_result.get("data", {})
+                
+                # Try to get issues from multiple sources (Claude-detected manufacturing_issues first)
+                issues = data.get("manufacturing_issues", [])
+                if not issues:
+                    # Fallback to design_issues if manufacturing_issues not available
+                    issues = data.get("design_issues", [])
+                if not issues:
+                    # Final fallback to legacy issues format
+                    issues = data.get("issues", [])
+                
+                print(f"DEBUG: Found {len(issues)} issues to visualize")
+                if issues:
+                    print(f"DEBUG: First issue: {issues[0]}")
+                
                 if not issues:
                     print("No DFM issues to visualize")
-                    return
+                    return False
                 
-                # Get active document
+                # Get active document and preserve it
                 doc = FreeCAD.ActiveDocument
                 if not doc:
                     print("No active document")
                     return
+                
+                # Store the current document name to prevent switching
+                current_doc_name = doc.Name
+                print(f"DEBUG: Visualizing on document: {current_doc_name}")
                 
                 # Remove any existing DFM visualization
                 self._remove_existing_dfm_visualization(doc)
@@ -437,52 +1283,103 @@ class ManufacturingFeatureManager:
                 # Create a group for DFM issues
                 dfm_group = doc.addObject("App::DocumentObjectGroup", "DFM_Issues")
                 
-                # Create visualization for each issue with color coding by severity
-                for i, issue in enumerate(issues):
-                    # Get issue details
-                    description = issue.get("description", f"Issue {i+1}")
-                    severity = issue.get("severity", "medium")
-                    location = issue.get("location", None)
-                    
-                    # Determine color based on severity
-                    if severity == "critical" or severity == "high":
-                        color = (1.0, 0.0, 0.0, 0.7)  # Red with transparency
-                    elif severity == "medium":
-                        color = (1.0, 0.7, 0.0, 0.7)  # Orange with transparency
-                    else:
-                        color = (0.0, 0.7, 1.0, 0.7)  # Blue with transparency
-                    
-                    # Create a sphere at the issue location
-                    if location:
-                        x, y, z = location
-                    else:
-                        # If no specific location, place along the model bounding box
-                        bbox = self._get_model_bounding_box(doc)
-                        x = bbox[0] + (i % 3) * (bbox[3] - bbox[0]) / 3
-                        y = bbox[1] + ((i // 3) % 3) * (bbox[4] - bbox[1]) / 3
-                        z = bbox[2] + (i // 9) * (bbox[5] - bbox[2]) / 3
-                    
-                    # Create sphere
-                    sphere = doc.addObject("Part::Sphere", f"Issue_{i+1}")
-                    sphere.Radius = min(10, max(5, self._get_model_size(doc) / 20))
-                    sphere.Placement.Base = FreeCAD.Vector(x, y, z)
-                    
-                    # Set color and transparency
-                    if hasattr(sphere.ViewObject, "ShapeColor"):
-                        sphere.ViewObject.ShapeColor = color[:3]
-                    if hasattr(sphere.ViewObject, "Transparency"):
-                        sphere.ViewObject.Transparency = int(color[3] * 100)
-                    
-                    # Add to group
-                    dfm_group.addObject(sphere)
-                    
-                    # Add text label
-                    label = self._create_text_label(doc, description, FreeCAD.Vector(x, y, z + sphere.Radius * 1.2))
-                    if label:
-                        dfm_group.addObject(label)
+                # ROBUST DFM OVERLAY SYSTEM: Professional surface-aligned highlighting
+                print(f"DEBUG: Creating robust DFM overlays for {len(issues)} issues...")
                 
-                # Recompute document
+                # Use the professional DFM visualization system
+                try:
+                    # Find the mesh/CAD object to highlight
+                    target_obj = None
+                    for obj in doc.Objects:
+                        if hasattr(obj, 'Mesh') or hasattr(obj, 'Shape'):
+                            target_obj = obj
+                            break
+                    
+                    if target_obj:
+                        print(f"DEBUG: Found target object: {target_obj.Name}")
+                        # Use the robust DFM visualization system
+                        created_overlays = self._dfm_visualize(target_obj.Name, issues, method="overlay", radius_mm=3.0)
+                        print(f"DEBUG: Created {len(created_overlays) if created_overlays else 0} professional DFM overlays")
+                    else:
+                        print("DEBUG: No suitable mesh or CAD object found for overlay visualization")
+                        
+                except Exception as overlay_error:
+                    print(f"DEBUG: Professional overlay system failed: {overlay_error}")
+                    print("DEBUG: Falling back to chat-only DFM analysis")
+                
+                # NOTE: Arrow visualization logic preserved for future use if needed
+                # Can be re-enabled by calling self._create_arrow_visualization_BACKUP()
+                
+                # Recompute document and refresh view to ensure visibility
                 doc.recompute()
+                
+                # Force view refresh to make rectangles visible
+                try:
+                    import FreeCADGui
+                    if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
+                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                        FreeCADGui.updateGui()
+                    print(f"DEBUG: Document recomputed and view refreshed - {len(issues)} DFM rectangles should now be visible")
+                except Exception as e:
+                    print(f"DEBUG: View refresh failed: {e}")
+                
+                # Activate DFM selection observer for tooltip functionality
+                try:
+                    import FreeCADGui
+                    if hasattr(FreeCADGui, 'Selection'):
+                        # Remove any existing DFM observer
+                        try:
+                            if hasattr(self, 'dfm_observer'):
+                                FreeCADGui.Selection.removeObserver(self.dfm_observer)
+                        except:
+                            pass
+                        
+                        # Create and add new DFM observer with task panel access
+                        # Find the task panel instance for tooltip display
+                        task_panel = None
+                        try:
+                            # Look for the active StandaloneCoPilotTaskPanel instance
+                            import FreeCADGui
+                            if hasattr(FreeCADGui, 'Control') and hasattr(FreeCADGui.Control, 'activeDialog'):
+                                active_dialog = FreeCADGui.Control.activeDialog()
+                                if hasattr(active_dialog, 'add_system_message'):
+                                    task_panel = active_dialog
+                        except:
+                            pass
+                        
+                        self.dfm_observer = DFMSelectionObserver(task_panel=task_panel)
+                        FreeCADGui.Selection.addObserver(self.dfm_observer)
+                        print("DEBUG: DFM selection observer activated for tooltip functionality with chat interface")
+                        
+                        # Populate tooltip information for the rectangles
+                        # Use same naming format as professional overlay system (3-digit format)
+                        tooltip_info = {}
+                        for i, issue in enumerate(issues):
+                            rect_name = f"DFM_Issue_{i+1:03d}"  # Match professional overlay naming: DFM_Issue_001, etc.
+                            tooltip_text = issue.get('title', 'Manufacturing Issue')
+                            description = issue.get('description', 'Manufacturing issue detected')
+                            tooltip_info[rect_name] = f"{tooltip_text}: {description}"
+                        
+                        # Update the observer with tooltip information
+                        self.dfm_observer.update_highlights(tooltip_info)
+                        print(f"DEBUG: Updated DFM observer with {len(tooltip_info)} tooltip entries")
+                except Exception as e:
+                    print(f"DEBUG: Failed to activate DFM selection observer: {e}")
+                
+                # CRITICAL: Ensure we stay on the original document
+                try:
+                    target_doc = FreeCAD.getDocument(current_doc_name)
+                    if target_doc and FreeCAD.ActiveDocument != target_doc:
+                        print(f"DEBUG: Switching back to original document: {current_doc_name}")
+                        FreeCAD.setActiveDocument(current_doc_name)
+                        import FreeCADGui
+                        if hasattr(FreeCADGui, 'ActiveDocument'):
+                            FreeCADGui.ActiveDocument = FreeCADGui.getDocument(current_doc_name)
+                    else:
+                        print(f"DEBUG: Already on correct document: {current_doc_name}")
+                except Exception as e:
+                    print(f"DEBUG: Document preservation failed: {e}")
+                
                 return True
                     
         except Exception as e:
@@ -501,8 +1398,1103 @@ class ManufacturingFeatureManager:
         except Exception as e:
             print(f"Error removing existing DFM visualization: {str(e)}")
     
+    def _get_actual_mesh_bounding_box(self, doc):
+        """Get the bounding box of mesh objects (like your CAD model)"""
+        try:
+            # Find mesh objects first (like your uploaded CAD model)
+            for obj in doc.Objects:
+                if hasattr(obj, "Mesh") and hasattr(obj.ViewObject, "Visibility") and obj.ViewObject.Visibility:
+                    bbox = obj.Mesh.BoundBox
+                    print(f"DEBUG: Found mesh object '{obj.Label}' with bounding box: ({bbox.XMin:.2f}, {bbox.YMin:.2f}, {bbox.ZMin:.2f}) to ({bbox.XMax:.2f}, {bbox.YMax:.2f}, {bbox.ZMax:.2f})")
+                    return (bbox.XMin, bbox.YMin, bbox.ZMin, bbox.XMax, bbox.YMax, bbox.ZMax)
+            
+            # Fallback to shape objects if no mesh found
+            for obj in doc.Objects:
+                if hasattr(obj, "Shape") and hasattr(obj.ViewObject, "Visibility") and obj.ViewObject.Visibility:
+                    bbox = obj.Shape.BoundBox
+                    print(f"DEBUG: Found shape object '{obj.Label}' with bounding box: ({bbox.XMin:.2f}, {bbox.YMin:.2f}, {bbox.ZMin:.2f}) to ({bbox.XMax:.2f}, {bbox.YMax:.2f}, {bbox.ZMax:.2f})")
+                    return (bbox.XMin, bbox.YMin, bbox.ZMin, bbox.XMax, bbox.YMax, bbox.ZMax)
+            
+            print("DEBUG: No mesh or shape objects found, using small default bounding box")
+            return (0, 0, 0, 10, 1, 2)  # Small default for your thin part
+        except Exception as e:
+            print(f"Error getting actual mesh bounding box: {str(e)}")
+            return (0, 0, 0, 10, 1, 2)  # Small default for your thin part
+    
+    def _project_point_to_surface(self, mesh_object, point):
+        """
+        Project the analysis point to the actual mesh surface using robust mesh intersection.
+        This ensures highlights appear ON the geometry, not floating in space.
+        """
+        try:
+            if not hasattr(mesh_object, 'Mesh') or not mesh_object.Mesh:
+                print(f"DEBUG: No mesh data available for surface projection")
+                return point
+                
+            mesh_data = mesh_object.Mesh
+            fc_point = FreeCAD.Vector(point[0], point[1], point[2])
+            
+            print(f"DEBUG: Projecting point {point} to mesh surface...")
+            
+            # METHOD 1: Find nearest point on mesh surface (most reliable)
+            try:
+                # Use correct FreeCAD mesh API
+                nearest_point = mesh_data.nearestPointOnMesh(fc_point)
+                if nearest_point and len(nearest_point) >= 3:
+                    surface_point = (nearest_point[0], nearest_point[1], nearest_point[2])
+                    distance = fc_point.distanceToPoint(FreeCAD.Vector(*surface_point))
+                    
+                    # Only use if reasonably close (within 50% of model size)
+                    bbox = mesh_data.BoundBox
+                    max_dimension = max(bbox.XLength, bbox.YLength, bbox.ZLength)
+                    if distance < max_dimension * 0.5:
+                        print(f"DEBUG: Found nearest surface point {surface_point} (distance: {distance:.2f})")
+                        return surface_point
+            except Exception as e:
+                print(f"DEBUG: Nearest point method failed: {e}")
+                
+            # METHOD 1B: Alternative nearest point approach
+            try:
+                # Find closest mesh point by direct distance calculation
+                min_distance = float('inf')
+                closest_point = None
+                
+                # Sample mesh points efficiently
+                sample_step = max(1, mesh_data.CountPoints // 200)  # Sample up to 200 points
+                for i in range(0, mesh_data.CountPoints, sample_step):
+                    mesh_point = mesh_data.Points[i]
+                    distance = fc_point.distanceToPoint(mesh_point)
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_point = (mesh_point.x, mesh_point.y, mesh_point.z)
+                
+                if closest_point and min_distance < float('inf'):
+                    print(f"DEBUG: Found closest mesh point {closest_point} (distance: {min_distance:.2f})")
+                    return closest_point
+                    
+            except Exception as e:
+                print(f"DEBUG: Alternative nearest point method failed: {e}")
+            
+            # METHOD 2: Ray casting from multiple strategic directions
+            directions_and_origins = [
+                # Cast rays from outside the mesh towards the point
+                ((point[0], point[1], point[2] + 100), (0, 0, -1)),  # From above
+                ((point[0], point[1], point[2] - 100), (0, 0, 1)),   # From below
+                ((point[0] + 100, point[1], point[2]), (-1, 0, 0)),  # From right
+                ((point[0] - 100, point[1], point[2]), (1, 0, 0)),   # From left
+                ((point[0], point[1] + 100, point[2]), (0, -1, 0)),  # From front
+                ((point[0], point[1] - 100, point[2]), (0, 1, 0)),   # From back
+            ]
+            
+            closest_distance = float('inf')
+            best_surface_point = None
+            
+            for origin, direction in directions_and_origins:
+                try:
+                    # Cast ray from outside towards the mesh
+                    result = mesh_data.nearestFacetOnRay(origin, direction)
+                    if result and len(result) >= 2:
+                        intersection_point = result[1]  # Intersection point
+                        if len(intersection_point) >= 3:
+                            surface_point = (intersection_point[0], intersection_point[1], intersection_point[2])
+                            distance = fc_point.distanceToPoint(FreeCAD.Vector(*surface_point))
+                            
+                            if distance < closest_distance:
+                                closest_distance = distance
+                                best_surface_point = surface_point
+                                print(f"DEBUG: Ray cast hit at {surface_point} (distance: {distance:.2f})")
+                except Exception as e:
+                    continue
+            
+            if best_surface_point and closest_distance < float('inf'):
+                print(f"DEBUG: Best surface projection: {best_surface_point} (distance: {closest_distance:.2f})")
+                return best_surface_point
+            
+            # METHOD 3: Fallback - find closest mesh point by brute force sampling
+            try:
+                print(f"DEBUG: Using fallback mesh point sampling...")
+                min_distance = float('inf')
+                closest_mesh_point = None
+                
+                # Sample mesh points to find the closest one
+                sample_step = max(1, mesh_data.CountPoints // 1000)  # Sample up to 1000 points
+                for i in range(0, mesh_data.CountPoints, sample_step):
+                    mesh_point = mesh_data.Points[i]
+                    distance = fc_point.distanceToPoint(mesh_point)
+                    if distance < min_distance:
+                        min_distance = distance
+                        closest_mesh_point = (mesh_point.x, mesh_point.y, mesh_point.z)
+                
+                if closest_mesh_point:
+                    print(f"DEBUG: Closest mesh point: {closest_mesh_point} (distance: {min_distance:.2f})")
+                    return closest_mesh_point
+                    
+            except Exception as e:
+                print(f"DEBUG: Fallback sampling failed: {e}")
+            
+            # Final fallback: return original point
+            print(f"DEBUG: All projection methods failed, using original point {point}")
+            return point
+            
+        except Exception as e:
+            print(f"ERROR: Surface projection completely failed: {str(e)}")
+            return point
+
+    def _project_point_to_surface_with_normal(self, mesh_object, point):
+        """
+        Project point to mesh surface and return both surface point and surface normal.
+        This enables proper overlay alignment with the mesh geometry.
+        """
+        try:
+            if not hasattr(mesh_object, 'Mesh') or not mesh_object.Mesh:
+                print(f"DEBUG: No mesh data for surface normal calculation")
+                return point, (0, 0, 1)
+                
+            mesh_data = mesh_object.Mesh
+            fc_point = FreeCAD.Vector(point[0], point[1], point[2])
+            
+            # Calculate surface point and normal
+            try:
+                # Use the input point directly as the surface point
+                surface_point = point
+                fc_surface_point = FreeCAD.Vector(surface_point[0], surface_point[1], surface_point[2])
+                print(f"DEBUG: Using input point as surface point: {surface_point}")
+            except Exception as surface_calc_error:
+                print(f"DEBUG: Error calculating surface point: {surface_calc_error}")
+                # Use center of bounding box as fallback
+                surface_point = (
+                    (mesh_data.BoundBox.XMin + mesh_data.BoundBox.XMax) / 2,
+                    (mesh_data.BoundBox.YMin + mesh_data.BoundBox.YMax) / 2,
+                    (mesh_data.BoundBox.ZMin + mesh_data.BoundBox.ZMax) / 2
+                )
+                fc_surface_point = FreeCAD.Vector(surface_point[0], surface_point[1], surface_point[2])
+                
+            except Exception as surface_calc_error:
+                print(f"DEBUG: Error calculating surface point: {surface_calc_error}")
+                # Use center of bounding box as fallback
+                surface_point = (
+                    (mesh_data.BoundBox.XMin + mesh_data.BoundBox.XMax) / 2,
+                    (mesh_data.BoundBox.YMin + mesh_data.BoundBox.YMax) / 2,
+                    (mesh_data.BoundBox.ZMin + mesh_data.BoundBox.ZMax) / 2
+                )
+                fc_surface_point = FreeCAD.Vector(surface_point[0], surface_point[1], surface_point[2])
+            
+            # Find surface normal at the calculated point
+            surface_normal = (0, 0, 1)  # Default upward normal
+            
+            try:
+                # Find the closest facet to the surface point
+                min_distance = float('inf')
+                closest_facet = None
+                
+                print(f"DEBUG: Searching through {mesh_data.CountFacets} facets for closest to point {fc_surface_point}")
+                
+                # Sample facets to find the closest one (for performance)
+                sample_step = max(1, mesh_data.CountFacets // 100)  # Sample more facets for better accuracy
+                facets_checked = 0
+                
+                for i in range(0, mesh_data.CountFacets, sample_step):
+                    try:
+                        facet = mesh_data.Facets[i]
+                        facets_checked += 1
+                        
+                        # Get facet vertices - Points are tuples (x,y,z), not Vector objects
+                        p1, p2, p3 = facet.Points
+                        facet_center = FreeCAD.Vector(
+                            (p1[0] + p2[0] + p3[0]) / 3,  # x coordinates
+                            (p1[1] + p2[1] + p3[1]) / 3,  # y coordinates
+                            (p1[2] + p2[2] + p3[2]) / 3   # z coordinates
+                        )
+                        distance = fc_surface_point.distanceToPoint(facet_center)
+                        
+                        if distance < min_distance:
+                            min_distance = distance
+                            closest_facet = facet
+                            
+                    except Exception as facet_error:
+                        print(f"DEBUG: Error processing facet {i}: {facet_error}")
+                        continue
+                
+                print(f"DEBUG: Checked {facets_checked} facets, min distance: {min_distance:.3f}")
+                
+                if closest_facet and min_distance < 50.0:  # Only use if reasonably close
+                    try:
+                        normal = closest_facet.Normal
+                        surface_normal = (normal.x, normal.y, normal.z)
+                        print(f"DEBUG: Found surface normal: {surface_normal} at facet distance {min_distance:.2f}")
+                    except Exception as normal_error:
+                        print(f"DEBUG: Error getting facet normal: {normal_error}")
+                        surface_normal = (0, 0, 1)
+                else:
+                    print(f"DEBUG: No suitable facet found (distance: {min_distance:.3f}), using default normal")
+                    
+            except Exception as e:
+                print(f"DEBUG: Surface normal calculation failed: {e}")
+            
+            return surface_point, surface_normal
+            
+        except Exception as e:
+            print(f"ERROR: Surface projection with normal failed: {str(e)}")
+            return point, (0, 0, 1)
+
+    def _get_mesh_object(self, doc):
+        """Get the mesh object from the document with improved detection"""
+        try:
+            mesh_objects = []
+            
+            # Look for mesh objects with different criteria
+            for obj in doc.Objects:
+                # Check for Mesh objects (STL, OBJ imports)
+                if hasattr(obj, "Mesh") and obj.Mesh and obj.Mesh.CountFacets > 0:
+                    mesh_objects.append(obj)
+                    print(f"DEBUG: Found mesh object: {obj.Name} ({obj.Mesh.CountFacets} facets)")
+                
+                # Check for Part objects with Shape (native CAD)
+                elif hasattr(obj, "Shape") and obj.Shape and hasattr(obj.Shape, "Faces") and len(obj.Shape.Faces) > 0:
+                    # Convert Part to mesh for consistent processing
+                    try:
+                        import MeshPart
+                        mesh_obj = MeshPart.meshFromShape(obj.Shape, LinearDeflection=0.1, AngularDeflection=0.1)
+                        if mesh_obj and mesh_obj.CountFacets > 0:
+                            # Create a temporary mesh object for processing
+                            temp_mesh = doc.addObject("Mesh::Feature", f"TempMesh_{obj.Name}")
+                            temp_mesh.Mesh = mesh_obj
+                            mesh_objects.append(temp_mesh)
+                            print(f"DEBUG: Converted Part object to mesh: {obj.Name} -> {temp_mesh.Name} ({mesh_obj.CountFacets} facets)")
+                    except Exception as e:
+                        print(f"DEBUG: Could not convert Part {obj.Name} to mesh: {e}")
+            
+            if mesh_objects:
+                # Prefer visible objects
+                for obj in mesh_objects:
+                    if hasattr(obj, "ViewObject") and hasattr(obj.ViewObject, "Visibility"):
+                        if obj.ViewObject.Visibility:
+                            print(f"DEBUG: Using visible mesh object: {obj.Name}")
+                            return obj
+                
+                # If no visible objects, use the first one
+                print(f"DEBUG: Using first available mesh object: {mesh_objects[0].Name}")
+                return mesh_objects[0]
+            
+            print(f"DEBUG: No mesh objects found in document")
+            return None
+            
+        except Exception as e:
+            print(f"ERROR: Failed to get mesh object: {str(e)}")
+            return None
+
+    def _create_surface_overlay(self, doc, highlight_name, x, y, z, surface_normal, highlight_color, issue_type):
+        """Create a surface-aligned overlay as fallback when face-level highlighting fails"""
+        try:
+            print(f"DEBUG: Creating surface overlay fallback at ({x:.2f}, {y:.2f}, {z:.2f})")
+            
+            # Create a highly selectable surface-aligned overlay based on issue type
+            if 'thin_wall' in issue_type.lower():
+                # Rectangular overlay for wall issues - made much more prominent for selection
+                overlay = doc.addObject("Part::Box", highlight_name)
+                overlay.Length = 5.0  # 5mm length (much larger for better selection)
+                overlay.Width = 5.0   # 5mm width (much larger for better selection)
+                overlay.Height = 1.0  # Much thicker (1.0mm) for reliable selection
+            else:
+                # Disc overlay for other issues - made much more prominent for selection
+                overlay = doc.addObject("Part::Cylinder", highlight_name)
+                overlay.Radius = 2.5   # 2.5mm radius (much larger for better selection)
+                overlay.Height = 1.0   # Much thicker (1.0mm) for reliable selection
+            
+            # Position with much larger surface normal offset for reliable selection
+            normal_x, normal_y, normal_z = surface_normal
+            offset_distance = 1.0  # Much larger offset for reliable selection (1.0mm)
+            
+            overlay_center = FreeCAD.Vector(
+                x + (normal_x * offset_distance),
+                y + (normal_y * offset_distance), 
+                z + (normal_z * offset_distance)
+            )
+            
+            # Calculate rotation to align with surface
+            try:
+                normal_vector = FreeCAD.Vector(normal_x, normal_y, normal_z)
+                up_vector = FreeCAD.Vector(0, 0, 1)
+                
+                if normal_vector.dot(up_vector) < 0.9:
+                    rotation_axis = up_vector.cross(normal_vector)
+                    if rotation_axis.Length > 0.01:
+                        rotation_axis.normalize()
+                        angle = math.acos(max(-1, min(1, up_vector.dot(normal_vector))))
+                        surface_rotation = FreeCAD.Rotation(rotation_axis, math.degrees(angle))
+                    else:
+                        surface_rotation = FreeCAD.Rotation(0, 0, 0)
+                else:
+                    surface_rotation = FreeCAD.Rotation(0, 0, 0)
+            except:
+                surface_rotation = FreeCAD.Rotation(0, 0, 0)
+            
+            # Apply placement and color
+            overlay.Placement = FreeCAD.Placement(overlay_center, surface_rotation)
+            
+            if hasattr(overlay, 'ViewObject'):
+                overlay.ViewObject.ShapeColor = highlight_color
+                overlay.ViewObject.Transparency = 20  # Less transparent for better visibility and selection
+                overlay.ViewObject.Selectable = True  # Ensure the overlay is selectable
+                overlay.ViewObject.DisplayMode = "Shaded"  # Use shaded mode for better visibility
+                # Make the overlay stand out more for selection
+                overlay.ViewObject.LineWidth = 2.0
+                overlay.ViewObject.PointSize = 3.0
+            
+            print(f"DEBUG: Created surface overlay fallback with {highlight_color} color")
+            return overlay
+            
+        except Exception as overlay_error:
+            print(f"DEBUG: Surface overlay creation failed: {overlay_error}")
+            # Ultimate fallback: simple sphere
+            sphere = doc.addObject("Part::Sphere", highlight_name)
+            sphere.Radius = 0.3
+            sphere.Placement = FreeCAD.Placement(FreeCAD.Vector(x, y, z), FreeCAD.Rotation())
+            return sphere
+
+    def _group_nearby_issues(self, issues, model_width):
+        """Smart grouping to reduce overlapping rectangles and improve visualization clarity"""
+        try:
+            # Group issues by type and proximity to reduce overlap
+            grouped = []
+            used_indices = set()
+            
+            # Define grouping distance (10% of model width)
+            group_distance = model_width * 0.1
+            
+            for i, issue in enumerate(issues):
+                if i in used_indices:
+                    continue
+                    
+                # Start a new group with this issue as primary
+                group = {
+                    'primary_issue': issue,
+                    'issues': [issue],
+                    'type': issue.get('type', 'general'),
+                    'severity': issue.get('severity', 'medium')
+                }
+                used_indices.add(i)
+                
+                # Find nearby issues of the same type to group together
+                if 'position' in issue and issue['position']:
+                    primary_x, primary_y, primary_z = issue['position']
+                    
+                    for j, other_issue in enumerate(issues):
+                        if j in used_indices or j <= i:
+                            continue
+                            
+                        # Only group issues of the same type
+                        if other_issue.get('type', 'general') != group['type']:
+                            continue
+                            
+                        if 'position' in other_issue and other_issue['position']:
+                            other_x, other_y, other_z = other_issue['position']
+                            
+                            # Calculate distance
+                            distance = ((primary_x - other_x)**2 + (primary_y - other_y)**2 + (primary_z - other_z)**2)**0.5
+                            
+                            # Group if within distance threshold
+                            if distance < group_distance:
+                                group['issues'].append(other_issue)
+                                used_indices.add(j)
+                                
+                                # Update severity to highest in group
+                                if other_issue.get('severity') == 'critical' or group['severity'] != 'critical':
+                                    if other_issue.get('severity') == 'critical':
+                                        group['severity'] = 'critical'
+                                    elif other_issue.get('severity') == 'high' and group['severity'] not in ['critical']:
+                                        group['severity'] = 'high'
+                
+                grouped.append(group)
+            
+            # Further reduce by limiting to most critical issues per type
+            final_groups = []
+            type_counts = {}
+            
+            # Sort by severity (critical first)
+            severity_order = {'critical': 0, 'high': 1, 'medium': 2, 'low': 3}
+            grouped.sort(key=lambda g: (severity_order.get(g['severity'], 4), g['type']))
+            
+            for group in grouped:
+                issue_type = group['type']
+                
+                # Limit thin_wall issues to 5 most critical
+                if issue_type == 'thin_wall':
+                    if type_counts.get(issue_type, 0) < 5:
+                        final_groups.append(group)
+                        type_counts[issue_type] = type_counts.get(issue_type, 0) + 1
+                # Keep all other issue types
+                else:
+                    final_groups.append(group)
+            
+            return final_groups
+            
+        except Exception as e:
+            print(f"Error in smart grouping: {str(e)}")
+            # Fallback: return individual issues as single-item groups
+            return [{'primary_issue': issue, 'issues': [issue], 'type': issue.get('type', 'general'), 'severity': issue.get('severity', 'medium')} for issue in issues[:10]]  # Limit to 10
+    
+    def _analyze_issue_position(self, issue, bbox, doc):
+        """Analyze CAD structure to determine accurate position for manufacturing issue"""
+        try:
+            # Extract issue information
+            description = issue.get('description', '').lower()
+            title = issue.get('title', '').lower()
+            severity = issue.get('severity', 'medium')
+            
+            # CAD dimensions
+            x_min, y_min, z_min, x_max, y_max, z_max = bbox
+            width = x_max - x_min
+            depth = y_max - y_min
+            height = z_max - z_min
+            center_x = x_min + width / 2
+            center_y = y_min + depth / 2
+            center_z = z_min + height / 2
+            
+            print(f"DEBUG: Analyzing issue: '{title}' - '{description[:50]}...'")
+            
+            # APPROACH 2: Smart CAD Structure Analysis - FIXED KEYWORD MATCHING
+            # Map issue types to likely geometric locations with PRIORITY-BASED classification
+            
+            # PRIORITY 1: GATE PLACEMENT ISSUES (most specific) - IMPROVED DETECTION
+            if any(keyword in description.lower() or keyword in title.lower() for keyword in 
+                   ['gate placement', 'gate locations', 'gate positioning', 'limited gate', 'gate options']):
+                # Position at base center for gate placement
+                x = center_x
+                y = center_y
+                z = z_min + height * 0.1  # Near bottom for gate issues
+                print(f"DEBUG: Gate placement issue - positioned at base center")
+                return (x, y, z)
+            
+            # PRIORITY 1B: FLOW/FILLING ISSUES (different from gate placement)
+            elif any(keyword in description.lower() or keyword in title.lower() for keyword in 
+                     ['flow', 'filling', 'material flow']):
+                # Position at end sections where flow issues occur
+                x = x_max - width * 0.2  # Near end of part
+                y = center_y
+                z = center_z  # Middle height for flow issues
+                print(f"DEBUG: Flow/filling issue - positioned at end section")
+                return (x, y, z)
+            
+            # PRIORITY 2A: EJECTION ISSUES (specific positioning) - IMPROVED DETECTION
+            elif any(keyword in description.lower() or keyword in title.lower() for keyword in 
+                     ['ejection', 'ejector', 'ejector pin', 'insufficient ejection', 'ejection area']):
+                # Position on main body surfaces where ejector pins would be
+                x = center_x - width * 0.2  # Offset from center for ejector area
+                y = center_y
+                z = center_z + height * 0.1  # Upper-middle for ejector pins
+                print(f"DEBUG: Ejection issue - positioned on ejector surface")
+                return (x, y, z)
+            
+            # PRIORITY 2B: DRAFT ANGLE ISSUES (check before general wall issues)
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['draft', 'angle', 'vertical']):
+                # Position on vertical walls (side areas)
+                x = x_min + width * 0.2  # Side wall area
+                y = center_y
+                z = center_z + height * 0.2  # Upper portion of walls
+                print(f"DEBUG: Draft angle issue - positioned on vertical surface")
+                return (x, y, z)
+            
+            # PRIORITY 3: COOLING/RATIO ISSUES (check before thickness issues)
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['cooling', 'ratio', 'warpage', 'uneven', 'length-to-thickness']):
+                # Position on center areas where cooling issues occur
+                x = center_x
+                y = center_y
+                z = z_min + height * 0.3  # Lower-middle for cooling issues
+                print(f"DEBUG: Cooling/ratio issue - positioned on center section")
+                return (x, y, z)
+            
+            # PRIORITY 4: THREAD/UNDERCUT ISSUES
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['thread', 'undercut', 'neck', 'cap', 'screw', 'overhang']):
+                # Position at top/neck area where threads typically are
+                x = center_x
+                y = center_y
+                z = z_max - height * 0.15  # Near top for thread issues
+                print(f"DEBUG: Thread/undercut issue - positioned at neck/top area")
+                return (x, y, z)
+            
+            # PRIORITY 5: SHARP CORNER ISSUES
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['sharp', 'corner', 'edge', 'radius', 'fillet']):
+                # Position at corner/edge areas
+                x = x_min + width * 0.1  # Near corner
+                y = y_min + depth * 0.1
+                z = center_z
+                print(f"DEBUG: Sharp corner issue - positioned at edge/corner")
+                return (x, y, z)
+            
+            # PRIORITY 6: WALL THICKNESS ISSUES - MESH-AWARE POSITIONING
+            elif any(keyword in description.lower() or keyword in title.lower() for keyword in 
+                     ['wall thickness', 'thin wall', 'thick wall', 'minimum wall', 'extremely thin']):
+                # Find the actual thinnest section of the mesh
+                thin_pos = self._find_thinnest_mesh_section(doc, bbox)
+                if thin_pos:
+                    print(f"DEBUG: Wall thickness issue - positioned at actual thin section: {thin_pos}")
+                    return thin_pos
+                # Fallback to geometric calculation
+                x = center_x  # Center for thin wall issues
+                y = center_y
+                z = center_z  # Middle height for visibility
+                print(f"DEBUG: Wall thickness issue - positioned at center (fallback)")
+                return (x, y, z)
+            
+            # PRIORITY 7: SURFACE FINISH ISSUES
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['surface', 'finish', 'texture', 'smooth', 'rough']):
+                # Position on main visible surface
+                x = center_x + width * 0.2
+                y = center_y + depth * 0.2
+                z = center_z + height * 0.1
+                print(f"DEBUG: Surface finish issue - positioned on visible surface")
+                return (x, y, z)
+            
+            # PRIORITY 8: STRUCTURAL/STRENGTH ISSUES
+            elif any(keyword in description or keyword in title for keyword in 
+                     ['strength', 'stress', 'weak', 'break', 'structural', 'support']):
+                # Position on potential stress concentration areas
+                x = center_x
+                y = center_y + depth * 0.3
+                z = center_z - height * 0.2  # Lower area for structural issues
+                print(f"DEBUG: Structural issue - positioned on stress area")
+                return (x, y, z)
+            
+            # 9. SEVERITY-BASED FALLBACK POSITIONING
+            else:
+                print(f"DEBUG: Using severity-based fallback positioning")
+                if severity == 'critical' or severity == 'high':
+                    # Critical issues - position prominently (front-center)
+                    x = center_x
+                    y = y_max - depth * 0.1  # Front of model
+                    z = center_z + height * 0.2
+                elif severity == 'medium':
+                    # Medium issues - position on side
+                    x = x_max - width * 0.1  # Right side
+                    y = center_y
+                    z = center_z
+                else:
+                    # Low severity - position at top
+                    x = center_x
+                    y = center_y
+                    z = z_max - height * 0.1  # Top area
+                
+                return (x, y, z)
+                
+        except Exception as e:
+            print(f"ERROR: Failed to analyze issue position: {str(e)}")
+            # Emergency fallback to center
+            center_x = bbox[0] + (bbox[3] - bbox[0]) / 2
+            center_y = bbox[1] + (bbox[4] - bbox[1]) / 2
+            center_z = bbox[2] + (bbox[5] - bbox[2]) / 2
+            return (center_x, center_y, center_z)
+    
+    def _find_thinnest_mesh_section(self, doc, bbox):
+        """Find the actual thinnest section of the mesh using FreeCAD's native analysis"""
+        try:
+            print(f"DEBUG: Starting advanced mesh analysis...")
+            
+            # Find the mesh object
+            mesh_obj = None
+            for obj in doc.Objects:
+                if hasattr(obj, 'Mesh') and obj.Mesh.CountFacets > 0:
+                    mesh_obj = obj
+                    break
+            
+            if not mesh_obj:
+                print(f"DEBUG: No mesh object found")
+                return None
+            
+            mesh = mesh_obj.Mesh
+            x_min, y_min, z_min, x_max, y_max, z_max = bbox
+            width = x_max - x_min
+            depth = y_max - y_min
+            height = z_max - z_min
+            
+            print(f"DEBUG: Mesh has {mesh.CountFacets} facets, {mesh.CountPoints} points")
+            print(f"DEBUG: Analyzing bounding box: ({x_min:.2f}, {y_min:.2f}, {z_min:.2f}) to ({x_max:.2f}, {y_max:.2f}, {z_max:.2f})")
+            
+            # COMPREHENSIVE GEOMETRIC ANALYSIS
+            all_issues = []
+            
+            # 1. THIN WALL DETECTION - Cross-sectional analysis
+            print(f"DEBUG: Analyzing thin walls...")
+            num_samples = 25  # High resolution sampling
+            for i in range(num_samples):
+                x_sample = x_min + (width * i / (num_samples - 1))
+                
+                # Find all mesh points near this X coordinate
+                nearby_points = []
+                tolerance = width * 0.04  # 4% tolerance for precision
+                
+                for point in mesh.Points:
+                    if abs(point.x - x_sample) <= tolerance:
+                        nearby_points.append(point)
+                
+                if len(nearby_points) >= 4:
+                    # Calculate local thickness (Y-direction for clamp)
+                    y_coords = [p.y for p in nearby_points]
+                    z_coords = [p.z for p in nearby_points]
+                    
+                    local_thickness = max(y_coords) - min(y_coords)
+                    
+                    # Identify thin sections (< 1.5mm = problematic for injection molding)
+                    if local_thickness < 1.5:
+                        center_y = (max(y_coords) + min(y_coords)) / 2
+                        center_z = (max(z_coords) + min(z_coords)) / 2
+                        
+                        # More nuanced severity assignment for better color distribution
+                        if local_thickness < 0.6:
+                            severity = 'critical'  # Red - extremely thin walls
+                        elif local_thickness < 1.0:
+                            severity = 'high'      # Orange - thin walls
+                        elif local_thickness < 1.5:
+                            severity = 'medium'    # Yellow - borderline walls
+                        else:
+                            severity = 'low'       # Blue - acceptable walls
+                        
+                        all_issues.append({
+                            'position': (x_sample, center_y, center_z),
+                            'thickness': local_thickness,
+                            'type': 'thin_wall',
+                            'severity': severity,
+                            'description': f'Thin wall: {local_thickness:.2f}mm (min recommended: 1.2mm)'
+                        })
+                        
+                        print(f"DEBUG: Thin wall at X={x_sample:.2f}, thickness={local_thickness:.2f}mm, severity={severity}")
+            
+            # 2. SHARP CORNER DETECTION - Curvature analysis
+            print(f"DEBUG: Analyzing sharp corners...")
+            try:
+                # Analyze mesh facets for sharp angles
+                sharp_corners = []
+                for i, facet in enumerate(mesh.Facets):
+                    if i % 50 == 0:  # Sample every 50th facet for performance
+                        # Get facet normal and adjacent facets
+                        normal = facet.Normal
+                        
+                        # Check for sharp transitions (simplified approach)
+                        # In a real implementation, you'd check adjacent facet angles
+                        if abs(normal.z) < 0.3:  # Steep angle indicator
+                            center = facet.Center
+                            # Vary severity based on angle steepness for better color distribution
+                            if abs(normal.z) < 0.1:
+                                severity = 'critical'  # Red - very sharp corners
+                            elif abs(normal.z) < 0.2:
+                                severity = 'high'      # Orange - sharp corners
+                            else:
+                                severity = 'medium'    # Yellow - moderate corners
+                            
+                            sharp_corners.append({
+                                'position': (center.x, center.y, center.z),
+                                'type': 'sharp_corner',
+                                'severity': severity,
+                                'description': f'Sharp corner detected (angle severity: {severity})'
+                            })
+                
+                if sharp_corners:
+                    # Take the most prominent sharp corner
+                    all_issues.extend(sharp_corners[:2])  # Limit to 2 for clarity
+                    print(f"DEBUG: Found {len(sharp_corners)} sharp corners")
+                    
+            except Exception as e:
+                print(f"DEBUG: Sharp corner analysis failed: {e}")
+            
+            # 3. UNDERCUT DETECTION - Overhang analysis
+            print(f"DEBUG: Analyzing undercuts...")
+            try:
+                undercuts = []
+                # Sample Z-levels to find overhangs
+                for z_level in [z_min + height * 0.3, z_min + height * 0.7]:
+                    points_at_level = [p for p in mesh.Points if abs(p.z - z_level) < height * 0.1]
+                    
+                    if len(points_at_level) > 10:
+                        x_coords = [p.x for p in points_at_level]
+                        y_coords = [p.y for p in points_at_level]
+                        
+                        # Check for overhangs (simplified)
+                        x_range = max(x_coords) - min(x_coords)
+                        if x_range > width * 0.5:  # Potential overhang
+                            center_x_level = (max(x_coords) + min(x_coords)) / 2
+                            center_y_level = (max(y_coords) + min(y_coords)) / 2
+                            
+                            # Vary severity based on overhang extent for better color distribution
+                            overhang_ratio = x_range / width
+                            if overhang_ratio > 0.9:
+                                severity = 'critical'  # Red - severe undercuts
+                            elif overhang_ratio > 0.8:
+                                severity = 'high'      # Orange - significant undercuts
+                            elif overhang_ratio > 0.6:
+                                severity = 'medium'    # Yellow - moderate undercuts
+                            else:
+                                severity = 'low'       # Blue - minor undercuts
+                            
+                            undercuts.append({
+                                'position': (center_x_level, center_y_level, z_level),
+                                'type': 'undercut',
+                                'severity': severity,
+                                'description': f'Undercut/overhang at Z={z_level:.2f}mm (extent: {overhang_ratio:.1%})'
+                            })
+                
+                if undercuts:
+                    all_issues.extend(undercuts[:1])  # Limit to 1 for clarity
+                    print(f"DEBUG: Found {len(undercuts)} potential undercuts")
+                    
+            except Exception as e:
+                print(f"DEBUG: Undercut analysis failed: {e}")
+            
+            # 4. ASPECT RATIO ISSUES - Length/width ratio
+            print(f"DEBUG: Analyzing aspect ratio...")
+            # Calculate center coordinates
+            center_x = x_min + width / 2
+            center_y = y_min + depth / 2
+            center_z = z_min + height / 2
+            
+            aspect_ratio = width / depth if depth > 0 else 0
+            if aspect_ratio > 8 or aspect_ratio < 0.125:  # Very long/thin or very wide/thin
+                all_issues.append({
+                    'position': (center_x, center_y, center_z),
+                    'type': 'aspect_ratio',
+                    'severity': 'medium',
+                    'description': f'Poor aspect ratio: {aspect_ratio:.1f}:1 (recommended: 2:1 to 4:1)'
+                })
+                print(f"DEBUG: Poor aspect ratio: {aspect_ratio:.1f}:1")
+            
+            # 5. DRAFT ANGLE ISSUES - Mold release analysis
+            print(f"DEBUG: Analyzing draft angles...")
+            try:
+                # Simplified draft angle analysis for vertical surfaces
+                if height > width * 0.5:  # Tall parts need draft angles
+                    all_issues.append({
+                        'position': (center_x, center_y, z_min + height * 0.8),  # Top area
+                        'type': 'draft_angle',
+                        'severity': 'high',
+                        'description': 'Vertical surfaces need 1-3° draft angle for mold release'
+                    })
+                    print(f"DEBUG: Draft angle issue detected for tall part (H:{height:.1f}mm)")
+            except Exception as e:
+                print(f"DEBUG: Draft angle analysis failed: {e}")
+            
+            # 6. SINK MARK ANALYSIS - Thick sections
+            print(f"DEBUG: Analyzing sink marks...")
+            try:
+                # Check for thick sections that may cause sink marks
+                max_thickness = max([issue.get('thickness', 0) for issue in all_issues if issue.get('type') == 'thin_wall'] + [1.5])
+                if max_thickness > 4.0:  # Thick sections > 4mm
+                    all_issues.append({
+                        'position': (center_x, center_y, center_z),
+                        'type': 'sink_mark',
+                        'severity': 'medium',
+                        'description': f'Thick sections ({max_thickness:.1f}mm) may cause sink marks'
+                    })
+                    print(f"DEBUG: Sink mark risk detected - thickness: {max_thickness:.1f}mm")
+            except Exception as e:
+                print(f"DEBUG: Sink mark analysis failed: {e}")
+            
+            # 7. WARPAGE ANALYSIS - Asymmetric geometry
+            print(f"DEBUG: Analyzing warpage risk...")
+            try:
+                # Check for asymmetric cooling (simplified)
+                thickness_variation = len([i for i in all_issues if i.get('type') == 'thin_wall'])
+                if thickness_variation > 5:  # Many thickness variations
+                    all_issues.append({
+                        'position': (center_x, center_y, center_z),
+                        'type': 'warpage',
+                        'severity': 'medium',
+                        'description': f'High thickness variation ({thickness_variation} areas) increases warpage risk'
+                    })
+                    print(f"DEBUG: Warpage risk detected - {thickness_variation} thickness variations")
+            except Exception as e:
+                print(f"DEBUG: Warpage analysis failed: {e}")
+            
+            # 8. FLOW LENGTH ANALYSIS - Material flow distance
+            print(f"DEBUG: Analyzing flow length...")
+            try:
+                flow_length = max(width, depth)  # Longest flow path
+                if flow_length > 100:  # Long flow path
+                    all_issues.append({
+                        'position': (x_min + width * 0.9, center_y, center_z),  # Far end
+                        'type': 'flow_length',
+                        'severity': 'medium',
+                        'description': f'Long flow path ({flow_length:.1f}mm) may cause flow lines'
+                    })
+                    print(f"DEBUG: Long flow path detected: {flow_length:.1f}mm")
+            except Exception as e:
+                print(f"DEBUG: Flow length analysis failed: {e}")
+            
+            # 9. GATE PLACEMENT ANALYSIS - Injection point optimization
+            print(f"DEBUG: Analyzing gate placement...")
+            try:
+                # Recommend gate placement for clamp geometry
+                if width > depth * 2:  # Long thin part
+                    all_issues.append({
+                        'position': (center_x, y_min, center_z),  # Side gate
+                        'type': 'gate_placement',
+                        'severity': 'low',
+                        'description': 'Consider side gate placement for uniform filling'
+                    })
+                    print(f"DEBUG: Gate placement recommendation for long part")
+                
+                # Add additional gate placement recommendations with varied severities
+                if volume > 50000:  # Large parts need multiple gates
+                    all_issues.append({
+                        'position': (x_min + width * 0.25, center_y, center_z),
+                        'type': 'gate_placement',
+                        'severity': 'medium',
+                        'description': 'Large part may require multiple gate locations'
+                    })
+                    all_issues.append({
+                        'position': (x_min + width * 0.75, center_y, center_z),
+                        'type': 'gate_placement', 
+                        'severity': 'low',
+                        'description': 'Secondary gate location for balanced filling'
+                    })
+            except Exception as e:
+                print(f"DEBUG: Gate placement analysis failed: {e}")
+            
+            # 10. SURFACE FINISH ANALYSIS - Add critical surface finish issues
+            print(f"DEBUG: Analyzing surface finish requirements...")
+            try:
+                # Critical surface finish areas (high visibility surfaces)
+                all_issues.append({
+                    'position': (center_x, y_max, z_max - height * 0.1),  # Top front surface
+                    'type': 'surface_finish',
+                    'severity': 'critical',
+                    'description': 'Critical surface finish area - high visibility'
+                })
+                
+                # High priority surface areas
+                all_issues.append({
+                    'position': (x_max - width * 0.1, center_y, center_z),  # Side surface
+                    'type': 'surface_finish',
+                    'severity': 'high',
+                    'description': 'High priority surface finish - visible edge'
+                })
+                
+                print(f"DEBUG: Added surface finish analysis points")
+            except Exception as e:
+                print(f"DEBUG: Surface finish analysis failed: {e}")
+            
+            # 11. COOLING ANALYSIS - Add cooling-related issues
+            print(f"DEBUG: Analyzing cooling requirements...")
+            try:
+                # Hot spots that need cooling attention
+                if volume > 30000:  # Larger parts have cooling challenges
+                    all_issues.append({
+                        'position': (center_x, center_y, center_z),  # Center mass
+                        'type': 'cooling',
+                        'severity': 'critical',
+                        'description': 'Large mass center requires enhanced cooling'
+                    })
+                
+                # Cooling channel recommendations
+                all_issues.append({
+                    'position': (center_x, y_min + depth * 0.2, center_z),
+                    'type': 'cooling',
+                    'severity': 'low',
+                    'description': 'Recommended cooling channel location'
+                })
+                
+                print(f"DEBUG: Added cooling analysis points")
+            except Exception as e:
+                print(f"DEBUG: Cooling analysis failed: {e}")
+            
+            # Return the most critical issue found
+            if all_issues:
+                # Sort by severity: critical > high > medium
+                severity_order = {'critical': 0, 'high': 1, 'medium': 2}
+                all_issues.sort(key=lambda x: severity_order.get(x['severity'], 3))
+                
+                most_critical = all_issues[0]
+                print(f"DEBUG: Most critical issue: {most_critical['type']} - {most_critical['description']}")
+                print(f"DEBUG: Total geometric issues found: {len(all_issues)}")
+                
+                # Store all issues for comprehensive reporting
+                self.detected_geometric_issues = all_issues
+                
+                return most_critical['position']
+            
+            print(f"DEBUG: No specific geometric issues found")
+            return None
+            
+        except Exception as e:
+            print(f"ERROR: Mesh analysis failed: {str(e)}")
+            return None
+    
+    def _perform_comprehensive_geometric_analysis(self):
+        """Perform comprehensive geometric analysis and return detected issues"""
+        try:
+            print("🔍 Starting comprehensive geometric analysis...")
+            
+            # Get active document
+            doc = FreeCAD.ActiveDocument
+            if not doc:
+                print("No active document for geometric analysis")
+                return []
+            
+            # Find the mesh or solid object
+            target_obj = None
+            for obj in doc.Objects:
+                if hasattr(obj, 'Mesh') and obj.Mesh.CountFacets > 0:
+                    target_obj = obj
+                    break
+                elif hasattr(obj, 'Shape') and obj.Shape.Volume > 0:
+                    target_obj = obj
+                    break
+            
+            if not target_obj:
+                print("No suitable object found for geometric analysis")
+                return []
+            
+            # Get bounding box
+            if hasattr(target_obj, 'Mesh'):
+                bbox = target_obj.Mesh.BoundBox
+            else:
+                bbox = target_obj.Shape.BoundBox
+            
+            bbox_tuple = (bbox.XMin, bbox.YMin, bbox.ZMin, bbox.XMax, bbox.YMax, bbox.ZMax)
+            
+            # Use the existing comprehensive analysis logic
+            position = self._find_thinnest_mesh_section(doc, bbox_tuple)
+            
+            # Return the stored geometric issues if available
+            if hasattr(self, 'detected_geometric_issues') and self.detected_geometric_issues:
+                print(f"🎯 Returning {len(self.detected_geometric_issues)} detected geometric issues")
+                return self.detected_geometric_issues
+            else:
+                print("⚠️ No geometric issues detected by analysis")
+                return []
+                
+        except Exception as e:
+            print(f"ERROR: Comprehensive geometric analysis failed: {str(e)}")
+            return []
+    
+    def _create_geometric_dfm_result(self, cloud_result, geometric_issues, manufacturing_process, material, production_volume):
+        """Create DFM result with geometric analysis findings"""
+        try:
+            print(f"🔧 Creating DFM result with {len(geometric_issues)} geometric issues...")
+            
+            # Start with the cloud result structure
+            result = cloud_result.copy() if cloud_result else {}
+            data = result.get('data', {})
+            
+            # Convert geometric issues to DFM format
+            dfm_issues = []
+            for issue in geometric_issues:
+                dfm_issue = {
+                    'title': issue.get('type', 'Manufacturing Issue').replace('_', ' ').title(),
+                    'description': issue.get('description', 'Geometric issue detected'),
+                    'severity': issue.get('severity', 'medium'),
+                    'position': issue.get('position', (0, 0, 0)),
+                    'type': issue.get('type', 'geometric'),
+                    'recommendations': self._get_recommendations_for_issue(issue, manufacturing_process)
+                }
+                dfm_issues.append(dfm_issue)
+            
+            # Update the result with geometric findings
+            data['design_issues'] = dfm_issues
+            data['analysis_method'] = 'Comprehensive Geometric Analysis'
+            data['issues_found'] = len(dfm_issues)
+            
+            # Update manufacturability score based on issues
+            critical_issues = len([i for i in dfm_issues if i['severity'] == 'critical'])
+            high_issues = len([i for i in dfm_issues if i['severity'] == 'high'])
+            medium_issues = len([i for i in dfm_issues if i['severity'] == 'medium'])
+            
+            # Calculate score (start at 100, deduct for issues)
+            score = 100 - (critical_issues * 25) - (high_issues * 15) - (medium_issues * 10)
+            score = max(score, 20)  # Minimum score of 20
+            
+            data['manufacturability_score'] = score
+            data['overall_rating'] = 'Excellent' if score >= 90 else 'Good' if score >= 70 else 'Fair' if score >= 50 else 'Poor'
+            
+            result['data'] = data
+            result['success'] = True
+            
+            print(f"[OK] Created geometric DFM result: {len(dfm_issues)} issues, score: {score}/100")
+            return result
+            
+        except Exception as e:
+            print(f"ERROR: Failed to create geometric DFM result: {str(e)}")
+            return cloud_result if cloud_result else {'success': False, 'error': str(e)}
+    
+    def _get_recommendations_for_issue(self, issue, manufacturing_process):
+        """Get specific recommendations for each type of geometric issue"""
+        issue_type = issue.get('type', '')
+        process = manufacturing_process.lower()
+        
+        recommendations = []
+        
+        if issue_type == 'thin_wall':
+            if 'injection' in process:
+                recommendations = [
+                    "Increase wall thickness to minimum 1.2mm for injection molding",
+                    "Add ribs or gussets for structural support",
+                    "Consider material with better flow characteristics"
+                ]
+            elif 'cnc' in process:
+                recommendations = [
+                    "Increase thickness to avoid tool deflection",
+                    "Use shorter, more rigid cutting tools",
+                    "Add support structures during machining"
+                ]
+        elif issue_type == 'sharp_corner':
+            recommendations = [
+                "Add fillets with minimum 0.5mm radius",
+                "Avoid sharp internal corners for stress concentration",
+                "Consider draft angles for molding processes"
+            ]
+        elif issue_type == 'undercut':
+            if 'injection' in process:
+                recommendations = [
+                    "Eliminate undercuts or add side actions",
+                    "Redesign geometry for straight pull molding",
+                    "Consider split-line placement"
+                ]
+        elif issue_type == 'aspect_ratio':
+            recommendations = [
+                "Optimize length-to-width ratio (2:1 to 4:1)",
+                "Add ribs to prevent warpage",
+                "Consider material shrinkage compensation"
+            ]
+        elif issue_type == 'draft_angle':
+            recommendations = [
+                "Add 1-3° draft angle to vertical surfaces",
+                "Use tapered walls for easier mold release",
+                "Consider split-line placement to minimize draft requirements"
+            ]
+        elif issue_type == 'sink_mark':
+            recommendations = [
+                "Reduce wall thickness in thick sections",
+                "Add ribs instead of thick walls for strength",
+                "Use uniform wall thickness throughout"
+            ]
+        elif issue_type == 'warpage':
+            recommendations = [
+                "Maintain uniform wall thickness",
+                "Add ribs for structural support",
+                "Consider symmetric cooling design"
+            ]
+        elif issue_type == 'flow_length':
+            recommendations = [
+                "Consider multiple gate locations",
+                "Optimize part orientation in mold",
+                "Use materials with better flow properties"
+            ]
+        elif issue_type == 'gate_placement':
+            recommendations = [
+                "Position gate for balanced filling",
+                "Avoid gate marks in visible areas",
+                "Consider hot runner system for multiple gates"
+            ]
+        else:
+            recommendations = ["Review geometry for manufacturability"]
+        
+        return recommendations
+    
     def _get_model_bounding_box(self, doc):
-        """Get the bounding box of the model"""
+        """Get the bounding box of all visible objects in the document"""
         try:
             # Find all visible shapes
             shapes = []
@@ -548,6 +2540,264 @@ class ManufacturingFeatureManager:
             print(f"Error creating text label: {str(e)}")
             return None
     
+    # ========== ROBUST DFM VISUALIZATION SYSTEM ==========
+    
+    # DFM Visualization Constants
+    SEVERITY_STYLE = {
+        "critical": {"color": (1.0, 0.0, 0.0),   "transparency": 35},  # #FF0000
+        "high":     {"color": (1.0, 0.302, 0.0), "transparency": 35},  # #FF4D00
+        "medium":   {"color": (1.0, 0.702, 0.0), "transparency": 30},  # #FFB300
+        "low":      {"color": (0.0, 0.5, 1.0),   "transparency": 30},  # #0080FF
+    }
+    OVERLAY_PART_PREFIX = "DFM_OVERLAYS_FOR_"
+    FACET_TEMP_SUFFIX = "_FacetColor"
+    
+    # Keep track of bases with overlays for auto-sync observer
+    _DFM_BASE_REGISTRY = set()
+    _DFM_OBSERVER = None
+    
+    def _V(self, t):
+        """Convert tuple to FreeCAD Vector"""
+        return FreeCAD.Vector(float(t[0]), float(t[1]), float(t[2]))
+    
+    def _get_mesh_from_object(self, obj, lin_def=0.1, ang_def=0.5):
+        """Get mesh from Mesh::Feature (STL/OBJ) or Part::Feature (STEP/Solid)"""
+        if hasattr(obj, "Mesh"):  # STL/OBJ
+            return obj.Mesh.copy()
+        elif hasattr(obj, "Shape"):  # STEP or any Part::Feature
+            import MeshPart
+            return MeshPart.meshFromShape(Shape=obj.Shape,
+                                          LinearDeflection=float(lin_def),
+                                          AngularDeflection=float(ang_def))
+        else:
+            raise ValueError(f"Object {obj.Name} is not meshable.")
+    
+    def _build_centers_and_tris(self, mesh):
+        """Build facet centers and triangles from mesh"""
+        centers, tris = [], []
+        for f in mesh.Facets:
+            p1, p2, p3 = f.Points
+            a, b, c = self._V(p1), self._V(p2), self._V(p3)
+            centers.append(FreeCAD.Vector((a.x+b.x+c.x)/3.0, (a.y+b.y+c.y)/3.0, (a.z+b.z+c.z)/3.0))
+            tris.append((a,b,c))
+        return centers, tris
+    
+    def _nearest_face_index(self, p, centers):
+        """Find nearest face index to point"""
+        best_i, best_d2 = -1, 1e100
+        for i,c in enumerate(centers):
+            d2 = (c - p).Length ** 2
+            if d2 < best_d2:
+                best_i, best_d2 = i, d2
+        return best_i
+    
+    def _project_point_to_triangle(self, p, a, b, c):
+        """Project point to triangle with barycentric clamping"""
+        ab, ac = b-a, c-a
+        n = ab.cross(ac)
+        nn = n.dot(n)
+        if nn == 0:  # degenerate
+            return min((a,b,c), key=lambda q: (q-p).Length)
+        # orthogonal projection
+        proj = p - n * ((p - a).dot(n) / nn)
+        # barycentric clamp
+        v0, v1, v2 = ab, ac, proj - a
+        d00, d01, d11 = v0.dot(v0), v0.dot(v1), v1.dot(v1)
+        d20, d21 = v2.dot(v0), v2.dot(v1)
+        denom = d00*d11 - d01*d01
+        if denom == 0:
+            return min((a,b,c), key=lambda q: (q-p).Length)
+        v = (d11*d20 - d01*d21) / denom
+        w = (d00*d21 - d01*d20) / denom
+        u = 1.0 - v - w
+        u = max(0.0, min(1.0, u))
+        v = max(0.0, min(1.0, v))
+        if u+v > 1.0:
+            s = u+v
+            u, v = u/s, v/s
+        w = 1.0 - u - v
+        return a*u + b*v + c*w
+    
+    def _faces_within_radius(self, point, centers, r_mm):
+        """Find faces within radius of point"""
+        r2 = r_mm*r_mm
+        return [i for i,c in enumerate(centers) if (c - point).Length**2 <= r2]
+    
+    def _overlay_part_name(self, base_obj_name):
+        """Generate overlay part name"""
+        return self.OVERLAY_PART_PREFIX + base_obj_name
+    
+    def _ensure_overlay_part(self, base_obj):
+        """Create or reuse App::Part for overlays tied to base object"""
+        doc = FreeCAD.ActiveDocument
+        part_name = self._overlay_part_name(base_obj.Name)
+        part = doc.getObject(part_name)
+        if not part:
+            part = doc.addObject("App::Part", part_name)
+        # hard-set placement to base
+        part.Placement = base_obj.Placement
+        return part
+    
+    def _clear_overlays_for(self, base_obj):
+        """Clear overlays for base object"""
+        doc = FreeCAD.ActiveDocument
+        part = doc.getObject(self._overlay_part_name(base_obj.Name))
+        if part:
+            # delete children then the part
+            for ch in list(part.Group):
+                doc.removeObject(ch.Name)
+            doc.removeObject(part.Name)
+            doc.recompute()
+        # also un-register base if present
+        if base_obj.Name in self._DFM_BASE_REGISTRY:
+            self._DFM_BASE_REGISTRY.discard(base_obj.Name)
+    
+    def _build_overlay(self, mesh, indices, name, color, transparency, parent_part):
+        """Build overlay mesh from indices"""
+        if not indices: 
+            return None
+        import Mesh
+        new_mesh = Mesh.Mesh()
+        for idx in indices:
+            facet = mesh.Facets[int(idx)]
+            p1,p2,p3 = facet.Points
+            new_mesh.addFacet(self._V(p1), self._V(p2), self._V(p3))
+        obj = FreeCAD.ActiveDocument.addObject("Mesh::Feature", name)
+        obj.Mesh = new_mesh
+        vo = obj.ViewObject
+        vo.ShapeColor = color
+        vo.Transparency = int(transparency)
+        vo.DisplayMode = "Shaded"
+        vo.Lighting = "One side"
+        # Put overlay under the overlay App::Part so it inherits transform
+        parent_part.addObject(obj)
+        obj.Placement = FreeCAD.Placement()  # identity; inherits parent transform
+        return obj
+    
+    def _dfm_visualize(self, obj_name, issues, method="overlay", radius_mm=3.0, clear=True, lin_def=0.1, ang_def=0.5):
+        """
+        Professional DFM visualization with per-issue overlays and 3D tooltips
+        obj_name: FreeCAD tree object name (Mesh::Feature or Part::Feature)
+        method: "overlay" (recommended) - uses professional per-issue system
+        radius_mm: local patch radius around each issue projection (3.0mm default)
+        lin_def / ang_def: tessellation quality for STEP (lower = finer)
+        """
+        # Use the professional DFM overlay system with per-issue tooltips
+        return dfm_draw_per_issue_overlays(obj_name, issues, radius_mm, clear, lin_def, ang_def)
+    
+    def _method2_overlays(self, base_obj, issues, radius_mm=2.5, clear=True, lin_def=0.1, ang_def=0.5):
+        """Method 2: Overlay submeshes (preferred)"""
+        from collections import defaultdict
+        
+        if clear: 
+            self._clear_overlays_for(base_obj)
+        mesh = self._get_mesh_from_object(base_obj, lin_def, ang_def)
+        centers, tris = self._build_centers_and_tris(mesh)
+
+        # Create (or reuse) a transform-carrying container (App::Part)
+        part = self._ensure_overlay_part(base_obj)
+
+        buckets = defaultdict(set)
+        for it in issues:
+            pos = it.get("position")
+            if not pos or len(pos)!=3: 
+                continue
+            p = FreeCAD.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+            i0 = self._nearest_face_index(p, centers)
+            if i0 < 0: 
+                continue
+            a,b,c = tris[i0]
+            p_proj = self._project_point_to_triangle(p, a, b, c)
+            face_ids = self._faces_within_radius(p_proj, centers, radius_mm) or [i0]
+            sev = (it.get("severity") or "medium").lower().strip()
+            if sev not in self.SEVERITY_STYLE: 
+                sev = "medium"
+            buckets[sev].update(face_ids)
+
+        created = []
+        for sev, idxs in buckets.items():
+            style = self.SEVERITY_STYLE[sev]
+            overlay = self._build_overlay(mesh, sorted(idxs),
+                                         f"DFM_{sev.upper()}_{base_obj.Name}",
+                                         style["color"], style["transparency"],
+                                         parent_part=part)
+            if overlay: 
+                created.append(overlay)
+
+        # Register for auto-sync
+        self._DFM_BASE_REGISTRY.add(base_obj.Name)
+        FreeCAD.ActiveDocument.recompute()
+        return created
+    
+    def _method1_facet_color(self, base_obj, issues, radius_mm=2.5, lin_def=0.1, ang_def=0.5):
+        """Method 1: Facet coloring (fallback)"""
+        from collections import defaultdict
+        
+        mesh = self._get_mesh_from_object(base_obj, lin_def, ang_def)
+        centers, tris = self._build_centers_and_tris(mesh)
+        n = len(centers)
+        diffuse = [(0.8,0.8,0.8)] * n
+        per_sev = defaultdict(set)
+        
+        for it in issues:
+            pos = it.get("position")
+            if not pos or len(pos)!=3: 
+                continue
+            p = FreeCAD.Vector(float(pos[0]), float(pos[1]), float(pos[2]))
+            i0 = self._nearest_face_index(p, centers)
+            if i0 < 0: 
+                continue
+            a,b,c = tris[i0]
+            p_proj = self._project_point_to_triangle(p, a, b, c)
+            face_ids = self._faces_within_radius(p_proj, centers, radius_mm) or [i0]
+            sev = (it.get("severity") or "medium").lower().strip()
+            if sev not in self.SEVERITY_STYLE: 
+                sev = "medium"
+            per_sev[sev].update(face_ids)
+
+        # paint by severity (critical overwrites)
+        order = ["low","medium","high","critical"]
+        for sev in order:
+            if sev not in per_sev: 
+                continue
+            color = self.SEVERITY_STYLE[sev]["color"]
+            for i in per_sev[sev]:
+                diffuse[int(i)] = color
+
+        shown_obj_name = None
+        if hasattr(base_obj, "Mesh"):
+            base_obj.ViewObject.DiffuseColor = diffuse
+            base_obj.ViewObject.DisplayMode = "Shaded"
+            base_obj.ViewObject.Lighting = "One side"
+            base_obj.ViewObject.Transparency = 0
+            shown_obj_name = base_obj.Name
+        else:
+            # STEP: make a display mesh that follows transforms via an App::Part container
+            part = self._ensure_overlay_part(base_obj)
+            temp = FreeCAD.ActiveDocument.addObject("Mesh::Feature", f"{base_obj.Name}{self.FACET_TEMP_SUFFIX}")
+            temp.Mesh = mesh
+            temp.ViewObject.DiffuseColor = diffuse
+            temp.ViewObject.DisplayMode = "Shaded"
+            temp.ViewObject.Lighting = "One side"
+            part.addObject(temp)
+            temp.Placement = FreeCAD.Placement()  # identity; inherits
+            shown_obj_name = temp.Name
+
+        # Register for auto-sync
+        self._DFM_BASE_REGISTRY.add(base_obj.Name)
+        FreeCAD.ActiveDocument.recompute()
+        return shown_obj_name
+    
+    def toggle_overlays(self, base_obj_name, visible=True):
+        """Toggle overlay visibility using professional DFM overlay system"""
+        dfm_toggle_overlays(base_obj_name, visible)
+    
+    def sync_overlay_part_to_base(self, base_obj_name):
+        """Manual sync overlay part to base object using professional DFM overlay system"""
+        sync_overlay_part_to_base(base_obj_name)
+    
+    # ========== END ROBUST DFM VISUALIZATION SYSTEM ==========
+
     def get_cost_analysis(self):
         """Get detailed cost analysis from the DFM service"""
         try:
@@ -651,21 +2901,155 @@ class DesignContextManager:
         """Clear the current objects"""
         self.context['current_objects'] = []
 
-# Cloud AI processor for natural language processing
+# Claude AI processor for conversational CAD generation
 class CloudAIProcessor:
-    """Process natural language using cloud AI"""
+    """Process natural language using Claude AI for conversational CAD generation"""
     
     def __init__(self, cloud_client=None):
         self.cloud_client = cloud_client
         self.context_memory = []
-        print(f"Debug: CloudAIProcessor initialized with client: {cloud_client is not None}")
+        self.anthropic_client = None
+        
+        # Initialize Claude/Anthropic client for conversational CAD generation
+        if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+            try:
+                self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+                print("[OK] Claude AI conversational CAD generation ready")
+            except Exception as e:
+                print(f"⚠️ Failed to initialize Claude AI: {str(e)}")
+        else:
+            if not ANTHROPIC_AVAILABLE:
+                print("⚠️ Claude AI library not available")
+            elif not ANTHROPIC_API_KEY:
+                print("⚠️ ANTHROPIC_API_KEY not found - Claude integration disabled")
+        
+        print(f"Debug: CloudAIProcessor initialized - Cloud: {cloud_client is not None}, Claude: {self.anthropic_client is not None}")
     
     def process_advanced_command(self, text, context=None):
-        """Process command with cloud AI"""
+        """Process command with Claude AI for conversational CAD generation"""
+        # Try Claude AI first for conversational CAD generation
+        if self.anthropic_client:
+            try:
+                return self.claude_conversational_process(text, context)
+            except Exception as e:
+                print(f"Claude conversational processing failed: {str(e)}, falling back")
+        
+        # Fallback to cloud client
         if self.cloud_client and self.cloud_client.connected:
             return self.cloud_process(text, context)
         else:
             return self.local_process(text, context)
+    
+    def claude_conversational_process(self, text, context=None):
+        """Process using Claude AI for conversational CAD generation"""
+        try:
+            if not self.anthropic_client:
+                print("Claude AI not available for conversational processing")
+                return self.local_process(text, context)
+            
+            # Build comprehensive system prompt for conversational CAD generation
+            system_prompt = """You are Axis 5, an expert CAD/manufacturing assistant integrated into FreeCAD. You provide conversational CAD generation and manufacturing intelligence.
+
+Your capabilities:
+1. Generate FreeCAD Python code from natural language descriptions
+2. Create CAD models (brackets, gears, bottles, holders, containers, etc.)
+3. Provide DFM analysis and manufacturing advice
+4. Recommend tools, processes, and materials
+5. Answer technical questions about CAD and manufacturing
+6. Engage in natural conversation about design and manufacturing
+
+When generating CAD code:
+- Use FreeCAD Python API (FreeCAD, Part, Draft modules)
+- Create objects in the active document
+- Include proper recompute() calls
+- Make objects visible with appropriate view settings
+
+For manufacturing advice:
+- Consider processes like 3D printing, CNC, injection molding
+- Provide cost estimates and material recommendations
+- Suggest design optimizations for manufacturability
+
+Always be conversational, helpful, and provide practical solutions."""
+            
+            # Add context if available
+            user_message = text
+            if context:
+                user_message = f"Context: {context}\n\nUser: {text}"
+            
+            # Add conversation memory for continuity
+            if self.context_memory:
+                recent_context = "\n".join(self.context_memory[-4:])  # Last 4 exchanges
+                user_message = f"Recent conversation:\n{recent_context}\n\nCurrent: {text}"
+            
+            print(f"🤖 Axis 5 processing: {text[:100]}...")
+            
+            # Call Claude API for conversational response
+            response = self.anthropic_client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=4000,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_message}
+                ]
+            )
+            
+            response_text = response.content[0].text
+            print(f"[OK] Axis 5 response generated: {len(response_text)} chars")
+            
+            # Store conversation in memory
+            self.context_memory.append(f"User: {text}")
+            self.context_memory.append(f"Axis 5: {response_text[:200]}...")
+            
+            # Keep memory manageable
+            if len(self.context_memory) > 12:
+                self.context_memory = self.context_memory[-12:]
+            
+            # Extract FreeCAD code if present
+            freecad_code = self.extract_freecad_code(response_text)
+            
+            return {
+                'success': True,
+                'response': response_text,
+                'freecad_code': freecad_code,
+                'source': 'claude_conversational',
+                'conversation_mode': True
+            }
+            
+        except Exception as e:
+            print(f"Error in Claude conversational processing: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'response': f"Axis 5 AI temporarily unavailable: {str(e)}. Using fallback processing."
+            }
+    
+    def extract_freecad_code(self, text):
+        """Extract FreeCAD Python code from Claude's conversational response"""
+        try:
+            import re
+            
+            # Look for Python code blocks
+            python_pattern = r'```python\s*\n(.*?)\n```'
+            matches = re.findall(python_pattern, text, re.DOTALL)
+            
+            if matches:
+                return matches[0].strip()
+            
+            # Look for general code blocks
+            code_pattern = r'```\s*\n(.*?)\n```'
+            matches = re.findall(code_pattern, text, re.DOTALL)
+            
+            if matches:
+                # Check if it looks like FreeCAD code
+                code = matches[0].strip()
+                if any(keyword in code for keyword in ['FreeCAD', 'Part.', 'Draft.', 'doc.addObject', 'App.ActiveDocument']):
+                    return code
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error extracting FreeCAD code: {str(e)}")
+            return None
     
     def cloud_process(self, text, context):
         """Use cloud AI for processing"""
@@ -803,7 +3187,7 @@ class CloudAIProcessor:
 
 # Natural Language CAD Editor
 class NaturalLanguageCADEditor:
-    """Natural Language CAD Editor"""
+    """Natural Language CAD Editor with Claude and Text-to-CAD Integration"""
     
     def __init__(self, cloud_client=None):
         """Initialize the NL CAD editor"""
@@ -815,11 +3199,32 @@ class NaturalLanguageCADEditor:
         this_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.join(this_dir, "cloud_config.json")
         try:
-            self.text_to_cad = TextToCADIntegration(config_path)
-            print(f"Text-to-CAD integration initialized, connected: {self.text_to_cad.connected}")
+            if _TEXT_TO_CAD_AVAILABLE:
+                self.text_to_cad = TextToCADIntegration(config_path)
+                print(f"Text-to-CAD integration initialized, connected: {self.text_to_cad.connected}")
+            else:
+                self.text_to_cad = None
+                print("Text-to-CAD integration not available")
         except Exception as e:
             print(f"Error initializing Text-to-CAD integration: {str(e)}")
             self.text_to_cad = None
+        
+        # Initialize Claude/Anthropic integration
+        self.anthropic_client = None
+        self.claude_available = False
+        if _ANTHROPIC_AVAILABLE:
+            api_key = load_anthropic_api_key()
+            if api_key:
+                try:
+                    self.anthropic_client = anthropic.Anthropic(api_key=api_key)
+                    self.claude_available = True
+                    print("Claude/Anthropic integration initialized")
+                except Exception as e:
+                    print(f"Error initializing Claude: {str(e)}")
+            else:
+                print("ANTHROPIC_API_KEY not found - Claude features disabled")
+        
+
         self.command_handlers = {}
         
         # Register command handlers
@@ -837,14 +3242,19 @@ class NaturalLanguageCADEditor:
     def register_command_handler(self, keyword, handler):
         """Register a command handler for a keyword"""
         self.command_handlers[keyword.lower()] = handler
+    
     def process_command(self, text):
-        """Process a natural language CAD command"""
+        """Process a natural language CAD command with Claude and Text-to-CAD integration"""
         print(f"Processing CAD command: {text}")
         
-        # Check if this is a Text-to-CAD request
+        # Check if this is a Text-to-CAD request first
         if self.text_to_cad and self.text_to_cad.is_text_to_cad_request(text):
             return self.handle_text_to_cad_request(text)
-            
+        
+        # Check if Claude should handle this request
+        if self.claude_available and self.should_use_claude(text):
+            return self.handle_claude_request(text)
+        
         # Check if this is a complex command that needs AI processing
         if self.is_complex_command(text):
             # Use AI processor
@@ -1226,11 +3636,15 @@ class NaturalLanguageCADEditor:
                     if hasattr(sel_item, 'SubObjects') and sel_item.SubObjects:
                         print(f"Debug: Found {len(sel_item.SubObjects)} sub-objects")
                         
-                        # Look for faces in the selection
+                        # Look for faces in the selection using proper FreeCAD API
                         faces = []
-                        for sub_obj in sel_item.SubObjects:
-                            if hasattr(sub_obj, 'Surface'):  # It's a face
-                                faces.append(sub_obj)
+                        if hasattr(sel_item, 'SubElementNames'):
+                            for sub_name in sel_item.SubElementNames:
+                                if sub_name.startswith('Face'):
+                                    # Get face index and extract the actual face from the shape
+                                    face_index = int(sub_name[4:]) - 1
+                                    if face_index < len(obj.Shape.Faces):
+                                        faces.append(obj.Shape.Faces[face_index])
                         
                         if faces:
                             print(f"Debug: Found {len(faces)} face(s) to extrude")
@@ -1287,17 +3701,50 @@ class NaturalLanguageCADEditor:
                         try:
                             # Get the largest face (most likely the one to extrude)
                             largest_face = max(obj.Shape.Faces, key=lambda f: f.Area)
-                            print(f"Debug: Using largest face with area {largest_face.Area}")
+                            print("Debug: Attempting clean face extrusion")
+                            try:
+                                # Create a clean copy of the face to avoid corruption
+                                face_copy = largest_face.copy()
+                                
+                                # Create extrusion using proper FreeCAD extrude method
+                                extruded_shape = face_copy.extrude(extrude_vector)
+                                
+                                # Ensure the shape is valid
+                                if not extruded_shape.isValid():
+                                    print("Debug: Invalid extruded shape, attempting to fix")
+                                    extruded_shape = extruded_shape.fix()
+                                
+                                extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
+                                result_obj = doc.addObject("Part::Feature", extrude_name)
+                                result_obj.Shape = extruded_shape
+                                
+                                # Ensure object is visible and properly rendered
+                                result_obj.ViewObject.Visibility = True
+                                result_obj.ViewObject.DisplayMode = "Flat Lines"  # Clean display mode
+                                
+                                # Make the extruded object more visible
+                                try:
+                                    result_obj.ViewObject.ShapeColor = (0.0, 0.8, 0.0)  # Green color
+                                    result_obj.ViewObject.Transparency = 20  # Slightly transparent
+                                    
+                                    # Force document recompute
+                                    doc.recompute()
+                                    
+                                    # Clear selection and select the new object
+                                    FreeCADGui.Selection.clearSelection()
+                                    FreeCADGui.Selection.addSelection(result_obj)
+                                    
+                                    # Force view update
+                                    FreeCADGui.updateGui()
+                                except:
+                                    pass
+                                
+                                print(f"Debug: Successfully created clean face extrusion: {extrude_name}")
+                                success_count += 1
                             
-                            extruded_shape = largest_face.extrude(extrude_vector)
-                            
-                            extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
-                            result_obj = doc.addObject("Part::Feature", extrude_name)
-                            result_obj.Shape = extruded_shape
-                            result_obj.ViewObject.Visibility = True
-                            
-                            print(f"Debug: Successfully created object face extrusion: {extrude_name}")
-                            success_count += 1
+                            except Exception as face_err:
+                                print(f"Debug: Face extrusion failed: {str(face_err)}")
+                                error_messages.append(f"Face extrusion failed: {str(face_err)}")
                             
                         except Exception as obj_err:
                             print(f"Debug: Object face extrusion failed: {str(obj_err)}")
@@ -1455,6 +3902,123 @@ class NaturalLanguageCADEditor:
             traceback.print_exc()
             return {'success': False, 'message': f"Error creating fillet: {str(e)}"}
     
+    def should_use_claude(self, text):
+        """Determine if Claude should handle this request"""
+        if not self.claude_available:
+            return False
+        
+        # Use Claude for conversational requests, complex analysis, or when explicitly asked
+        claude_keywords = [
+            'explain', 'how', 'why', 'what', 'analyze', 'recommend', 'suggest',
+            'compare', 'optimize', 'improve', 'claude', 'ai', 'help me understand'
+        ]
+        
+        text_lower = text.lower()
+        return any(keyword in text_lower for keyword in claude_keywords)
+    
+    def handle_claude_request(self, text):
+        """Handle request using Claude AI"""
+        try:
+            # Get current CAD context
+            context = self.context.get_context()
+            
+            # Build comprehensive prompt for Claude
+            system_prompt = """You are an expert manufacturing engineer and CAD specialist integrated into FreeCAD. 
+You help users with:
+- CAD design and modeling
+- Manufacturing processes and DFM analysis
+- Material selection and optimization
+- Engineering calculations and recommendations
+
+Provide practical, actionable advice. If the user wants to create CAD geometry, provide specific FreeCAD Python code."""
+            
+            user_prompt = f"""Current CAD Context:
+{context}
+
+User Request: {text}
+
+Please provide a helpful response with specific recommendations or FreeCAD code if applicable."""
+            
+            # Call Claude API
+            response = self.anthropic_client.messages.create(
+                model="claude-3-sonnet-20240229",
+                max_tokens=2000,
+                system=system_prompt,
+                messages=[
+                    {"role": "user", "content": user_prompt}
+                ]
+            )
+            
+            claude_response = response.content[0].text
+            
+            return {
+                'success': True,
+                'message': claude_response,
+                'source': 'Claude AI',
+                'type': 'conversational'
+            }
+            
+        except Exception as e:
+            print(f"Error with Claude request: {str(e)}")
+            # Fallback to regular processing
+            return self.ai_processor.process_advanced_command(text, self.context.get_context())
+    
+    def handle_text_to_cad_request(self, text):
+        """Handle a Text-to-CAD request using the cloud service"""
+        if not self.text_to_cad:
+            return {
+                "success": False,
+                "message": "Text-to-CAD integration is not available"
+            }
+            
+        try:
+            print(f"Processing Text-to-CAD request: {text}")
+            
+            # Process the request using TextToCADIntegration
+            result = self.text_to_cad.process_request(text)
+            
+            # Execute the FreeCAD code to actually create the CAD object
+            if result.get("success", False):
+                freecad_code = result.get("freecad_code", "")
+                print(f"Got FreeCAD code with length: {len(freecad_code)}")
+                if freecad_code:
+                    print(f"About to execute FreeCAD code via execute_freecad_code")
+                    
+                    execution_result = self.text_to_cad.execute_freecad_code(freecad_code)
+                    print(f"Execution result: {execution_result}")
+                    
+                    if not execution_result.get("success", False):
+                        print(f"Failed to execute FreeCAD code: {execution_result.get('error', 'Unknown error')}")
+                        return {
+                            "success": False,
+                            "message": f"Failed to execute CAD code: {execution_result.get('error', 'Unknown error')}"
+                        }
+                    else:
+                        print("FreeCAD code executed successfully - CAD object should be visible in 3D view")
+                else:
+                    print("No FreeCAD code received from server")
+                
+                return {
+                    "success": True,
+                    "message": result.get("message", "CAD model created successfully"),
+                    "engineering_analysis": result.get("engineering_analysis", "")
+                }
+            else:
+                error_msg = result.get("error", "Unknown error in Text-to-CAD request")
+                print(f"Text-to-CAD request failed: {error_msg}")
+                return {
+                    "success": False,
+                    "message": f"Text-to-CAD failed: {error_msg}"
+                }
+                
+        except Exception as e:
+            print(f"Error in Text-to-CAD request: {str(e)}")
+            traceback.print_exc()
+            return {
+                "success": False,
+                "message": f"Text-to-CAD error: {str(e)}"
+            }
+    
     def add_fillets_to_object(self, obj, radius=2.0):
         """Add fillets to all edges of an object"""
         try:
@@ -1502,9 +4066,31 @@ class NaturalLanguageCADEditor:
                 print(f"Text-to-CAD progress: {message}")
             
             # Process the request using the improved TextToCADIntegration
-            result = self.text_to_cad.handle_text_to_cad_request(text, progress_callback)
+            result = self.text_to_cad.process_request(text)
             
+            # Execute the FreeCAD code to actually create the CAD object and make it visible - AXIS 5 DEBUG
             if result.get("success", False):
+                freecad_code = result.get("freecad_code", "")
+                print(f"🔍 AXIS 5 DEBUG: Got FreeCAD code with length: {len(freecad_code)}")
+                if freecad_code:
+                    print(f"🔍 AXIS 5 DEBUG: About to execute FreeCAD code via enhanced execute_freecad_code")
+                    print(f"🔍 AXIS 5 DEBUG: First 200 chars of code: {freecad_code[:200]}...")
+                    
+                    execution_result = self.text_to_cad.execute_freecad_code(freecad_code)
+                    print(f"🔍 AXIS 5 DEBUG: Execution result: {execution_result}")
+                    
+                    if not execution_result.get("success", False):
+                        print(f"❌ AXIS 5 DEBUG: Failed to execute FreeCAD code: {execution_result.get('error', 'Unknown error')}")
+                        return {
+                            "success": False,
+                            "message": f"Failed to execute CAD code: {execution_result.get('error', 'Unknown error')}"
+                        }
+                    else:
+                        print("[OK] AXIS 5 DEBUG: FreeCAD code executed successfully - CAD object should be visible in 3D view")
+                        print(f"[OK] AXIS 5 DEBUG: Enhanced GUI updates should have been applied for visibility")
+                else:
+                    print("❌ AXIS 5 DEBUG: No FreeCAD code received from server")
+                
                 return {
                     "success": True,
                     "message": result.get("message", "CAD model created successfully"),
@@ -2039,16 +4625,8 @@ class CloudApiClient:
             return {"status": "error", "message": str(e)}
     
     def _make_request(self, endpoint: str, payload: Dict[str, Any] = None, method: str = "POST", timeout: int = None) -> Dict[str, Any]:
-        """Make a request to the cloud API"""
+        """Make a request to the cloud API using urllib.request"""
         url = f"{self.api_url}{endpoint}"
-        
-        # Set up headers with API key if available
-        headers = {"Content-Type": "application/json"}
-        if self.api_key:
-            # Use X-API-Key as the primary authentication method
-            # This is the standard expected by the cloud service
-            headers["X-API-Key"] = self.api_key
-            print("Using X-API-Key authentication")
         
         # Use provided timeout or default from config
         if timeout is None:
@@ -2059,78 +4637,110 @@ class CloudApiClient:
             print(f"Making {method} request to {url} with timeout {timeout}s")
             start_time = time.time()
             
+            # Prepare request
             if method == "GET":
-                response = requests.get(url, headers=headers, timeout=timeout)
+                req = urllib.request.Request(url, method="GET")
             elif method == "POST":
-                response = requests.post(url, json=payload, headers=headers, timeout=timeout)
+                # Convert payload to JSON bytes
+                if payload:
+                    data = json.dumps(payload).encode('utf-8')
+                else:
+                    data = None
+                req = urllib.request.Request(url, data=data, method="POST")
+                req.add_header('Content-Type', 'application/json')
             else:
                 raise ValueError(f"Unsupported HTTP method: {method}")
             
-            # Calculate latency
-            end_time = time.time()
-            latency = int((end_time - start_time) * 1000)
-            self.last_latency = latency
+            # Add API key header if available
+            if self.api_key:
+                req.add_header('X-API-Key', self.api_key)
+                print("Using X-API-Key authentication")
             
-            # Log response status
-            print(f"Response status code: {response.status_code}, latency: {latency}ms")
-            
-            # Check if response is successful
-            if response.status_code >= 400:
-                print(f"Error response: {response.text}")
+            # Make the request
+            with urllib.request.urlopen(req, timeout=timeout) as response:
+                # Calculate latency
+                end_time = time.time()
+                latency = int((end_time - start_time) * 1000)
+                self.last_latency = latency
                 
-                # Handle specific error codes
-                if response.status_code == 401:
-                    # Authentication error - try to recover
-                    print("Authentication error. Trying to recover...")
-                    # Reload config to get fresh API key
-                    cloud_config = self.load_cloud_config()
-                    self.api_key = cloud_config.get("cloud_api_key", "dev_api_key_for_testing")
-                    raise ValueError(f"Authentication failed: {response.text}. Updated API key for next attempt.")
-                elif response.status_code == 404:
-                    # Not found error
-                    raise ValueError(f"Endpoint not found: {endpoint}")
-                elif response.status_code == 422 and 'cad_data' in response.text:
-                    raise ValueError("API requires cad_data field")
+                # Log response status
+                status_code = response.getcode()
+                print(f"Response status code: {status_code}, latency: {latency}ms")
+                
+                # Update connection quality based on latency
+                if latency < 200:
+                    self.connection_quality = "excellent"
+                elif latency < 500:
+                    self.connection_quality = "good"
+                elif latency < 1000:
+                    self.connection_quality = "fair"
+                else:
+                    self.connection_quality = "poor"
+                
+                # Read and parse response
+                response_data = response.read().decode('utf-8')
+                return json.loads(response_data)
             
-            response.raise_for_status()
-            
-            # Update connection quality based on latency
-            if latency < 200:
-                self.connection_quality = "excellent"
-            elif latency < 500:
-                self.connection_quality = "good"
-            elif latency < 1000:
-                self.connection_quality = "fair"
-            else:
-                self.connection_quality = "poor"
-            
-            # Parse response
-            return response.json()
-            
-        except requests.exceptions.RequestException as e:
+        except urllib.error.HTTPError as e:
             self.last_error = str(e)
-            print(f"Cloud API request failed: {str(e)}")
-            if hasattr(e, 'response') and e.response is not None:
-                print(f"Response status code: {e.response.status_code}")
-                try:
-                    print(f"Response content: {e.response.text}")
-                except:
-                    pass
-            # Update connection status
-            old_status = self.connected
-            self.connected = False
-            self.connection_quality = "unknown"
+            status_code = e.code
+            response_text = e.read().decode('utf-8') if hasattr(e, 'read') else str(e)
             
-            # Notify listeners if status changed
-            if old_status and not self.connected:
-                self._notify_connection_change()
+            print(f"HTTP Error {status_code}: {response_text}")
+            
+            # Handle specific error codes
+            if status_code == 401:
+                # Authentication error - try to recover
+                print("Authentication error. Trying to recover...")
+                # Reload config to get fresh API key
+                cloud_config = self.load_cloud_config()
+                self.api_key = cloud_config.get("cloud_api_key", "dev_api_key_for_testing")
+                raise ValueError(f"Authentication failed: {response_text}. Updated API key for next attempt.")
+            elif status_code == 404:
+                # Not found error
+                raise ValueError(f"Endpoint not found: {endpoint}")
+            elif status_code == 422 and 'cad_data' in response_text:
+                raise ValueError("API requires cad_data field")
+            
+            # Update connection status
+            if self.connected:
+                old_status = self.connected
+                self.connected = False
+                self.connection_quality = "poor"
                 
-            raise Exception(f"Cloud API request failed: {str(e)}")
+                if old_status != self.connected:
+                    self._notify_connection_change()
+            
+            raise ValueError(f"Cloud API HTTP error {status_code}: {response_text}")
+        
+        except urllib.error.URLError as e:
+            self.last_error = str(e)
+            print(f"URL Error: {str(e)}")
+            
+            # Update connection status
+            if self.connected:
+                old_status = self.connected
+                self.connected = False
+                self.connection_quality = "poor"
+                
+                if old_status != self.connected:
+                    self._notify_connection_change()
+            
+            raise ValueError(f"Cloud API connection failed: {str(e)}")
         
         except Exception as e:
             self.last_error = str(e)
-            print(f"Unexpected error: {str(e)}")
-            raise
+            print(f"Unexpected error in cloud API request: {str(e)}")
+            
+            # Update connection status
+            old_status = self.connected
+            self.connected = False
+            self.connection_quality = "poor"
+            
+            if old_status and not self.connected:
+                self._notify_connection_change()
+            
+            raise ValueError(f"Unexpected error: {str(e)}")
 
     def add_connection_listener(self, callback):
         """Add a callback function to be notified of connection status changes"""
@@ -2193,7 +4803,7 @@ class CloudApiClient:
             
             # Add overall assessment
             if not violations:
-                response_text += f"{item_num}. ✅ Overall: Excellent manufacturability\n"
+                response_text += f"{item_num}. [OK] Overall: Excellent manufacturability\n"
             else:
                 # Calculate overall severity based on highest severity score
                 max_severity = max([v.get('severity_score', 0) for v in violations]) if violations else 0
@@ -2324,7 +4934,7 @@ class CloudApiClient:
             # Add overall assessment as item #1 with process-specific wording
             if process == 'fdm':
                 if mfg_index > 90:
-                    response_text += f"{item_num}. ✅ Overall: Excellent 3D printability (Score: {mfg_index}/100)\n"
+                    response_text += f"{item_num}. [OK] Overall: Excellent 3D printability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 70:
                     response_text += f"{item_num}. ✓ Overall: Good 3D printability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 50:
@@ -2333,7 +4943,7 @@ class CloudApiClient:
                     response_text += f"{item_num}. 🚨 Overall: Poor 3D printability (Score: {mfg_index}/100)\n"
             elif process == 'cnc':
                 if mfg_index > 90:
-                    response_text += f"{item_num}. ✅ Overall: Excellent machinability (Score: {mfg_index}/100)\n"
+                    response_text += f"{item_num}. [OK] Overall: Excellent machinability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 70:
                     response_text += f"{item_num}. ✓ Overall: Good machinability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 50:
@@ -2342,7 +4952,7 @@ class CloudApiClient:
                     response_text += f"{item_num}. 🚨 Overall: Poor machinability (Score: {mfg_index}/100)\n"
             else:
                 if mfg_index > 90:
-                    response_text += f"{item_num}. ✅ Overall: Excellent manufacturability (Score: {mfg_index}/100)\n"
+                    response_text += f"{item_num}. [OK] Overall: Excellent manufacturability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 70:
                     response_text += f"{item_num}. ✓ Overall: Good manufacturability (Score: {mfg_index}/100)\n"
                 elif mfg_index > 50:
@@ -2533,7 +5143,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
     def setup_ui(self):
         """Set up the user interface"""
         # Set window title and size
-        self.setWindowTitle("Standalone Manufacturing Co-Pilot")
+        self.setWindowTitle("Axis 5")
         self.resize(500, 600)
         
         # Initialize chat entries list
@@ -2756,33 +5366,81 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         elif self.is_cad_command(message):
             self.process_cad_command(message)
         else:
-            # Send message to cloud service for chat
+            # Use Axis 5 Claude AI for conversational CAD generation and manufacturing intelligence
             try:
-                # Get response from cloud
-                response = self.cloud_client.get_chat_response(message)
-                
-                # Extract response text
-                if "response" in response:
-                    response_text = response["response"]
-                elif "error" in response:
-                    response_text = f"Error: {response['error']}"
-                else:
-                    print(f"Debug: Received empty response from cloud: {response}")
-                    response_text = "I'm processing your request locally."
-                
                 # Remove processing indicator
                 self.remove_last_processing_message()
                 
-                # Add assistant message
-                self.add_assistant_message(response_text)
+                # Use Claude AI processor for advanced conversational processing
+                if hasattr(self, 'ai_processor') and self.ai_processor:
+                    print(f"🤖 Axis 5 processing conversational request: {message[:50]}...")
+                    ai_response = self.ai_processor.process_advanced_command(message)
+                    
+                    if ai_response and ai_response.get('success'):
+                        response_text = ai_response.get('response', 'No response received')
+                        
+                        # Check if Claude generated FreeCAD code for CAD generation
+                        freecad_code = ai_response.get('freecad_code')
+                        if freecad_code:
+                            print(f"[OK] Axis 5 generated FreeCAD code: {len(freecad_code)} chars")
+                            # Execute the FreeCAD code for CAD generation
+                            try:
+                                exec(freecad_code)
+                                if FreeCAD.ActiveDocument:
+                                    FreeCAD.ActiveDocument.recompute()
+                                if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
+                                    FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                                response_text += "\n\n[OK] CAD model generated successfully and visible in 3D view!"
+                            except Exception as code_err:
+                                print(f"Error executing Axis 5's FreeCAD code: {str(code_err)}")
+                                response_text += f"\n\n⚠️ Error executing generated CAD code: {str(code_err)}"
+                        
+                        # Add Axis 5's conversational response to chat
+                        source = ai_response.get('source', 'ai')
+                        if source == 'claude_conversational':
+                            self.add_assistant_message(f"🤖 Axis 5: {response_text}")
+                        else:
+                            self.add_assistant_message(response_text)
+                    else:
+                        error_msg = ai_response.get('error', 'Unknown error') if ai_response else 'No response'
+                        print(f"Axis 5 processing failed: {error_msg}")
+                        # Fallback to cloud service
+                        response = self.cloud_client.get_chat_response(message)
+                        
+                        # Extract response text
+                        if "response" in response:
+                            response_text = response["response"]
+                        elif "error" in response:
+                            response_text = f"Error: {response['error']}"
+                        else:
+                            print(f"Debug: Received empty response from cloud: {response}")
+                            response_text = "I'm processing your request locally."
+                        
+                        # Add fallback response
+                        self.add_assistant_message(response_text)
+                else:
+                    # Fallback to cloud service if AI processor not available
+                    response = self.cloud_client.get_chat_response(message)
+                    
+                    # Extract response text
+                    if "response" in response:
+                        response_text = response["response"]
+                    elif "error" in response:
+                        response_text = f"Error: {response['error']}"
+                    else:
+                        print(f"Debug: Received empty response from cloud: {response}")
+                        response_text = "I'm processing your request locally."
+                    
+                    # Add fallback response
+                    self.add_assistant_message(response_text)
                 
             except Exception as e:
                 # Remove processing indicator
                 self.remove_last_processing_message()
                 
                 # Add error message
-                self.add_system_message(f"Error: {str(e)}")
-                print(f"Error sending message: {e}")
+                self.add_system_message(f"Axis 5 Error: {str(e)}")
+                print(f"Error in Axis 5 processing: {e}")
                 traceback.print_exc()
     
     def is_cad_command(self, text):
@@ -2814,7 +5472,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             
             if result['success']:
                 # Add success message
-                self.add_system_message(f"✅ {result['message']}")
+                self.add_system_message(f"[OK] {result['message']}")
                 
                 # Check for engineering analysis from Text-to-CAD
                 if 'engineering_analysis' in result and result['engineering_analysis']:
@@ -2955,7 +5613,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         """Add an assistant message to the chat history"""
         print(f"DEBUG: add_assistant_message called with message length: {len(message)}")
         timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] Manufacturing Co-Pilot:</b> {message}"
+        chat_entry = f"<b>[{timestamp}] Axis 5:</b> {message}"
         print(f"DEBUG: Adding entry to chat_entries, length: {len(chat_entry)}")
         
         # Initialize chat_entries as a list if it doesn't exist
@@ -3032,8 +5690,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         mfg_layout = QtWidgets.QVBoxLayout()
         
     def on_analyze_clicked(self):
-        """Handle analyze button click"""
-        self.add_system_message("Analyzing current model...")
+        """Handle analyze button click - now runs full DFM analysis with professional overlays"""
+        self.add_system_message("Running DFM analysis with professional overlays...")
         try:
             # Check if there's an active document
             if FreeCAD.ActiveDocument:
@@ -3041,28 +5699,72 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 objects = FreeCAD.ActiveDocument.Objects
                 object_count = len(objects)
                 
-                # Basic analysis
-                analysis_text = f"Active document: {doc_name} with {object_count} objects\n"
+                if object_count == 0:
+                    self.add_system_message("No objects found to analyze")
+                    self.add_assistant_message("Please create or import a CAD object first, then click Analyze to see DFM overlays with tooltips.")
+                    return
                 
-                # Analyze each object
-                for obj in objects:
-                    if hasattr(obj, 'Shape'):
-                        # Get basic properties
-                        volume = obj.Shape.Volume
-                        bbox = obj.Shape.BoundBox
-                        dimensions = f"{bbox.XLength:.1f}x{bbox.YLength:.1f}x{bbox.ZLength:.1f}"
-                        
-                        analysis_text += f"- {obj.Label}: {obj.TypeId}, Volume: {volume:.1f} mm³, Size: {dimensions} mm\n"
-                    else:
-                        analysis_text += f"- {obj.Label}: {obj.TypeId}\n"
+                # Run full DFM analysis with professional overlays
+                self.add_assistant_message(f"🔍 Analyzing {object_count} objects in '{doc_name}' for manufacturing issues...")
                 
-                # Add analysis to chat
-                self.add_assistant_message(f"Here's my analysis of the current model:\n\n{analysis_text}")
+                # Run DFM analysis using the manufacturing feature manager
+                result = self.mfg_feature_manager.analyze_dfm(
+                    manufacturing_process="3d_printing",  # Default process
+                    material="pla",                       # Default material
+                    production_volume=1,                  # Default volume
+                    advanced_analysis=True                # Enable advanced analysis
+                )
+                
+                if result and result.get('success'):
+                    data = result.get('data', {})
+                    issues = data.get('issues', [])
+                    score = data.get('manufacturability_score', 0)
+                    
+                    self.add_assistant_message(f"[OK] DFM Analysis Complete!\n\n"
+                                             f"📊 Manufacturability Score: {score}/100\n"
+                                             f"🔍 Found {len(issues)} manufacturing issues\n\n"
+                                             f"🎯 **Professional overlays with tooltips are now active!**\n"
+                                             f"• **Hover** over colored areas to see issue details\n"
+                                             f"• **Click** on overlays to pin/unpin tooltips\n"
+                                             f"• Overlays automatically follow object movements")
+                    
+                    if issues:
+                        issues_text = "\n".join([f"• {issue.get('title', 'Issue')}: {issue.get('description', 'No description')}" 
+                                               for issue in issues[:5]])  # Show first 5 issues
+                        if len(issues) > 5:
+                            issues_text += f"\n... and {len(issues) - 5} more issues (see overlays)"
+                        self.add_assistant_message(f"🚨 **Manufacturing Issues Found:**\n{issues_text}")
+                else:
+                    # Fallback to basic analysis if DFM fails
+                    analysis_text = f"Active document: {doc_name} with {object_count} objects\n"
+                    for obj in objects:
+                        if hasattr(obj, 'Shape'):
+                            volume = obj.Shape.Volume
+                            bbox = obj.Shape.BoundBox
+                            dimensions = f"{bbox.XLength:.1f}x{bbox.YLength:.1f}x{bbox.ZLength:.1f}"
+                            analysis_text += f"- {obj.Label}: {obj.TypeId}, Volume: {volume:.1f} mm³, Size: {dimensions} mm\n"
+                        else:
+                            analysis_text += f"- {obj.Label}: {obj.TypeId}\n"
+                    
+                    self.add_assistant_message(f"Here's my basic analysis:\n\n{analysis_text}\n\n"
+                                             f"💡 **Tip:** For DFM overlays with tooltips, ensure you have a mesh or solid object selected.")
             else:
                 self.add_system_message("No active document found")
                 self.add_assistant_message("There is no active document to analyze. Please create or open a document first.")
         except Exception as e:
             self.add_system_message(f"Error analyzing model: {str(e)}")
+            self.add_assistant_message(f"❌ Analysis failed: {str(e)}\n\n"
+                                     f"💡 **Quick Test:** Try creating a simple cube first:\n"
+                                     f"```python\n"
+                                     f"import FreeCAD, Part\n"
+                                     f"doc = FreeCAD.newDocument()\n"
+                                     f"cube = doc.addObject('Part::Box', 'TestCube')\n"
+                                     f"cube.Length = 20\n"
+                                     f"cube.Width = 15\n"
+                                     f"cube.Height = 10\n"
+                                     f"doc.recompute()\n"
+                                     f"```\n"
+                                     f"Then click Analyze again!")
             traceback.print_exc()
     
     def on_suggestions_clicked(self):
@@ -3126,6 +5828,22 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.compare_button.setToolTip("Compare different manufacturing methods")
         self.compare_button.clicked.connect(self.on_compare_clicked)
         button_grid.addWidget(self.compare_button, 1, 1)
+        
+        # Show Problem Area button (RESTORED HEATMAP OVERLAY FEATURE)
+        # Initially hidden - only shown after DFM analysis completes
+        self.show_problems_button = QtWidgets.QPushButton("Show Problem Areas")
+        self.show_problems_button.setToolTip("Visualize manufacturing problem areas with colored overlays on the CAD model")
+        self.show_problems_button.clicked.connect(self.on_show_problems_clicked)
+        self.show_problems_button.setVisible(False)  # Hidden by default
+        button_grid.addWidget(self.show_problems_button, 2, 0)
+        
+        # Hide Problem Area button
+        # Initially hidden - only shown after problem areas are displayed
+        self.hide_problems_button = QtWidgets.QPushButton("Hide Problem Areas")
+        self.hide_problems_button.setToolTip("Remove manufacturing problem area overlays from the CAD model")
+        self.hide_problems_button.clicked.connect(self.on_hide_problems_clicked)
+        self.hide_problems_button.setVisible(False)  # Hidden by default
+        button_grid.addWidget(self.hide_problems_button, 2, 1)
         
         # Add button grid to layout
         mfg_layout.addLayout(button_grid)
@@ -3261,26 +5979,45 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     print(f"DEBUG: Using manufacturing_issues from transformed data: {issues}")
                     
                 # If we don't have issues, try to get them from design_issues
+                print(f"DEBUG: Before design_issues check - issues length: {len(issues)}")
                 if not issues and 'design_issues' in data:
                     design_issues = data.get('design_issues', [])
-                    print(f"DEBUG: Found {len(design_issues)} design_issues")
+                    print(f"DEBUG: Found {len(design_issues)} design_issues: {design_issues}")
                     
                     # Convert design_issues to our format
                     for issue in design_issues:
                         if isinstance(issue, str):
+                            print(f"DEBUG: Converting string issue: {issue}")
                             issues.append({
                                 'severity': 'medium',
                                 'description': issue
                             })
                         elif isinstance(issue, dict):
+                            print(f"DEBUG: Adding dict issue: {issue}")
                             issues.append(issue)
                     
                     print(f"DEBUG: Converted {len(issues)} design_issues to issues format")
+                elif 'design_issues' in data:
+                    print(f"DEBUG: Skipping design_issues conversion - already have {len(issues)} issues")
+                else:
+                    print("DEBUG: No design_issues found in data")
                     
                 # If we don't have recommendations, try to get them from the original format
                 if not recommendations and 'expert_recommendations' in data:
                     recommendations = data.get('expert_recommendations', [])
                     print("DEBUG: Using expert_recommendations from transformed data")
+                
+                # Store the analysis data for visualization (CRITICAL FIX)
+                self.last_analysis = {
+                    'manufacturing_issues': issues,
+                    'design_issues': data.get('design_issues', []),
+                    'overall_manufacturability_score': score,
+                    'overall_rating': data.get('overall_rating', ''),
+                    'primary_process': data.get('primary_process', ''),
+                    'alternative_processes': data.get('alternative_processes', []),
+                    'expert_recommendations': recommendations
+                }
+                print(f"DEBUG: Set last_analysis with {len(issues)} manufacturing_issues for visualization")
                 
                 print(f"DEBUG: UI received score: {score}")
                 print(f"DEBUG: UI received {len(issues)} issues")
@@ -3315,8 +6052,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                             report_lines.append(f"Fillets: {geometry_summary['fillets']}")
                         report_lines.append("")
                     
-                    # Add issues
+                    # Add issues with red color (HTML formatting)
                     report_lines.append(f"--- Manufacturing Issues ({len(issues)}) ---")
+                    # Apply red color to ALL manufacturing issues text
                     if issues:
                         for issue in issues:
                             if isinstance(issue, dict):
@@ -3324,18 +6062,18 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                                 severity = issue.get('severity', 'medium')
                                 recommendation = issue.get('recommendation', '')
                                 
-                                # Add severity indicator
+                                # Add severity indicator with RED COLOR
                                 if severity == 'critical':
-                                    report_lines.append(f"❌ {description}")
+                                    report_lines.append(f"<span style='color: #ff4444;'>❌ {description}</span>")
                                 elif severity == 'high':
-                                    report_lines.append(f"⚠️ {description}")
+                                    report_lines.append(f"<span style='color: #ff4444;'>⚠️ {description}</span>")
                                 else:
-                                    report_lines.append(f"ℹ️ {description}")
+                                    report_lines.append(f"<span style='color: #ff4444;'>ℹ️ {description}</span>")
                                     
                                 if recommendation:
-                                    report_lines.append(f"   → {recommendation}")
+                                    report_lines.append(f"<span style='color: #ff4444;'>   → {recommendation}</span>")
                             else:
-                                report_lines.append(f"• {issue}")
+                                report_lines.append(f"<span style='color: #ff4444;'>• {issue}</span>")
                     else:
                         report_lines.append("No manufacturability issues found.")
                     report_lines.append("")
@@ -3491,7 +6229,13 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     
                     report_text = "\n".join(report_lines)
                     print(f"DEBUG: Generated comprehensive report text of length {len(report_text)}")
-                    data['report_text'] = report_text
+                    
+                    # Apply red color to Manufacturing Issues section for HTML display
+                    report_text_with_color = report_text.replace('--- Manufacturing Issues', '--- <span style="color: #ff4444; font-weight: bold;">Manufacturing Issues')
+                    report_text_with_color = report_text_with_color.replace(') ---', ') ---</span>')
+                    print(f"DEBUG: Applied red color styling to Manufacturing Issues section")
+                    
+                    data['report_text'] = report_text_with_color
                 
                 # Create a formatted message
                 message = f"<b>Advanced DFM Analysis Results</b><br>"
@@ -3504,8 +6248,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 report_text = data.get('report_text', '')
                 if report_text:
                     print(f"DEBUG: Processing report_text for display, length: {len(report_text)}")
-                    # Convert the report text to HTML
+                    # Convert the report text to HTML with red color for Manufacturing Issues
                     report_html = report_text.replace('\n', '<br>')
+                    # Apply red color to Manufacturing Issues section
+                    report_html = report_html.replace('--- Manufacturing Issues', '<span style="color: #ff4444; font-weight: bold;">--- Manufacturing Issues')
+                    report_html = report_html.replace(') ---', ') ---</span>')
                     print(f"DEBUG: HTML report length: {len(report_html)}")
                     message += f"<div style='background-color: #2d2d2d; color: #ffffff; padding: 10px; border-radius: 5px;'>{report_html}</div><br>"
                     print("DEBUG: Added report HTML to message")
@@ -3517,16 +6264,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 else:
                     print("DEBUG: No report_text available for display")
                 
-                # Display issues with severity color coding
-                if issues:
-                    message += "<b>Manufacturing Issues:</b><br>"
-                    for i, issue in enumerate(issues):
-                        severity = issue.get('severity', 'medium')
-                        color = "red" if severity in ["critical", "high"] else "orange" if severity == "medium" else "blue"
-                        message += f"<span style='color:{color}'>{i+1}. {issue.get('description')}</span><br>"
-                    message += "<br>"
-                else:
-                    message += "<b>No manufacturability issues found.</b><br><br>"
+                # Issues are already displayed in the report above, no need to duplicate them here
                 
                 # Get cost analysis if advanced analysis was enabled
                 if advanced_analysis:
@@ -3581,9 +6319,27 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 self.add_assistant_message(message)
                 print("DEBUG: DFM analysis results added to chat")
                 
-                # Visualize issues in 3D view
-                self.mfg_feature_manager.visualize_dfm_issues()
+                # Don't automatically visualize - only when user clicks "Show Problem Areas" button
+                print("DEBUG: Using direct visualization to bypass cloud_integration issues")
+                print(f"DEBUG: Found {len(issues)} issues to visualize")
+                if len(issues) > 0:
+                    print(f"DEBUG: First issue: {issues[0]}")
+                    for i, issue in enumerate(issues):
+                        title = issue.get('title', 'Unknown issue')
+                        location = issue.get('location', 'Unknown location')
+                        print(f"DEBUG: Issue {i+1}: {title[:50]}... at location {location}")
                 self.add_system_message("DFM analysis complete. Issues visualized in the 3D view.")
+                
+                # SHOW PROBLEM AREAS BUTTONS AFTER SUCCESSFUL DFM ANALYSIS (RESTORED WORKFLOW)
+                print(f"DEBUG: Final button visibility check - issues length: {len(issues)}")
+                print(f"DEBUG: Issues content: {issues}")
+                if issues:  # Only show if there are actual issues to visualize
+                    print("DEBUG: SHOWING Problem Areas button - issues found!")
+                    self.show_problems_button.setVisible(True)
+                    self.add_system_message("[OK] Click 'Show Problem Areas' to highlight manufacturing issues with colored overlays.")
+                else:
+                    print("DEBUG: NOT showing Problem Areas button - no issues found")
+                    self.add_system_message("ℹ️ No manufacturing issues found - no problem areas to highlight.")
             else:
                 error_msg = result.get('error', 'Unknown error during DFM analysis') if result else "Failed to get DFM analysis results"
                 self.add_system_message(f"Error: {error_msg}")
@@ -3930,6 +6686,138 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 self.add_assistant_message("I couldn't compare manufacturing methods. Please check if your model is valid and try again.")
         except Exception as e:
             self.add_system_message(f"Error comparing manufacturing methods: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+
+    def on_show_problems_clicked(self):
+        """Handle Show Problem Areas button click (RESTORED HEATMAP OVERLAY FEATURE)"""
+        self.add_system_message("Showing manufacturing problem areas...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before showing problem areas.")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Visualizing problem areas...")
+            
+            # Get the current Claude-detected issues from the latest analysis
+            current_issues = []
+            if hasattr(self, 'last_analysis') and self.last_analysis:
+                current_issues = self.last_analysis.get('manufacturing_issues', [])
+                print(f"DEBUG: Found {len(current_issues)} current Claude issues to visualize")
+                if current_issues:
+                    # Handle different issue formats robustly
+                    first_issue = current_issues[0]
+                    issue_title = first_issue.get('title', first_issue.get('description', 'Unknown issue'))
+                    print(f"DEBUG: First current issue: {issue_title}")
+            
+            # Pass the current issues to the visualization function
+            if current_issues:
+                # Update BOTH the mfg_feature_manager AND cloud_integration with current data
+                current_data = {
+                    "success": True,
+                    "data": {
+                        "manufacturing_issues": current_issues
+                    }
+                }
+                
+                # Update mfg_feature_manager
+                if not hasattr(self.mfg_feature_manager, 'last_dfm_result'):
+                    self.mfg_feature_manager.last_dfm_result = {}
+                self.mfg_feature_manager.last_dfm_result = current_data
+                
+                # Update cloud_integration (this is what's actually being called)
+                if hasattr(self, 'cloud_integration') and self.cloud_integration:
+                    if not hasattr(self.cloud_integration, 'last_dfm_result'):
+                        self.cloud_integration.last_dfm_result = {}
+                    self.cloud_integration.last_dfm_result = current_data
+                    print(f"DEBUG: Updated cloud_integration with {len(current_issues)} current issues")
+                
+                print(f"DEBUG: Updated both managers with {len(current_issues)} current issues")
+            
+            # Use the existing visualize_dfm_issues function
+            success = self.mfg_feature_manager.visualize_dfm_issues()
+            
+            if success:
+                self.add_system_message("[OK] Problem areas visualized with colored overlays")
+                self.add_assistant_message(
+                    "<b>Manufacturing Problem Areas Displayed</b><br><br>"
+                    "I've overlaid transparent colored markers on your CAD model to highlight manufacturing issues:<br><br>"
+                    "🔴 <b>Red:</b> Critical/High severity issues<br>"
+                    "🟠 <b>Orange:</b> Medium severity issues<br>"
+                    "🔵 <b>Blue:</b> Low severity issues<br><br>"
+                    "Each marker shows the location and description of manufacturing problems. "
+                    "Click 'Hide Problem Areas' to remove the overlays."
+                )
+                
+                # Show Hide button and hide Show button (CORRECT WORKFLOW)
+                self.show_problems_button.setVisible(False)
+                self.hide_problems_button.setVisible(True)
+            else:
+                self.add_system_message("No manufacturing issues found to visualize")
+                self.add_assistant_message("No manufacturing problem areas were detected in your current model.")
+        except Exception as e:
+            self.add_system_message(f"Error showing problem areas: {str(e)}")
+            traceback.print_exc()
+        finally:
+            # Reset status
+            self.cloud_feature_status.setText("Ready")
+    
+    def on_hide_problems_clicked(self):
+        """Handle Hide Problem Areas button click (ROBUST DFM VISUALIZATION SYSTEM)"""
+        self.add_system_message("Hiding manufacturing problem areas...")
+        try:
+            # Check if there's an active document
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                return
+                
+            # Update status
+            self.cloud_feature_status.setText("Removing problem area overlays...")
+            
+            # Use the robust DFM visualization system to hide overlays
+            doc = FreeCAD.ActiveDocument
+            hidden_count = 0
+            
+            # Find all objects with DFM overlays and hide them
+            for obj in doc.Objects:
+                if hasattr(obj, 'Mesh') or hasattr(obj, 'Shape'):
+                    try:
+                        # Try to toggle overlays for this object (hide them)
+                        self.mfg_feature_manager.toggle_overlays(obj.Name, visible=False)
+                        hidden_count += 1
+                        print(f"DEBUG: Hidden overlays for {obj.Name}")
+                    except Exception as toggle_error:
+                        print(f"DEBUG: No overlays found for {obj.Name}: {toggle_error}")
+                        continue
+            
+            # Also remove any remaining old-style DFM visualization
+            self.mfg_feature_manager._remove_existing_dfm_visualization(doc)
+            
+            if hidden_count > 0:
+                self.add_system_message(f"[OK] Problem area overlays hidden for {hidden_count} objects")
+                self.add_assistant_message(
+                    "<b>Problem Area Overlays Hidden</b><br><br>"
+                    f"Manufacturing problem area overlays have been hidden for {hidden_count} objects. "
+                    "The overlays are still available and can be shown again using 'Show Problem Areas'."
+                )
+            else:
+                self.add_system_message("[OK] No active overlays found to hide")
+                self.add_assistant_message(
+                    "<b>No Active Overlays</b><br><br>"
+                    "No manufacturing problem area overlays were found to hide. "
+                    "Use 'Show Problem Areas' to create overlays first."
+                )
+            
+            # Hide both buttons - workflow complete (CORRECT WORKFLOW)
+            self.show_problems_button.setVisible(False)
+            self.hide_problems_button.setVisible(False)
+        except Exception as e:
+            self.add_system_message(f"Error hiding problem areas: {str(e)}")
             traceback.print_exc()
         finally:
             # Reset status

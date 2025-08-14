@@ -266,6 +266,157 @@ async def health_check():
             "error": str(e)
         }
 
+# DFM Heatmap endpoint
+class HeatmapRequest(BaseModel):
+    cad_data: Dict[str, Any]
+    manufacturing_process: str = "3d_printing"
+    material: str = "pla"
+    production_volume: int = 100
+
+@app.post("/api/analysis/heatmap")
+async def generate_dfm_heatmap(
+    request: HeatmapRequest,
+    api_key: str = Depends(verify_api_key)
+):
+    """Generate DFM heatmap data for CAD visualization"""
+    try:
+        logger.info(f"Generating DFM heatmap for process: {request.manufacturing_process}, material: {request.material}")
+        
+        # Extract geometry data
+        cad_data = request.cad_data
+        objects = cad_data.get('objects', [])
+        
+        if not objects:
+            return {
+                "success": False,
+                "error": "No CAD objects found for heatmap analysis",
+                "heatmap_data": {},
+                "legend": {}
+            }
+        
+        # Analyze manufacturability issues based on process and material
+        heatmap_data = {}
+        legend = {
+            "critical": "Cannot manufacture without major changes",
+            "minor": "Suboptimal but manufacturable",
+            "optimal": "Ideal for this process"
+        }
+        
+        # Process-specific analysis
+        for obj in objects:
+            obj_name = obj.get('name', 'unknown')
+            geometry = obj.get('geometry', {})
+            dimensions = obj.get('dimensions', {})
+            
+            # Analyze based on manufacturing process
+            if request.manufacturing_process.lower() in ['3d_printing', 'fdm', 'sla']:
+                issues = analyze_3d_printing_issues(obj, request.material)
+            elif request.manufacturing_process.lower() in ['cnc_machining', 'cnc', 'milling']:
+                issues = analyze_cnc_issues(obj, request.material)
+            elif request.manufacturing_process.lower() in ['injection_molding', 'molding']:
+                issues = analyze_injection_molding_issues(obj, request.material)
+            else:
+                issues = analyze_general_issues(obj, request.material)
+            
+            # Add issues to heatmap data
+            for issue in issues:
+                face_id = issue.get('face_id', f"{obj_name}_face_{len(heatmap_data)}")
+                heatmap_data[face_id] = {
+                    "severity": issue['severity'],
+                    "color": issue['color'],
+                    "issue_type": issue['issue_type'],
+                    "description": issue['description'],
+                    "recommendation": issue.get('recommendation', ''),
+                    "object_name": obj_name
+                }
+        
+        logger.info(f"Generated heatmap with {len(heatmap_data)} problem areas")
+        
+        return {
+            "success": True,
+            "heatmap_data": heatmap_data,
+            "legend": legend,
+            "analysis_summary": {
+                "total_objects": len(objects),
+                "problem_areas": len(heatmap_data),
+                "manufacturing_process": request.manufacturing_process,
+                "material": request.material,
+                "timestamp": datetime.now().isoformat()
+            }
+        }
+        
+    except Exception as e:
+        logger.error(f"Error generating DFM heatmap: {str(e)}")
+        logger.error(traceback.format_exc())
+        return {
+            "success": False,
+            "error": str(e),
+            "heatmap_data": {},
+            "legend": {}
+        }
+
+def analyze_3d_printing_issues(obj, material):
+    """Analyze 3D printing specific manufacturability issues"""
+    issues = []
+    geometry = obj.get('geometry', {})
+    dimensions = obj.get('dimensions', {})
+    
+    # Check for overhangs (simplified analysis)
+    if dimensions.get('height', 0) > dimensions.get('width', 0) * 2:
+        issues.append({
+            "face_id": f"{obj['name']}_overhang",
+            "severity": "critical",
+            "color": "#FF4444",
+            "issue_type": "overhang",
+            "description": "Steep overhang requires support material",
+            "recommendation": "Add support structures or redesign geometry"
+        })
+    
+    # Check for thin walls
+    min_dimension = min(dimensions.get('width', 10), dimensions.get('length', 10))
+    if min_dimension < 1.0:  # Less than 1mm
+        issues.append({
+            "face_id": f"{obj['name']}_thin_wall",
+            "severity": "minor",
+            "color": "#FFAA00",
+            "issue_type": "thin_wall",
+            "description": "Wall thickness may be too thin for reliable printing",
+            "recommendation": "Increase wall thickness to at least 1.2mm"
+        })
+    
+    return issues
+
+def analyze_cnc_issues(obj, material):
+    """Analyze CNC machining specific manufacturability issues"""
+    issues = []
+    geometry = obj.get('geometry', {})
+    dimensions = obj.get('dimensions', {})
+    
+    # Check for deep pockets (simplified)
+    if dimensions.get('height', 0) > dimensions.get('width', 0) * 3:
+        issues.append({
+            "face_id": f"{obj['name']}_deep_pocket",
+            "severity": "critical",
+            "color": "#FF4444",
+            "issue_type": "tool_access",
+            "description": "Deep pocket may be difficult to machine",
+            "recommendation": "Consider multi-axis machining or redesign"
+        })
+    
+    return issues
+
+def analyze_injection_molding_issues(obj, material):
+    """Analyze injection molding specific manufacturability issues"""
+    issues = []
+    # Simplified analysis - would need more complex geometry analysis
+    return issues
+
+def analyze_general_issues(obj, material):
+    """Analyze general manufacturability issues"""
+    issues = []
+    # Simplified general analysis
+    return issues
+
 # Root endpoint
 @app.get("/")
 async def root():
@@ -273,5 +424,6 @@ async def root():
     return {
         "message": "FreeCAD Manufacturing Co-Pilot API",
         "docs_url": "/docs",
-        "health_check": "/health"
+        "health_check": "/health",
+        "heatmap_endpoint": "/api/analysis/heatmap"
     }

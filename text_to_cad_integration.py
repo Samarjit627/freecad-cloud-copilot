@@ -1,511 +1,279 @@
+#!/usr/bin/env python3
 """
-Text-to-CAD Integration Module for FreeCAD Cloud Co-Pilot
-Handles integration between the StandaloneCoPilot.FCMacro and the Text-to-CAD cloud service
+Text-to-CAD Integration Module
+Provides natural language to CAD conversion capabilities for FreeCAD
 """
 
-import os
 import json
-import time
-import traceback
 import requests
-from typing import Dict, Any, Optional, List, Tuple, Callable
+import os
+import re
+from typing import Dict, Any, Optional, Tuple
 
 class TextToCADIntegration:
     """
-    Text-to-CAD Integration for FreeCAD Cloud Co-Pilot
-    Handles communication with the Text-to-CAD cloud service and processes responses
+    Handles text-to-CAD conversion using cloud services and local fallbacks
     """
     
-    def __init__(self, config_path: Optional[str] = None, cloud_client=None):
-        """Initialize the Text-to-CAD integration
-        
-        Args:
-            config_path: Path to configuration file
-            cloud_client: Existing cloud client instance (optional)
-        """
+    def __init__(self, config_path: str):
+        """Initialize the Text-to-CAD integration"""
         self.config_path = config_path
-        self.cloud_client = cloud_client
-        self.config = {}
         self.connected = False
-        self.last_error = None
-        self.capabilities = []
-        self.endpoint = None
-        self.session = requests.Session()
+        self.base_url = None
+        self.api_key = None
+        self.timeout = 30
         
         # Load configuration
-        self._load_configuration()
+        self._load_config()
         
         # Test connection
-        self.test_connection()
-        
-        print(f"Text-to-CAD Integration initialized, connected: {self.connected}")
+        self._test_connection()
     
-    def _load_configuration(self):
-        """Load configuration from file"""
+    def _load_config(self):
+        """Load configuration from cloud_config.json"""
         try:
-            if self.config_path and os.path.exists(self.config_path):
+            if os.path.exists(self.config_path):
                 with open(self.config_path, 'r') as f:
-                    self.config = json.load(f)
-                print("Text-to-CAD configuration loaded successfully")
+                    config = json.load(f)
+                    
+                # Extract text-to-CAD server configuration
+                text_to_cad_config = config.get('text_to_cad', {})
+                self.base_url = text_to_cad_config.get('base_url', 'http://localhost:8084')
+                self.api_key = text_to_cad_config.get('api_key')
+                self.timeout = text_to_cad_config.get('timeout', 30)
+                
+                print(f"Text-to-CAD config loaded: {self.base_url}")
             else:
-                print("No configuration file found, using defaults")
-                self.config = {
-                    "text_to_cad_endpoint": "https://text-to-cad-agent-xxx-uc.a.run.app",
-                    "text_to_cad_api_key": None
-                }
+                print(f"Config file not found: {self.config_path}")
+                # Use default local server
+                self.base_url = 'http://localhost:8084'
+                
         except Exception as e:
-            print(f"Error loading Text-to-CAD configuration: {str(e)}")
-            traceback.print_exc()
+            print(f"Error loading Text-to-CAD config: {e}")
+            self.base_url = 'http://localhost:8084'
     
-    def test_connection(self) -> bool:
-        """Test connection to the Text-to-CAD cloud service
-        
-        Returns:
-            bool: True if connection is successful, False otherwise
-        """
-        if self.cloud_client and hasattr(self.cloud_client, 'connected') and self.cloud_client.connected:
-            # Use existing cloud client if available
-            self.connected = True
-            return True
-            
+    def _test_connection(self):
+        """Test connection to the text-to-CAD server"""
         try:
-            endpoint = self.config.get("text_to_cad_endpoint", "https://text-to-cad-agent-xxx-uc.a.run.app")
-            api_key = self.config.get("text_to_cad_api_key")
-            
-            self.endpoint = endpoint  # Store endpoint for reference
-            
-            headers = {}
-            if api_key:
-                # Use X-API-Key header for authentication with the unified server
-                headers['X-API-Key'] = api_key
+            if self.base_url:
+                health_url = f"{self.base_url}/health"
+                headers = {}
+                if self.api_key:
+                    headers['X-API-Key'] = self.api_key
                 
-            print(f"Testing connection to {endpoint}...")
-                
-            # Test health endpoint
-            response = requests.get(f"{endpoint}/health", headers=headers, timeout=10)
-            
-            if response.status_code == 200:
-                self.connected = True
-                print(f"Connected successfully to {endpoint}")
-                
-                # Get capabilities
-                try:
-                    print(f"Requesting capabilities from {endpoint}/list-capabilities")
-                    print(f"Using headers: {headers}")
+                response = requests.get(health_url, headers=headers, timeout=5)
+                if response.status_code == 200:
+                    self.connected = True
+                    print(f"✅ Text-to-CAD server connected: {self.base_url}")
+                else:
+                    print(f"⚠️ Text-to-CAD server responded with status {response.status_code}")
                     
-                    capabilities_response = requests.get(f"{endpoint}/list-capabilities", headers=headers, timeout=10)
-                    
-                    print(f"Capabilities response status code: {capabilities_response.status_code}")
-                    print(f"Capabilities response headers: {capabilities_response.headers}")
-                    
-                    if capabilities_response.status_code == 200:
-                        try:
-                            data = capabilities_response.json()
-                            print(f"Capabilities response data: {data}")
-                            self.capabilities = data.get('supported_parts', [])
-                            return True
-                        except Exception as e:
-                            print(f"Error parsing capabilities response as JSON: {e}")
-                            print(f"Raw capabilities response: {capabilities_response.text}")
-                            return False
-                    else:
-                        print(f"Failed to get capabilities: Status code {capabilities_response.status_code}")
-                        try:
-                            print(f"Error response: {capabilities_response.text}")
-                        except Exception:
-                            pass
-                        return False
-                except Exception as e:
-                    print(f"Error getting capabilities: {e}")
-                    traceback.print_exc()
-                    return False
-            else:
-                self.last_error = f"Failed to connect to {endpoint}: Status code {response.status_code}"
-                print(self.last_error)
-                return False
         except Exception as e:
-            self.last_error = f"Error connecting to Text-to-CAD service: {e}"
-            print(self.last_error)
-            return False
+            print(f"⚠️ Text-to-CAD server not available: {e}")
+            self.connected = False
     
-    def _test_connection(self) -> bool:
-        """Test the connection to the Text-to-CAD cloud service
-        
-        Returns:
-            True if the connection is successful, False otherwise
+    def is_text_to_cad_request(self, message: str) -> bool:
         """
-        if not self.cloud_endpoint:
-            return False
-        
-        try:
-            response = self.session.get(
-                f"{self.cloud_endpoint}/health",
-                timeout=5
-            )
-            
-            return response.status_code == 200
-        except Exception as e:
-            print(f"Error testing connection to Text-to-CAD service: {e}")
-            return False
-    
-    def is_text_to_cad_request(self, text: str) -> bool:
-        """Detect if user input is a text-to-CAD request
-        
-        Args:
-            text: User input text
-            
-        Returns:
-            True if this should be routed to text-to-CAD agent
+        Determine if a message is a text-to-CAD request
         """
-        cad_indicators = [
-            # Creation verbs
-            'create', 'make', 'generate', 'build', 'design', 'model',
+        if not message:
+            return False
             
-            # Object types
-            'bicycle', 'bike', 'chassis', 'frame',
-            'bottle', 'water bottle', 'flask',
-            'gear', 'cog', 'sprocket',
-            'bracket', 'mount', 'holder', 'housing',
-            'shaft', 'pipe', 'tube', 'cylinder',
-            'box', 'cube', 'sphere', 'cone',
-            
-            # CAD terms
-            '3d', 'cad', 'model', 'part', 'component', 'assembly'
+        message_lower = message.lower()
+        
+        # CAD creation keywords
+        cad_keywords = [
+            'create', 'make', 'design', 'generate', 'build', 'draw',
+            'model', 'construct', 'fabricate', 'manufacture'
         ]
         
-        text_lower = text.lower()
-        return any(indicator in text_lower for indicator in cad_indicators)
-    
-    def send_request(self, description: str, user_id: str = "freecad_user") -> Dict:
-        """Send text-to-CAD request to cloud service
+        # CAD object keywords
+        object_keywords = [
+            'gear', 'assembly', 'bracket', 'holder', 'mount', 'adapter',
+            'cylinder', 'cube', 'box', 'sphere', 'cone', 'tube',
+            'bottle', 'container', 'housing', 'case', 'cover',
+            'shaft', 'bearing', 'bushing', 'spacer', 'washer',
+            'plate', 'panel', 'frame', 'support', 'clamp'
+        ]
         
-        Args:
-            description: Natural language description
-            user_id: User identifier
-            
-        Returns:
-            Dict containing response from cloud service
+        # Special patterns
+        special_patterns = [
+            r'\d+:\d+.*ratio',  # Gear ratios like "10:1 ratio"
+            r'reduction.*ratio',  # "reduction ratio"
+            r'gear.*assembly',   # "gear assembly"
+            r'with.*holes?',     # "with holes"
+            r'diameter.*\d+',    # "diameter 50mm"
+            r'\d+\s*mm',         # Dimensions like "50mm"
+        ]
+        
+        # Check for CAD creation patterns
+        has_cad_keyword = any(keyword in message_lower for keyword in cad_keywords)
+        has_object_keyword = any(keyword in message_lower for keyword in object_keywords)
+        has_special_pattern = any(re.search(pattern, message_lower) for pattern in special_patterns)
+        
+        return has_cad_keyword and (has_object_keyword or has_special_pattern)
+    
+    def process_request(self, prompt: str) -> Dict[str, Any]:
         """
-        if not self.connected or not self.endpoint:
+        Process a text-to-CAD request
+        """
+        if not self.connected:
             return {
-                "success": False,
-                "message": "Not connected to Text-to-CAD service",
-                "fallback_available": True
+                'success': False,
+                'error': 'Text-to-CAD server not available',
+                'fallback_available': True
             }
-            
+        
         try:
+            # Prepare request
+            url = f"{self.base_url}/api/v1/text-to-cad"
+            headers = {'Content-Type': 'application/json'}
+            if self.api_key:
+                headers['X-API-Key'] = self.api_key
+            
             payload = {
-                'prompt': description,  # Change 'description' to 'prompt' to match server expectation
-                'user_id': user_id,
-                'client': 'freecad_macro',
-                'timestamp': self._get_timestamp()
+                'prompt': prompt,
+                'format': 'freecad_python',
+                'include_analysis': True
             }
             
-            # Add X-API-Key header for authentication
-            headers = {}
-            api_key = self.config.get("text_to_cad_api_key")
-            if api_key:
-                headers['X-API-Key'] = api_key
-            
-            print(f"Sending request to {self.endpoint}/text-to-cad with payload: {payload}")
-            print(f"Using headers: {headers}")
-            
-            response = self.session.post(
-                f"{self.endpoint}/text-to-cad",
-                json=payload,
-                headers=headers,
-                timeout=30  # 30 second timeout
+            # Make request
+            response = requests.post(
+                url, 
+                json=payload, 
+                headers=headers, 
+                timeout=self.timeout
             )
             
-            print(f"Response status code: {response.status_code}")
-            print(f"Response headers: {response.headers}")
-            
-            # Print response content for debugging
-            try:
-                response_content = response.json()
-                print(f"Response content: {response_content}")
-            except Exception as e:
-                print(f"Error parsing response as JSON: {e}")
-                print(f"Raw response: {response.text}")
-            
-            response.raise_for_status()
-            response_data = response.json()
-        
-            # Add success flag to the response
-            response_data['success'] = True
-            return response_data
-            
+            if response.status_code == 200:
+                result = response.json()
+                return {
+                    'success': True,
+                    'freecad_code': result.get('freecad_code', ''),
+                    'engineering_analysis': result.get('engineering_analysis', ''),
+                    'metadata': result.get('metadata', {}),
+                    'server_response': result
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f'Server error: {response.status_code}',
+                    'fallback_available': True
+                }
+                
         except requests.exceptions.Timeout:
             return {
                 'success': False,
-                'message': 'Request timeout - cloud service not responding',
+                'error': 'Request timeout',
                 'fallback_available': True
             }
-            
-        except requests.exceptions.ConnectionError:
-            return {
-                'success': False,
-                'message': 'Cannot connect to cloud service',
-                'fallback_available': True
-            }
-            
-        except requests.exceptions.HTTPError as e:
-            error_message = f'HTTP error: {e.response.status_code}'
-            try:
-                error_detail = e.response.text
-                print(f"HTTP Error details: {error_detail}")
-                error_message = f'HTTP error {e.response.status_code}: {error_detail}'
-            except Exception:
-                pass
-            
-            self.last_error = error_message
-            return {
-                'success': False,
-                'message': error_message,
-                'fallback_available': True
-            }
-            
         except Exception as e:
-            error_message = f'Unexpected error: {str(e)}'
-            print(f"Detailed error: {error_message}")
-            traceback.print_exc()
-            self.last_error = error_message
             return {
                 'success': False,
-                'message': error_message,
+                'error': f'Request failed: {str(e)}',
                 'fallback_available': True
             }
     
-    def execute_freecad_code(self, freecad_code: str, progress_callback: Optional[Callable] = None) -> Dict:
-        """Execute FreeCAD Python code returned from cloud service
-        
-        Args:
-            freecad_code: Python code to execute in FreeCAD
-            progress_callback: Optional function to call for progress updates
-            
-        Returns:
-            Dict with execution results
+    def execute_freecad_code(self, code: str) -> Dict[str, Any]:
         """
-        if progress_callback:
-            progress_callback(" Executing CAD generation code...")
-        
-        # Clean the code
-        freecad_code = self._clean_code(freecad_code)
-        
-        # Print the code for debugging
-        print("Executing FreeCAD code:")
-        print(freecad_code)
-        
+        Execute FreeCAD code safely
+        """
         try:
-            # Create a globals dictionary with necessary imports
-            exec_globals = {}
+            # Import FreeCAD modules
+            import FreeCAD
+            import Part
             
-            # Add FreeCAD module
-            try:
-                import FreeCAD
-                exec_globals['FreeCAD'] = FreeCAD
-                exec_globals['App'] = FreeCAD  # Add App alias
-            except ImportError as e:
-                if progress_callback:
-                    progress_callback(f" FreeCAD module not available: {str(e)}")
-                return {
-                    'success': False,
-                    'message': f'Error executing FreeCAD code: FreeCAD module not available - {str(e)}'
-                }
+            # Execute the code
+            exec(code)
             
-            # Add Part module
-            try:
-                import Part
-                exec_globals['Part'] = Part
-            except ImportError:
-                pass
-            
-            # Add math module
-            try:
-                import math
-                exec_globals['math'] = math
-            except ImportError:
-                pass
-            
-            # Try to add FreeCADGui if available
+            # Update FreeCAD GUI to make objects visible - ENHANCED FOR AXIS 5
             try:
                 import FreeCADGui
-                exec_globals['FreeCADGui'] = FreeCADGui
-                exec_globals['Gui'] = FreeCADGui  # Add Gui alias
-            except ImportError:
-                pass  # Headless mode
-            
-            # Ensure we have an active document
-            if FreeCAD.ActiveDocument is None:
-                FreeCAD.newDocument("TextToCADModel")
-            
-            # Make sure the document is active
-            FreeCAD.setActiveDocument(FreeCAD.ActiveDocument.Name)
-            
-            # Add direct access to active document
-            exec_globals['doc'] = FreeCAD.ActiveDocument
-            
-            # Define a function to update the GUI that will be called after execution
-            def update_gui():
-                try:
-                    import FreeCADGui
+                
+                # Recompute all documents first
+                for doc_name in FreeCAD.listDocuments():
+                    doc = FreeCAD.getDocument(doc_name)
+                    doc.recompute()
+                    print(f"✅ Recomputed document: {doc_name}")
+                
+                # Get the active document and ensure objects are visible
+                if FreeCAD.ActiveDocument:
+                    active_doc = FreeCAD.ActiveDocument
+                    print(f"✅ Active document: {active_doc.Name} with {len(active_doc.Objects)} objects")
                     
-                    # Get the active document
-                    if FreeCAD.ActiveDocument is None and len(FreeCAD.listDocuments()) > 0:
-                        doc_name = list(FreeCAD.listDocuments().keys())[-1]
-                        FreeCAD.setActiveDocument(doc_name)
-                    
-                    # Ensure document is recomputed
-                    if FreeCAD.ActiveDocument:
-                        FreeCAD.ActiveDocument.recompute()
-                    
-                    # Update the GUI if available
-                    if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
-                        # Select all objects to make them visible
-                        FreeCADGui.Selection.clearSelection()
-                        for obj in FreeCAD.ActiveDocument.Objects:
-                            try:
-                                FreeCADGui.Selection.addSelection(obj)
-                            except:
-                                pass
+                    # Make sure all objects are visible
+                    for obj in active_doc.Objects:
+                        try:
+                            if hasattr(FreeCADGui, 'getDocument'):
+                                view_obj = FreeCADGui.getDocument(active_doc.Name).getObject(obj.Name)
+                                if view_obj:
+                                    view_obj.Visibility = True
+                                    print(f"✅ Made object visible: {obj.Name}")
+                        except Exception as obj_e:
+                            print(f"⚠️ Error making object visible: {obj_e}")
+                
+                # Update GUI if available
+                if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
+                    try:
+                        # Force document recompute
+                        FreeCADGui.ActiveDocument.Document.recompute()
+                        print("✅ GUI document recomputed")
                         
-                        # Force view updates using multiple methods
-                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                        # Fit all objects in view
+                        if hasattr(FreeCADGui.ActiveDocument, 'ActiveView'):
+                            FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                            print("✅ View fitted to all objects")
+                        
+                        # Update GUI
                         FreeCADGui.updateGui()
-                        FreeCADGui.SendMsgToActiveView("ViewFit")
+                        print("✅ GUI updated")
                         
-                        # Try additional view commands
+                        # Try additional view commands for visibility
                         try:
                             FreeCADGui.runCommand("Std_ViewFitAll")
-                            FreeCADGui.runCommand("Std_ViewSelection")
-                        except:
-                            pass
+                            print("✅ Std_ViewFitAll executed")
+                        except Exception as cmd_e:
+                            print(f"⚠️ Std_ViewFitAll failed: {cmd_e}")
+                            
+                        # Force refresh of 3D view
+                        try:
+                            FreeCADGui.runCommand("Std_Refresh")
+                            print("✅ 3D view refreshed")
+                        except Exception as refresh_e:
+                            print(f"⚠️ Refresh failed: {refresh_e}")
+                            
+                    except Exception as gui_update_e:
+                        print(f"⚠️ GUI update error: {gui_update_e}")
                         
-                        # Final update after a short delay
-                        import time
-                        time.sleep(0.2)
-                        FreeCADGui.updateGui()
-                        
-                        print("GUI update completed successfully")
-                except Exception as e:
-                    print(f"GUI update error: {str(e)}")
-            
-            # Add the update function to the globals
-            exec_globals['update_gui'] = update_gui
-            
-            # Append GUI update call to the code
-            gui_update_code = """
-# Update the GUI to ensure model is visible
-try:
-    update_gui()
-except Exception as e:
-    print(f"GUI update failed: {str(e)}")
-"""
-            
-            # Execute the code with the GUI update appended
-            exec(freecad_code + gui_update_code, exec_globals)
-            
-            if progress_callback:
-                progress_callback(" CAD model generated successfully!")
+                print("✅ CAD object created and GUI updated for Axis 5")
+            except Exception as gui_e:
+                print(f"⚠️ GUI update failed: {str(gui_e)}")
             
             return {
                 'success': True,
-                'message': 'FreeCAD code executed successfully'
+                'message': 'CAD model created successfully'
             }
             
         except Exception as e:
-            error_msg = f"Error executing FreeCAD code: {str(e)}"
-            
-            if progress_callback:
-                progress_callback(f" {error_msg}")
-            
             return {
                 'success': False,
-                'message': error_msg,
-                'traceback': traceback.format_exc()
+                'error': f'FreeCAD execution error: {str(e)}'
             }
     
-    def _clean_code(self, code: str) -> str:
-        """Clean FreeCAD Python code to remove any problematic characters or content
-        
-        Args:
-            code: The FreeCAD Python code to clean
-            
-        Returns:
-            Cleaned code string
-        """
-        if not code:
-            return ""
-            
-        # Remove any non-printable characters
-        code = ''.join(c for c in code if c.isprintable() or c in '\n\r\t')
-        
-        # Remove any markdown code block markers
-        code = code.replace('```python', '').replace('```', '')
-        
-        # Remove any trailing or leading whitespace
-        code = code.strip()
-        
-        return code
-    
-    def _get_timestamp(self) -> str:
-        """Get current timestamp in ISO format"""
-        try:
-            from datetime import datetime
-            return datetime.now().isoformat()
-        except:
-            return "unknown"
-            
-    def handle_text_to_cad_request(self, text: str, progress_callback: Optional[Callable] = None) -> Dict:
-        """Process user message with potential text-to-CAD routing
-        
-        Args:
-            text: User's natural language input
-            progress_callback: Function to call for progress updates
-            
-        Returns:
-            Dict with processing results
-        """
-        if progress_callback:
-            progress_callback(" Processing Text-to-CAD request...")
-        
-        # Send to cloud service
-        cloud_response = self.send_request(text)
-        
-        if cloud_response.get('success'):
-            # Display engineering analysis
-            if progress_callback and 'engineering_analysis' in cloud_response:
-                progress_callback(cloud_response['engineering_analysis'])
-            
-            # Execute FreeCAD code
-            if 'freecad_code' in cloud_response:
-                if progress_callback:
-                    progress_callback(" Generating 3D model...")
-                
-                exec_result = self.execute_freecad_code(
-                    cloud_response['freecad_code'],
-                    progress_callback
-                )
-                
-                return {
-                    'success': exec_result.get('success', False),
-                    'message': exec_result.get('message', 'Unknown result'),
-                    'engineering_analysis': cloud_response.get('engineering_analysis', ''),
-                    'part_type': cloud_response.get('part_type', 'unknown')
-                }
-            else:
-                return {
-                    'success': False,
-                    'message': 'No FreeCAD code returned from cloud service'
-                }
-        else:
-            # Cloud service failed
-            error_msg = cloud_response.get('message', 'Unknown error')
-            if progress_callback:
-                progress_callback(f" Cloud service error: {error_msg}")
-            
-            return {
-                'success': False,
-                'message': error_msg,
-                'fallback_available': cloud_response.get('fallback_available', False)
-            }
+    def get_status(self) -> Dict[str, Any]:
+        """Get current status of the integration"""
+        return {
+            'connected': self.connected,
+            'base_url': self.base_url,
+            'has_api_key': bool(self.api_key),
+            'timeout': self.timeout
+        }
+
+# Compatibility functions for the macro
+def create_text_to_cad_integration(config_path: str) -> Optional[TextToCADIntegration]:
+    """Create and return a TextToCADIntegration instance"""
+    try:
+        return TextToCADIntegration(config_path)
+    except Exception as e:
+        print(f"Failed to create TextToCADIntegration: {e}")
+        return None

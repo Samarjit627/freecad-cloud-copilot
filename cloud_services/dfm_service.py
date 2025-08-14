@@ -197,6 +197,10 @@ class DFMService:
                                 "recommendation": issue.get("recommendation", ""),
                             })
                     transformed_data["manufacturing_issues"] = manufacturing_issues
+                    
+                    # PRESERVE ORIGINAL design_issues FOR UI COMPATIBILITY (PROBLEM AREAS BUTTON FIX)
+                    transformed_data["design_issues"] = response_data["design_issues"]
+                    print(f"DEBUG: Preserved {len(response_data['design_issues'])} design_issues in transformed_data")
                 
                 # Extract manufacturing features and convert to our format
                 if "manufacturing_features" in response_data:
@@ -338,22 +342,33 @@ class DFMService:
                     "position": issue.get("location", {"x": 0, "y": 0, "z": 0})
                 })
         
-        # Check for regular manufacturing issues from advanced DFM engine
+        # Check for regular manufacturing issues from advanced DFM engine (Claude-detected issues)
         if "manufacturing_issues" in self.last_analysis:
             for issue in self.last_analysis.get("manufacturing_issues", []):
-                severity = "medium"
-                if issue.get("severity") == "HIGH":
+                # Handle both old format (severity as string) and new Claude format (severity as string)
+                severity_raw = issue.get("severity", "medium")
+                if severity_raw in ["critical", "high", "HIGH"]:
                     severity = "high"
-                elif issue.get("severity") == "LOW":
+                elif severity_raw in ["low", "LOW"]:
                     severity = "low"
+                else:
+                    severity = "medium"
+                
+                # Handle both old and new position formats
+                position = issue.get("position", issue.get("location", {"x": 0, "y": 0, "z": 0}))
+                if isinstance(position, dict) and 'x' in position:
+                    position_dict = position
+                else:
+                    position_dict = {"x": 0, "y": 0, "z": 0}
                 
                 issues.append({
                     "severity": severity,
                     "title": issue.get("title", "Manufacturing Issue"),
                     "description": issue.get("description", ""),
                     "recommendation": issue.get("recommendation", ""),
-                    "position": issue.get("location", {"x": 0, "y": 0, "z": 0})
+                    "position": position_dict
                 })
+                print(f"DEBUG: Added Claude-detected issue: {issue.get('title', 'Unknown')} (severity: {severity})")
         
         # Fall back to legacy format if no issues found yet
         if not issues:

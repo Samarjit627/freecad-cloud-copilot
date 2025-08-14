@@ -19,6 +19,9 @@
   "retry_count": 1,
   "use_dedicated_dfm_endpoint": false,
   "use_local_fallback": false,
-  "text_to_cad_endpoint": "http://localhost:8084",
-  "text_to_cad_api_key": "test-api-key"
+  "text_to_cad": {
+    "base_url": "http://localhost:8084",
+    "api_key": "test-api-key",
+    "timeout": 30
+  }
 }

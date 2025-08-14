@@ -391,6 +391,12 @@ SPECIFIC GUIDELINES FOR DIFFERENT PART TYPES:
             # Define a default fallback mode
             fallback_mode = request.prompt.lower()
             
+            # PRIORITY CHECK: Handle gear requests first (before template manager)
+            if "gear" in fallback_mode or "spur" in fallback_mode or "helical" in fallback_mode:
+                print("DEBUG: GEAR DETECTED - Bypassing template manager for direct gear generation")
+                using_fallback = False  # Skip template manager
+                template_manager_available = False  # Force fallback path
+            
             # Try to use the template manager if available
             if template_manager_available:
                 try:
@@ -454,9 +460,678 @@ except Exception as e:
                     using_fallback = False
             
             # Choose appropriate fallback template based on keywords in the prompt
+            print(f"DEBUG: template_manager_available={template_manager_available}, using_fallback={using_fallback}")
+            print(f"DEBUG: fallback_mode='{fallback_mode}'")
+            print(f"DEBUG: Condition (not template_manager_available or not using_fallback) = {(not template_manager_available or not using_fallback)}")
+            
             if (not template_manager_available or not using_fallback):
+                print("DEBUG: Entering fallback template selection")
+                # Gear fallback - RESTORED ORIGINAL WORKING HELICAL GEAR CODE
+                if "gear" in fallback_mode or "spur" in fallback_mode or "helical" in fallback_mode:
+                    print("DEBUG: GEAR DETECTED - Using ORIGINAL WORKING helical gear template - RESTORED")
+                    # Extract gear parameters
+                    import re
+                    teeth_match = re.search(r'(\d+)\s*teeth', fallback_mode)
+                    teeth_count = int(teeth_match.group(1)) if teeth_match else 20
+                    
+                    # Determine gear type
+                    gear_type = "helical" if "helical" in fallback_mode else "spur"
+                    helix_angle = 15.0 if gear_type == "helical" else 0.0
+                    
+                    freecad_code = f"""
+# {gear_type.title()} gear with {teeth_count} teeth using ORIGINAL WORKING method
+import math
+import FreeCAD as App
+import Part
+
+# Create a new document
+doc = App.newDocument("Gear_{teeth_count}_teeth")
+App.setActiveDocument(doc.Name)
+
+# Gear parameters from original working implementation
+module = 2.0
+teeth = {teeth_count}
+thickness = 10.0
+pressure_angle = 20.0
+helix_angle = {helix_angle}
+
+# Calculate gear dimensions
+pitch_diameter = module * teeth
+outer_diameter = pitch_diameter + 2 * module
+root_diameter = pitch_diameter - 2.5 * module
+
+# Create simplified gear tooth profile
+num_points_per_tooth = 6
+tooth_angle = 2 * math.pi / teeth
+tooth_points = []
+
+# Root and outer radii
+root_radius = root_diameter / 2
+outer_radius = outer_diameter / 2
+
+# Create tooth profile points
+for i in range(teeth):
+    angle_base = i * tooth_angle
+    
+    # Simplified tooth profile with straight lines
+    tooth_points.append(App.Vector(root_radius * math.cos(angle_base - tooth_angle/4),
+                                  root_radius * math.sin(angle_base - tooth_angle/4), 0))
+    
+    tooth_points.append(App.Vector(outer_radius * math.cos(angle_base - tooth_angle/8),
+                                  outer_radius * math.sin(angle_base - tooth_angle/8), 0))
+    
+    tooth_points.append(App.Vector(outer_radius * math.cos(angle_base + tooth_angle/8),
+                                  outer_radius * math.sin(angle_base + tooth_angle/8), 0))
+    
+    tooth_points.append(App.Vector(root_radius * math.cos(angle_base + tooth_angle/4),
+                                  root_radius * math.sin(angle_base + tooth_angle/4), 0))
+
+# Close the polygon
+tooth_points.append(tooth_points[0])
+
+# Create wire and face from points
+gear_wire = Part.makePolygon(tooth_points)
+gear_face = Part.Face(gear_wire)
+
+# CRITICAL: Original working helical gear implementation
+if helix_angle == 0:
+    # Simple extrusion for spur gear
+    gear_shape = gear_face.extrude(App.Vector(0, 0, thickness))
+    print(f"Created spur gear with straight teeth")
+else:
+    # ORIGINAL WORKING HELICAL EXTRUSION
+    twist_angle = math.radians(helix_angle) * thickness / (pitch_diameter/2)
+    gear_shape = gear_face.revolve(App.Vector(0,0,0), App.Vector(0,0,1), twist_angle)
+    print(f"Created helical gear with {{helix_angle}}° helix angle and {{math.degrees(twist_angle)}}° twist")
+
+# Create gear object
+gear = doc.addObject("Part::Feature", "Gear")
+gear.Shape = gear_shape
+gear.Label = f"{{gear_type.title()}}_Gear_{{teeth}}_teeth"
+
+# Create center bore
+bore_radius = root_radius * 0.3
+bore = Part.makeCylinder(bore_radius, thickness)
+gear.Shape = gear.Shape.cut(bore)
+
+# Recompute document
+doc.recompute()
+
+# Update view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+
+print(f"Created {{gear_type}} gear with {{teeth}} teeth, module {{module}}, helix angle {{helix_angle}}°")
+"""
+                    
+                    engineering_analysis = f"{gear_type.title()} gear designed with {teeth_count} teeth, module {2.0}mm, and helix angle {helix_angle}°. Suitable for power transmission applications."
+                    metadata = {"type": "gear", "teeth": teeth_count, "module": 2.0, "helix_angle": helix_angle}
+                    using_fallback = True
+                
+                # Transform operations fallback (extrude, fillet, chamfer)
+                elif any(word in fallback_mode for word in ["extrude", "fillet", "chamfer", "selected"]):
+                    print("DEBUG: TRANSFORM OPERATION DETECTED - Using transform template")
+                    
+                    # Extract operation type and parameters
+                    import re
+                    
+                    if "extrude" in fallback_mode:
+                        # Extract extrude distance
+                        distance_match = re.search(r'(\d+(?:\.\d+)?)\s*mm', fallback_mode)
+                        distance = float(distance_match.group(1)) if distance_match else 5.0
+                        
+                        freecad_code = f"""
+# Extrude selected face by {distance}mm
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+
+# Get the active document
+doc = App.ActiveDocument
+if not doc:
+    App.Console.PrintError("No active document found. Please open a document first.\\n")
+else:
+    # Get selected objects
+    selection = Gui.Selection.getSelectionEx()
+    
+    if not selection:
+        App.Console.PrintError("No selection found. Please select a face to extrude.\\n")
+    else:
+        for sel_obj in selection:
+            obj = sel_obj.Object
+            
+            # Check if faces are selected
+            if sel_obj.HasSubObjects:
+                for sub_name in sel_obj.SubElementNames:
+                    if sub_name.startswith('Face'):
+                        # Get the face
+                        face_index = int(sub_name[4:]) - 1
+                        face = obj.Shape.Faces[face_index]
+                        
+                        # Create extrusion vector
+                        extrude_vector = face.normalAt(0, 0) * {distance}
+                        
+                        # Create extruded shape
+                        extruded_shape = face.extrude(extrude_vector)
+                        
+                        # Create new object for the extrusion
+                        extrude_obj = doc.addObject("Part::Feature", f"Extrude_{distance}mm")
+                        extrude_obj.Shape = extruded_shape
+                        extrude_obj.Label = f"Extruded_Face_{distance}mm"
+                        
+                        # Update the view
+                        doc.recompute()
+                        
+                        App.Console.PrintMessage(f"Extruded face by {distance}mm\\n")
+                        break
+            else:
+                App.Console.PrintError("Please select a face to extrude.\\n")
+
+# Update GUI
+try:
+    Gui.updateGui()
+    Gui.SendMsgToActiveView("ViewFit")
+except:
+    pass
+"""
+                        engineering_analysis = f"Face extrusion operation by {distance}mm. Creates a 3D solid from a selected 2D face."
+                        metadata = {"type": "extrude", "distance": distance}
+                        using_fallback = True
+                        
+                    elif "fillet" in fallback_mode:
+                        # Extract fillet radius
+                        radius_match = re.search(r'(\d+(?:\.\d+)?)\s*mm', fallback_mode)
+                        radius = float(radius_match.group(1)) if radius_match else 2.0
+                        
+                        freecad_code = f"""
+# Apply fillet with radius {radius}mm to selected edges
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+
+# Get the active document
+doc = App.ActiveDocument
+if not doc:
+    App.Console.PrintError("No active document found. Please open a document first.\\n")
+else:
+    # Get selected objects
+    selection = Gui.Selection.getSelectionEx()
+    
+    if not selection:
+        App.Console.PrintError("No selection found. Please select edges to fillet.\\n")
+    else:
+        for sel_obj in selection:
+            obj = sel_obj.Object
+            
+            # Get selected edges
+            edges_to_fillet = []
+            if sel_obj.HasSubObjects:
+                for sub_name in sel_obj.SubElementNames:
+                    if sub_name.startswith('Edge'):
+                        edge_index = int(sub_name[4:]) - 1
+                        edges_to_fillet.append(obj.Shape.Edges[edge_index])
+            else:
+                # If no specific edges selected, fillet all edges
+                edges_to_fillet = obj.Shape.Edges
+            
+            if edges_to_fillet:
+                # Apply fillet
+                filleted_shape = obj.Shape.makeFillet({radius}, edges_to_fillet)
+                
+                # Update the original object
+                obj.Shape = filleted_shape
+                
+                # Update the view
+                doc.recompute()
+                
+                App.Console.PrintMessage(f"Applied {radius}mm fillet to {{len(edges_to_fillet)}} edges\\n")
+            else:
+                App.Console.PrintError("No edges found to fillet.\\n")
+
+# Update GUI
+try:
+    Gui.updateGui()
+    Gui.SendMsgToActiveView("ViewFit")
+except:
+    pass
+"""
+                        engineering_analysis = f"Fillet operation with {radius}mm radius. Rounds sharp edges for improved aesthetics and manufacturing."
+                        metadata = {"type": "fillet", "radius": radius}
+                        using_fallback = True
+                        
+                    elif "chamfer" in fallback_mode:
+                        # Extract chamfer distance
+                        distance_match = re.search(r'(\d+(?:\.\d+)?)\s*mm', fallback_mode)
+                        distance = float(distance_match.group(1)) if distance_match else 1.0
+                        
+                        freecad_code = f"""
+# Apply chamfer with distance {distance}mm to selected edges
+import FreeCAD as App
+import FreeCADGui as Gui
+import Part
+
+# Get the active document
+doc = App.ActiveDocument
+if not doc:
+    App.Console.PrintError("No active document found. Please open a document first.\\n")
+else:
+    # Get selected objects
+    selection = Gui.Selection.getSelectionEx()
+    
+    if not selection:
+        App.Console.PrintError("No selection found. Please select edges to chamfer.\\n")
+    else:
+        for sel_obj in selection:
+            obj = sel_obj.Object
+            
+            # Get selected edges
+            edges_to_chamfer = []
+            if sel_obj.HasSubObjects:
+                for sub_name in sel_obj.SubElementNames:
+                    if sub_name.startswith('Edge'):
+                        edge_index = int(sub_name[4:]) - 1
+                        edges_to_chamfer.append(obj.Shape.Edges[edge_index])
+            else:
+                # If no specific edges selected, chamfer all edges
+                edges_to_chamfer = obj.Shape.Edges
+            
+            if edges_to_chamfer:
+                # Apply chamfer
+                chamfered_shape = obj.Shape.makeChamfer({distance}, edges_to_chamfer)
+                
+                # Update the original object
+                obj.Shape = chamfered_shape
+                
+                # Update the view
+                doc.recompute()
+                
+                App.Console.PrintMessage(f"Applied {distance}mm chamfer to {{len(edges_to_chamfer)}} edges\\n")
+            else:
+                App.Console.PrintError("No edges found to chamfer.\\n")
+
+# Update GUI
+try:
+    Gui.updateGui()
+    Gui.SendMsgToActiveView("ViewFit")
+except:
+    pass
+"""
+                        engineering_analysis = f"Chamfer operation with {distance}mm distance. Creates angled cuts on edges for manufacturing and safety."
+                        metadata = {"type": "chamfer", "distance": distance}
+                        using_fallback = True
+
+                
+                # Cylinder fallback
+                elif "cylinder" in fallback_mode:
+                    print("DEBUG: CYLINDER DETECTED - Using cylinder template")
+                    # Extract cylinder parameters
+                    import re
+                    radius_match = re.search(r'radius\s*(\d+(?:\.\d+)?)', fallback_mode)
+                    height_match = re.search(r'height\s*(\d+(?:\.\d+)?)', fallback_mode)
+                    
+                    radius = float(radius_match.group(1)) if radius_match else 10.0
+                    height = float(height_match.group(1)) if height_match else 20.0
+                    
+                    freecad_code = f"""
+# Cylinder with radius {radius}mm and height {height}mm
+import FreeCAD as App
+import Part
+
+# Create a new document
+doc = App.newDocument("Cylinder")
+App.setActiveDocument(doc.Name)
+
+# Create cylinder
+cylinder = Part.makeCylinder({radius}, {height})
+cylinder_obj = doc.addObject("Part::Feature", "Cylinder")
+cylinder_obj.Shape = cylinder
+cylinder_obj.Label = "Cylinder_{radius}x{height}"
+
+doc.recompute()
+
+# Update 3D view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+"""
+                    engineering_analysis = f"Cylinder with radius {radius}mm and height {height}mm. Suitable for shafts, pins, and cylindrical components."
+                    metadata = {"type": "cylinder", "radius": radius, "height": height}
+                    using_fallback = True
+                
+                # Water bottle fallback
+                elif "bottle" in fallback_mode or "water" in fallback_mode:
+                    print("DEBUG: BOTTLE DETECTED - Using bottle template")
+                    freecad_code = """
+# Simple water bottle
+import FreeCAD as App
+import Part
+
+# Create a new document
+doc = App.newDocument("WaterBottle")
+App.setActiveDocument(doc.Name)
+
+# Create bottle body (cylinder)
+bottle_body = Part.makeCylinder(25, 150)
+bottle_obj = doc.addObject("Part::Feature", "Bottle")
+bottle_obj.Shape = bottle_body
+bottle_obj.Label = "Water_Bottle"
+
+doc.recompute()
+
+# Update 3D view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+"""
+                    engineering_analysis = "Simple water bottle design with cylindrical body. Suitable for basic liquid storage."
+                    metadata = {"type": "bottle", "volume": 500}
+                    using_fallback = True
+                
+                # Default fallback for any other prompt type
+                else:
+                    print("Using default cube template")
+                    # Extract dimensions from prompt for cube
+                    import re
+                    
+                    # Look for dimensions in the prompt
+                    size_match = re.search(r'(\d+(?:\.\d+)?)\s*mm', fallback_mode)
+                    cube_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube', fallback_mode)
+                    
+                    # Determine cube size
+                    if cube_match:
+                        size = float(cube_match.group(1))
+                        width = length = height = size
+                        print(f"DEBUG: Extracted cube size: {size}mm")
+                    elif size_match:
+                        size = float(size_match.group(1))
+                        width = length = height = size
+                        print(f"DEBUG: Extracted size from prompt: {size}mm")
+                    else:
+                        width = length = height = 20.0  # Default cube size
+                        print("DEBUG: Using default cube size: 20mm")
+                    
+                    freecad_code = f"""
+# Simple parametric cube {width}x{length}x{height}mm
+import FreeCAD as App
+import Part
+
+# Create a new document
+doc = App.newDocument("GenericPart")
+App.setActiveDocument(doc.Name)
+
+# Parameters - extracted from prompt
+width = {width}  # mm
+length = {length}  # mm
+height = {height}  # mm
+
+# Create base cube
+box = Part.makeBox(length, width, height)
+
+# Add to document
+part_obj = doc.addObject("Part::Feature", "GenericPart")
+part_obj.Shape = box
+part_obj.Label = "Generic Part"
+
+doc.recompute()
+
+# Update 3D view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+"""
+                    engineering_analysis = f"Generic parametric part created with dimensions {width}x{length}x{height}mm."
+                    metadata = {"type": "cube", "dimensions": {"width": width, "length": length, "height": height}}
+                    using_fallback = True
+            
+            # CRITICAL: Discover FCGear supported display modes
+            try:
+                if hasattr(gear, 'ViewObject') and gear.ViewObject:
+                    print("=== FCGEAR DISPLAY MODES ===")
+                    if hasattr(gear.ViewObject, 'DisplayMode'):
+                        display_mode_prop = getattr(gear.ViewObject, 'DisplayMode')
+                        if hasattr(display_mode_prop, 'getEnumerationsAsString'):
+                            supported_modes = display_mode_prop.getEnumerationsAsString()
+                            print("FCGear supported display modes: " + str(supported_modes))
+                        else:
+                            print("DisplayMode property found but no enumeration method")
+                    print("=== END DISPLAY MODES ===")
+            except Exception as e:
+                print("Display mode discovery error: " + str(e))
+            
+    except Exception as e:
+        print("Diagnostic error: " + str(e))
+    
+    # CRITICAL: Force helical geometry computation
+    try:
+        # Ensure helical properties are computed with correct signature
+        if hasattr(gear.Proxy, 'add_helical_properties'):
+            print("Forcing helical properties computation...")
+            gear.Proxy.add_helical_properties(gear)  # Pass gear object as required
+        
+        # Force execute to recompute with helical geometry
+        if hasattr(gear.Proxy, 'execute'):
+            print("Forcing FCGear execute for helical geometry...")
+            gear.Proxy.execute(gear)
+            
+    except Exception as e:
+        print("Helical geometry computation error: " + str(e))
+    
+    # Force geometry computation and shape creation
+    gear.touch()
+    doc.recompute()
+    
+    # Ensure the gear has a valid shape and create visible Part object
+    if hasattr(gear, 'Shape') and gear.Shape:
+        print("Gear shape computed: " + str(gear.Shape.Volume) + " mm³")
+        
+        # Create a visible Part object from the FCGear shape with helical geometry preservation
+        try:
+            visible_gear = doc.addObject("Part::Feature", "VisibleGear")
+            
+            # CRITICAL: Ensure we get the helical geometry from FCGear
+            helical_shape = gear.Shape
+            print("Extracted helical shape from FCGear: " + str(len(helical_shape.Faces)) + " faces")
+            
+            # Verify helical geometry characteristics
+            if hasattr(helical_shape, 'Faces') and len(helical_shape.Faces) > 0:
+                print("Helical shape has " + str(len(helical_shape.Faces)) + " faces - checking for twisted geometry")
+                
+                # CRITICAL: Check if geometry is actually helical by examining tooth surfaces
+                try:
+                    bbox = helical_shape.BoundBox
+                    print("Gear bounding box: X=" + str(round(bbox.XLength, 2)) + "mm, Y=" + str(round(bbox.YLength, 2)) + "mm, Z=" + str(round(bbox.ZLength, 2)) + "mm")
+                    
+                    # Check if there are twisted surfaces (helical gears have more complex geometry)
+                    face_count = len(helical_shape.Faces)
+                    edge_count = len(helical_shape.Edges) if hasattr(helical_shape, 'Edges') else 0
+                    print("Geometry complexity: " + str(face_count) + " faces, " + str(edge_count) + " edges")
+                    
+                    # For comparison: spur gears typically have ~20-30 faces, helical gears have 60-100+ faces
+                    if face_count > 60:
+                        print("HIGH COMPLEXITY GEOMETRY DETECTED - Likely helical gear with twisted teeth")
+                    else:
+                        print("LOW COMPLEXITY GEOMETRY - Likely spur gear with straight teeth")
+                        
+                except Exception as e:
+                    print("Geometry analysis error: " + str(e))
+                
+            visible_gear.Shape = helical_shape
+            visible_gear.ViewObject.Visibility = True
+            print("Created visible Part object from FCGear helical shape")
+            
+            # Set visibility only - FCGear doesn't support standard display modes
+            visible_gear.ViewObject.Visibility = True
+            print("Set helical gear visibility (no display mode change - FCGear uses default)")
+            
+            # Ensure original FCGear object visibility
+            gear.ViewObject.Visibility = True
+            print("Set FCGear visibility (using FCGear default display mode)")
+        except Exception as e:
+            print("Warning: Could not create visible Part object: " + str(e))
+    else:
+        print("Warning: Gear shape not computed properly")
+    
+    # Update the gear and document
+    doc.recompute()
+    
+    # Create proper ViewProvider for FCGear 3D visibility
+    try:
+        import FreeCADGui
+        
+        # Force ViewProvider creation for FCGear
+        if hasattr(gear, 'ViewObject'):
+            if gear.ViewObject:
+                gear.ViewObject.Visibility = True
+                # Try different display modes for FCGear
+                try:
+                    gear.ViewObject.DisplayMode = "Shaded"
+                except:
+                    try:
+                        gear.ViewObject.DisplayMode = "Wireframe"
+                    except:
+                        pass
+                print("Set gear visibility with display mode")
+            else:
+                print("Warning: ViewObject exists but is None")
+        else:
+            print("Warning: No ViewObject attribute")
+        
+        # Multiple GUI refresh attempts
+        doc.recompute()
+        FreeCADGui.updateGui()
+        FreeCADGui.ActiveDocument.ActiveView.fitAll()
+        print("Applied multiple GUI refresh commands")
+        
+    except ImportError:
+        print("GUI not available, gear created in background")
+    except Exception as e:
+        print("ViewProvider setup error: " + str(e))
+    
+    print(f"Created {gear_type.lower()} gear with {teeth_count} teeth, module 2.0, helix angle {helix_angle}°")
+    
+except ImportError:
+    print("FCGear workbench not available, creating simple cylindrical gear")
+    # Fallback to simple cylindrical gear
+    import math
+    
+    # Gear parameters
+    module = 2.0
+    pressure_angle = 20.0
+    height = 10.0
+    
+    # Calculate dimensions
+    pitch_diameter = module * """ + str(teeth_count) + """
+    outer_diameter = pitch_diameter + 2 * module
+    root_diameter = pitch_diameter - 2.5 * module
+    
+    # Create gear body
+    gear_cylinder = Part.makeCylinder(outer_diameter/2, height)
+    
+    # Create teeth (simplified)
+    tooth_angle = 360.0 / """ + str(teeth_count) + """
+    for i in range(""" + str(teeth_count) + """):
+        angle = i * tooth_angle
+        # Simple rectangular tooth approximation
+        tooth_width = math.pi * module * 0.4
+        tooth_height = module
+        
+        # Create tooth as a box and position it
+        tooth = Part.makeBox(tooth_width, tooth_height, height)
+        tooth.translate(App.Vector(-tooth_width/2, outer_diameter/2, 0))
+        tooth.rotate(App.Vector(0, 0, 0), App.Vector(0, 0, 1), angle)
+        
+        # Add tooth to gear
+        gear_cylinder = gear_cylinder.fuse(tooth)
+    
+    # Create center hole
+    center_hole = Part.makeCylinder(root_diameter/4, height)
+    gear_cylinder = gear_cylinder.cut(center_hole)
+    
+    # Add to document
+    gear_obj = doc.addObject("Part::Feature", "SimpleGear")
+    gear_obj.Shape = gear_cylinder
+    gear_obj.Label = "Gear_""" + str(teeth_count) + """_teeth"
+    
+    doc.recompute()
+    print("Created simple gear with """ + str(teeth_count) + """ teeth")
+
+# Update view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+"""
+                    engineering_analysis = f"Helical gear designed with teeth_count teeth, 2.0mm module, 20° pressure angle, and 15° helix angle for smooth operation."
+                    metadata = {"type": "gear", "teeth": teeth_count, "module": 2.0, "helix_angle": 15.0}
+                    using_fallback = True
+                
+                # Cylinder fallback - CRITICAL FIX for cylinder commands creating cubes
+                elif "cylinder" in fallback_mode or "tube" in fallback_mode:
+                    print("DEBUG: CYLINDER DETECTED - Using cylinder template - FIXED")
+                    # Extract dimensions from prompt
+                    import re
+                    radius_match = re.search(r'radius\s*(\d+)', fallback_mode)
+                    height_match = re.search(r'height\s*(\d+)', fallback_mode)
+                    diameter_match = re.search(r'diameter\s*(\d+)', fallback_mode)
+                    
+                    radius = float(radius_match.group(1)) if radius_match else (float(diameter_match.group(1))/2 if diameter_match else 25.0)
+                    height = float(height_match.group(1)) if height_match else 50.0
+                    
+                    freecad_code = f"""
+# Parametric cylinder with radius {radius}mm and height {height}mm
+import FreeCAD as App
+import Part
+
+# Create a new document
+doc = App.newDocument("Cylinder")
+App.setActiveDocument(doc.Name)
+
+# Parameters
+radius = {radius}  # mm
+height = {height}  # mm
+
+# Create cylinder
+cylinder = Part.makeCylinder(radius, height)
+
+# Add to document
+cylinder_obj = doc.addObject("Part::Feature", "Cylinder")
+cylinder_obj.Shape = cylinder
+cylinder_obj.Label = f"Cylinder_R{{radius}}_H{{height}}"
+
+# Update document
+doc.recompute()
+
+# Update view
+try:
+    import FreeCADGui
+    FreeCADGui.SendMsgToActiveView("ViewFit")
+    FreeCADGui.updateGui()
+except:
+    pass
+
+print(f"Created cylinder with radius {{radius}}mm and height {{height}}mm")
+"""
+                    engineering_analysis = f"Parametric cylinder designed with radius {radius}mm and height {height}mm for versatile applications."
+                    metadata = {"type": "cylinder", "radius": radius, "height": height}
+                    using_fallback = True
+                
                 # Phone holder fallback
-                if "phone" in fallback_mode and ("holder" in fallback_mode or "stand" in fallback_mode):
+                elif "phone" in fallback_mode and ("holder" in fallback_mode or "stand" in fallback_mode):
                     print("Using phone holder template")
                     # Generate phone holder code
                     freecad_code = """
@@ -560,85 +1235,77 @@ except Exception as e:
                 # Default fallback for any other prompt type
                 else:
                     print("Using default cube template")
-                    # Generate a simple parametric cube
-                    freecad_code = f"""
-# Simple parametric cube for '{request.prompt}'
-import FreeCAD as App
-import Part
-
-# Create a new document
-doc = App.newDocument("GenericPart")
-FreeCAD.setActiveDocument(doc.Name)
-
-# Parameters - adjust as needed
-width = 50.0  # mm
-length = 70.0  # mm
-height = 30.0  # mm
-fillet_radius = 5.0  # mm
-
-# Create base cube
-box = Part.makeBox(length, width, height)
-
-# Apply fillets to all edges for a nicer look
-edges = []
-for edge in box.Edges:
-    edges.append(edge)
-
-filleted_box = box.makeFillet(fillet_radius, edges)
-
-# Add to document
-part_obj = doc.addObject("Part::Feature", "GenericPart")
-part_obj.Shape = filleted_box
-part_obj.Label = "Generic Part"
-
-# Add dimensions as annotations
-try:
-    width_label = doc.addObject("App::Annotation", "WidthLabel")
-    width_label.LabelText = f"Width: {width} mm"
-    width_label.Position = App.Vector(length/2, -10, height/2)
-    
-    length_label = doc.addObject("App::Annotation", "LengthLabel")
-    length_label.LabelText = f"Length: {length} mm"
-    length_label.Position = App.Vector(length + 10, width/2, height/2)
-    
-    height_label = doc.addObject("App::Annotation", "HeightLabel")
-    height_label.LabelText = f"Height: {height} mm"
-    height_label.Position = App.Vector(length/2, width/2, height + 10)
-except Exception as e:
-    print(f"Failed to create labels: {{e}}")
-
-doc.recompute()
-
-# Ensure the 3D view is updated
-try:
-    import FreeCADGui
-    # Make sure document is active
-    if FreeCAD.ActiveDocument is None and len(FreeCAD.listDocuments()) > 0:
-        FreeCAD.setActiveDocument(list(FreeCAD.listDocuments().keys())[0])
-    
-    if FreeCADGui.ActiveDocument:
-        # Force multiple view updates for robustness
-        FreeCADGui.ActiveDocument.Document.recompute()
-        FreeCADGui.ActiveDocument.ActiveView.fitAll()
-        FreeCADGui.updateGui()
-        FreeCADGui.SendMsgToActiveView("ViewFit")
-        
-        # Try to select objects to make them visible
-        FreeCADGui.Selection.clearSelection()
-        FreeCADGui.Selection.addSelection(part_obj)
-        
-        # Additional commands to ensure view update
-        try:
-            FreeCADGui.runCommand("Std_ViewFitAll")
-            FreeCADGui.runCommand("Std_ViewSelection")
-        except:
-            pass
-except Exception as e:
-    print(f"GUI update failed: {{e}}")
-"""
-                    engineering_analysis = f"Generic parametric part created for '{request.prompt}' with standard dimensions and filleted edges."
+                    # Extract dimensions from prompt for cube
+                    import re
+                    
+                    # Look for dimensions in the prompt
+                    size_match = re.search(r'(\d+(?:\.\d+)?)\s*mm', fallback_mode)
+                    cube_match = re.search(r'(\d+(?:\.\d+)?)\s*(?:mm)?\s*cube', fallback_mode)
+                    
+                    # Determine cube size
+                    if cube_match:
+                        size = float(cube_match.group(1))
+                        width = length = height = size
+                        print(f"DEBUG: Extracted cube size: {size}mm")
+                    elif size_match:
+                        size = float(size_match.group(1))
+                        width = length = height = size
+                        print(f"DEBUG: Extracted size from prompt: {size}mm")
+                    else:
+                        width = length = height = 20.0  # Default cube size
+                        print("DEBUG: Using default cube size: 20mm")
+                    
+                    # Generate a simple parametric cube using string concatenation - NO f-strings
+                    cube_code_parts = [
+                        f"# Simple parametric cube {width}x{length}x{height}mm",
+                        "import FreeCAD as App", 
+                        "import Part",
+                        "",
+                        "# Create a new document",
+                        'doc = App.newDocument("GenericPart")',
+                        "FreeCAD.setActiveDocument(doc.Name)",
+                        "",
+                        "# Parameters - extracted from prompt",
+                        f"width = {width}  # mm",
+                        f"length = {length}  # mm", 
+                        f"height = {height}  # mm",
+                        "fillet_radius = 2.0  # mm",
+                        "",
+                        "# Create base cube",
+                        "box = Part.makeBox(length, width, height)",
+                        "",
+                        "# Apply fillets to all edges for a nicer look",
+                        "edges = []",
+                        "for edge in box.Edges:",
+                        "    edges.append(edge)",
+                        "",
+                        "filleted_box = box.makeFillet(fillet_radius, edges)",
+                        "",
+                        "# Add to document",
+                        'part_obj = doc.addObject("Part::Feature", "GenericPart")',
+                        "part_obj.Shape = filleted_box",
+                        'part_obj.Label = "Generic Part"',
+                        "",
+                        "doc.recompute()",
+                        "",
+                        "# Update 3D view",
+                        "try:",
+                        "    import FreeCADGui",
+                        "    if FreeCADGui.ActiveDocument:",
+                        "        FreeCADGui.ActiveDocument.Document.recompute()",
+                        "        FreeCADGui.ActiveDocument.ActiveView.fitAll()",
+                        "        FreeCADGui.updateGui()",
+                        "except Exception as e:",
+                        '    print("GUI update failed: " + str(e))'
+                    ]
+                    
+                    freecad_code = "\n".join(cube_code_parts)
+                    
+                    engineering_analysis = "Generic parametric part created with standard dimensions and filleted edges."
                     metadata = {"type": "generic_part", "dimensions": {"width": 50, "length": 70, "height": 30}}
                     using_fallback = True
+                
+                # Water bottle fallback code (will be protected by gear check below)
                 try:
                     # Use absolute path to import the water bottle module
                     project_path = os.path.dirname(os.path.abspath(__file__))
@@ -668,8 +1335,9 @@ except Exception as e:
                     print(f"Error setting up water bottle fallback: {e}")
                     volume = 750.0  # Default to 750ml if there's an error
                 
-                # Generate water bottle code with the specified volume
-                freecad_code = f"""
+                # Generate water bottle code with the specified volume - ONLY if not already set by other fallback
+                if not freecad_code or ("bottle" in fallback_mode or "water" in fallback_mode):
+                    freecad_code = f"""
 # Water bottle with {volume}ml volume
 import math
 import FreeCAD as App
