@@ -10,6 +10,13 @@ import os
 import re
 from typing import Dict, Any, Optional, Tuple
 
+# Optional LLM client (additive, non-invasive)
+try:
+    from utils.llm_client import build_llm_from_config, BaseLLMClient
+except Exception:
+    build_llm_from_config = None  # type: ignore
+    BaseLLMClient = object  # type: ignore
+
 class TextToCADIntegration:
     """
     Handles text-to-CAD conversion using cloud services and local fallbacks
@@ -22,6 +29,12 @@ class TextToCADIntegration:
         self.base_url = None
         self.api_key = None
         self.timeout = 30
+        # LLM orchestration (optional)
+        self.llm: Optional[BaseLLMClient] = None
+        self.llm_enabled: bool = False
+        self.llm_ask_followups: bool = False
+        self.llm_max_followups: int = 3
+        self.llm_provider: str = ""
         
         # Load configuration
         self._load_config()
@@ -43,6 +56,20 @@ class TextToCADIntegration:
                 self.timeout = text_to_cad_config.get('timeout', 30)
                 
                 print(f"Text-to-CAD config loaded: {self.base_url}")
+
+                # LLM config (additive)
+                try:
+                    llm_cfg = config.get('llm', {})
+                    self.llm_enabled = bool(llm_cfg.get('enabled', False))
+                    self.llm_ask_followups = bool(llm_cfg.get('ask_followups', True))
+                    self.llm_max_followups = int(llm_cfg.get('max_followups', 3))
+                    self.llm_provider = str(llm_cfg.get('provider', 'claude'))
+                    if self.llm_enabled and build_llm_from_config:
+                        self.llm = build_llm_from_config(config)
+                        if self.llm:
+                            print(f"LLM enabled: provider={self.llm_provider}")
+                except Exception as llm_e:
+                    print(f"LLM config load failed (non-fatal): {llm_e}")
             else:
                 print(f"Config file not found: {self.config_path}")
                 # Use default local server
@@ -134,6 +161,30 @@ class TextToCADIntegration:
             }
         
         try:
+            original_prompt = prompt
+
+            # Optional LLM refinement (non-invasive): rewrite/normalize prompt
+            refined_prompt = original_prompt
+            llm_used = False
+            if self.llm_enabled and self.llm:
+                try:
+                    system = (
+                        "You are a senior manufacturing CAD expert. Rewrite the user's request into a concise, "
+                        "explicit instruction for CAD code generation in FreeCAD. Include clear units (mm), "
+                        "explicit dimensions, and parameters. Avoid assumptions on critical dimensions; if missing, "
+                        "propose safe defaults and note them succinctly. Output a single paragraph, no markdown."
+                    )
+                    messages = [
+                        {"role": "user", "content": original_prompt}
+                    ]
+                    resp = self.llm.generate(system=system, messages=messages, tools=None, tool_choice=None, stream=False)
+                    if resp and resp.text:
+                        refined_prompt = resp.text.strip()
+                        llm_used = True
+                        print("[LLM] Refined prompt generated for Text-to-CAD.")
+                except Exception as _llm_err:
+                    print(f"[LLM] Refinement skipped (non-fatal): {_llm_err}")
+
             # Prepare request
             url = f"{self.base_url}/api/v1/text-to-cad"
             headers = {'Content-Type': 'application/json'}
@@ -141,7 +192,7 @@ class TextToCADIntegration:
                 headers['X-API-Key'] = self.api_key
             
             payload = {
-                'prompt': prompt,
+                'prompt': refined_prompt,
                 'format': 'freecad_python',
                 'include_analysis': True
             }
@@ -161,7 +212,11 @@ class TextToCADIntegration:
                     'freecad_code': result.get('freecad_code', ''),
                     'engineering_analysis': result.get('engineering_analysis', ''),
                     'metadata': result.get('metadata', {}),
-                    'server_response': result
+                    'server_response': result,
+                    'route': 'text_to_cad_server',
+                    'llm_refined': llm_used,
+                    'original_prompt': original_prompt,
+                    'refined_prompt': refined_prompt if llm_used else original_prompt
                 }
             else:
                 return {

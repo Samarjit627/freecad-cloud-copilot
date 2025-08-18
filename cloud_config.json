@@ -23,5 +23,14 @@
     "base_url": "http://localhost:8089",
     "api_key": "test-api-key",
     "timeout": 30
+  },
+  "llm": {
+    "enabled": true,
+    "provider": "claude",
+    "model": "claude-3-5-sonnet-20240620",
+    "temperature": 0.2,
+    "timeout": 30,
+    "ask_followups": true,
+    "max_followups": 3
   }
 }
