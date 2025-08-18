@@ -1022,7 +1022,7 @@ except:
     
     print(f"Created {gear_type.lower()} gear with {teeth_count} teeth, module 2.0, helix angle {helix_angle}°")
     
-except ImportError:
+pass  # NOTE: previously 'except ImportError:' here caused SyntaxError due to mismatched try/except
     print("FCGear workbench not available, creating simple cylindrical gear")
     # Fallback to simple cylindrical gear
     import math
@@ -1033,7 +1033,7 @@ except ImportError:
     height = 10.0
     
     # Calculate dimensions
-    pitch_diameter = module * """ + str(teeth_count) + """
+    pitch_diameter = module * teeth_count
     outer_diameter = pitch_diameter + 2 * module
     root_diameter = pitch_diameter - 2.5 * module
     
@@ -1041,8 +1041,8 @@ except ImportError:
     gear_cylinder = Part.makeCylinder(outer_diameter/2, height)
     
     # Create teeth (simplified)
-    tooth_angle = 360.0 / """ + str(teeth_count) + """
-    for i in range(""" + str(teeth_count) + """):
+    tooth_angle = 360.0 / teeth_count
+    for i in range(int(teeth_count)):
         angle = i * tooth_angle
         # Simple rectangular tooth approximation
         tooth_width = math.pi * module * 0.4

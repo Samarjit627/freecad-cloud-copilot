@@ -80,6 +80,9 @@ class TextToCADIntegration:
             return False
             
         message_lower = message.lower()
+        # Explicitly exclude gear so the native handler (with FCGear support) runs locally
+        if 'gear' in message_lower or 'cog' in message_lower or 'herringbone' in message_lower:
+            return False
         
         # CAD creation keywords
         cad_keywords = [
@@ -110,8 +113,14 @@ class TextToCADIntegration:
         has_cad_keyword = any(keyword in message_lower for keyword in cad_keywords)
         has_object_keyword = any(keyword in message_lower for keyword in object_keywords)
         has_special_pattern = any(re.search(pattern, message_lower) for pattern in special_patterns)
+
+        # Relaxed policy: if user mentions a CAD object (e.g., "water bottle 750ml")
+        # or uses recognizable dimension patterns, treat it as Text-to-CAD.
+        if has_object_keyword or has_special_pattern:
+            return True
         
-        return has_cad_keyword and (has_object_keyword or has_special_pattern)
+        # Otherwise require an explicit CAD verb.
+        return has_cad_keyword
     
     def process_request(self, prompt: str) -> Dict[str, Any]:
         """
@@ -221,8 +230,10 @@ class TextToCADIntegration:
                         
                         # Fit all objects in view
                         if hasattr(FreeCADGui.ActiveDocument, 'ActiveView'):
-                            FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                            print("✅ View fitted to all objects")
+                            import os
+                            if os.getenv('AXIS5_FITALL_ON_CREATE', '0') == '1':
+                                FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                                print("✅ View fitted to all objects")
                         
                         # Update GUI
                         FreeCADGui.updateGui()
@@ -230,8 +241,10 @@ class TextToCADIntegration:
                         
                         # Try additional view commands for visibility
                         try:
-                            FreeCADGui.runCommand("Std_ViewFitAll")
-                            print("✅ Std_ViewFitAll executed")
+                            import os
+                            if os.getenv('AXIS5_FITALL_ON_CREATE', '0') == '1':
+                                FreeCADGui.runCommand("Std_ViewFitAll")
+                                print("✅ Std_ViewFitAll executed")
                         except Exception as cmd_e:
                             print(f"⚠️ Std_ViewFitAll failed: {cmd_e}")
                             

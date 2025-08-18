@@ -20,7 +20,7 @@
   "use_dedicated_dfm_endpoint": false,
   "use_local_fallback": false,
   "text_to_cad": {
-    "base_url": "http://localhost:8084",
+    "base_url": "http://localhost:8089",
     "api_key": "test-api-key",
     "timeout": 30
   }

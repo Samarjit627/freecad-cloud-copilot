@@ -109,6 +109,10 @@ class TemplateManager:
             template_name = 'enclosure'
         elif 'gear' in text or 'cog' in text:
             template_name = 'gear'
+        elif 'cylinder' in text or 'diameter' in text or 'ø' in text:
+            template_name = 'cylinder'
+        elif 'cube' in text or 'block' in text:
+            template_name = 'cube'
         elif 'bottle' in text or 'container' in text:
             template_name = 'water_bottle'
         
@@ -127,12 +131,16 @@ class TemplateManager:
         dim_pattern = r'(\d+)\s*mm\s*x\s*(\d+)\s*mm\s*x\s*(\d+)\s*mm'
         dim_match = re.search(dim_pattern, text)
         
-        if dim_match and template_name in ['bracket', 'enclosure']:
+        if dim_match and template_name in ['bracket', 'enclosure', 'cube']:
             if template_name == 'bracket':
                 params['length'] = float(dim_match.group(1))
                 params['width'] = float(dim_match.group(2))
                 params['height'] = float(dim_match.group(3))
             elif template_name == 'enclosure':
+                params['length'] = float(dim_match.group(1))
+                params['width'] = float(dim_match.group(2))
+                params['height'] = float(dim_match.group(3))
+            elif template_name == 'cube':
                 params['length'] = float(dim_match.group(1))
                 params['width'] = float(dim_match.group(2))
                 params['height'] = float(dim_match.group(3))
@@ -153,6 +161,30 @@ class TemplateManager:
             bore_match = re.search(r'bore\s*(\d+\.?\d*)', text)
             if bore_match:
                 params['bore_diameter'] = float(bore_match.group(1))
+
+            # Look for helix angle and helical/double-helical keywords
+            # Examples: "helical gear", "helix angle 20 deg", "double helical", "herringbone"
+            if 'helical' in text or 'helix' in text or 'herringbone' in text:
+                # Default to helical when keywords present
+                params['helix_angle'] = params.get('helix_angle', 15.0)
+            helix_match = re.search(r'(?:helix|helix\s*angle|beta)\s*(\d+\.?\d*)', text)
+            if helix_match:
+                try:
+                    params['helix_angle'] = float(helix_match.group(1))
+                except:
+                    pass
+            # Double helical / herringbone flag
+            params['double_helical'] = ('double helical' in text) or ('herringbone' in text)
+
+            # Thickness/width
+            width_match = re.search(r'(?:width|thickness)\s*(\d+\.?\d*)', text)
+            if width_match:
+                params['thickness'] = float(width_match.group(1))
+
+            # Pressure angle
+            pa_match = re.search(r'(?:pressure\s*angle|pa)\s*(\d+\.?\d*)', text)
+            if pa_match:
+                params['pressure_angle'] = float(pa_match.group(1))
         
         elif template_name == 'bracket':
             # Look for thickness
@@ -174,7 +206,51 @@ class TemplateManager:
             params['include_mounting_holes'] = not ('no holes' in text or 'without holes' in text)
             params['include_ventilation'] = 'vent' in text
             params['include_cable_cutout'] = 'cable' in text or 'cutout' in text
-        
+
+        elif template_name == 'cube':
+            # Support single value: "cube 30mm" => 30x30x30
+            single_mm = re.search(r'(\d+\.?\d*)\s*mm', text)
+            if single_mm and not dim_match:
+                val = float(single_mm.group(1))
+                params['length'] = val
+                params['width'] = val
+                params['height'] = val
+            # Optional fillet
+            fillet_match = re.search(r'fillet\s*(\d+\.?\d*)', text)
+            if fillet_match:
+                params['fillet_radius'] = float(fillet_match.group(1))
+
+        elif template_name == 'cylinder':
+            # Patterns: "Ø20 x 50mm", "20mm diameter x 50mm", "diameter 20mm height 50mm"
+            # Diameter symbol Ø and plain text variants
+            dia_height_patterns = [
+                r'[øo]\s*(\d+\.?\d*)\s*[x×]\s*(\d+\.?\d*)\s*mm',
+                r'(\d+\.?\d*)\s*mm\s*(?:diameter|dia)\s*[x×]\s*(\d+\.?\d*)\s*mm',
+                r'(?:diameter|dia)\s*(\d+\.?\d*)\s*mm.*?(?:height|tall|h)\s*(\d+\.?\d*)\s*mm',
+                r'(\d+\.?\d*)\s*mm\s*[x×]\s*(\d+\.?\d*)\s*mm\s*cylinder'
+            ]
+            d_h = None
+            for pat in dia_height_patterns:
+                m = re.search(pat, text)
+                if m:
+                    d_h = (float(m.group(1)), float(m.group(2)))
+                    break
+            if d_h:
+                params['diameter'] = d_h[0]
+                params['height'] = d_h[1]
+            else:
+                # Fallback: capture any diameter and any height separately
+                d = re.search(r'(?:diameter|dia|[øo])\s*(\d+\.?\d*)\s*mm', text)
+                h = re.search(r'(?:height|tall|h)\s*(\d+\.?\d*)\s*mm', text)
+                if d:
+                    params['diameter'] = float(d.group(1))
+                if h:
+                    params['height'] = float(h.group(1))
+            # Optional bore
+            bore_match = re.search(r'(?:bore|inner|id)\s*(\d+\.?\d*)\s*mm', text)
+            if bore_match:
+                params['bore_diameter'] = float(bore_match.group(1))
+
         elif template_name == 'water_bottle':
             # Look for volume in ml
             volume_match = re.search(r'(\d+)\s*ml', text)
