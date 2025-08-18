@@ -766,6 +766,39 @@ class ManufacturingFeatureManager:
             except Exception as e:
                 print(f"Error initializing cloud integration: {str(e)}")
                 traceback.print_exc()
+
+    def add_suggestion_chips_in_chat(self):
+        """Append clickable suggestion chips as an assistant message that scrolls with history."""
+        chip_style = (
+            "display:inline-block; margin:2px 6px 2px 0; padding:4px 10px;"
+            "border:1px solid #444; border-radius:14px; background:#2a2a2a; color:#ddd;"
+            "text-decoration:none; font-size:12px;"
+        )
+        html = (
+            f"<b>Axis 5:</b> "
+            f"<a href='action:create_cube' style='{chip_style}'>Create a cube</a>"
+            f"<a href='action:dfm' style='{chip_style}'>Run Advance DFM analysis</a>"
+            f"<a href='action:show_problems' style='{chip_style}'>Show problem areas</a>"
+            f"<a href='action:import' style='{chip_style}'>Import STEP/IGES</a>"
+        )
+        if not hasattr(self, 'chat_entries') or self.chat_entries is None:
+            self.chat_entries = []
+        self.chat_entries.append(html)
+        self._update_chat_display()
+
+    def on_chat_anchor_clicked(self, qurl):
+        try:
+            action = qurl.toString()
+            if action == 'action:create_cube':
+                self.on_quick_create_cube()
+            elif action == 'action:dfm':
+                self.on_quick_dfm()
+            elif action == 'action:show_problems':
+                self.on_quick_show_problems()
+            elif action == 'action:import':
+                self.on_quick_import()
+        except Exception as e:
+            self.add_system_message(f"Couldn't handle action: {e}")
     
     def analyze_dfm(self, manufacturing_process="3d_printing", material="pla", production_volume=1, advanced_analysis=True):
         """Analyze design for manufacturability using industry-grade DFM engine"""
@@ -824,7 +857,41 @@ class ManufacturingFeatureManager:
                             # FALLBACK TO BASIC ANALYSIS IF NO GEOMETRIC ISSUES FOUND
                             print("🔄 Using basic manufacturability analysis...")
                             
-                            # Initialize enhanced local analyzer
+                            # Initialize enhanced local analyzer (safe import with local fallback)
+                            try:
+                                from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer  # type: ignore
+                            except Exception:
+                                print("DEBUG: utils.enhanced_local_dfm not available, using built-in lightweight analyzer")
+                                class EnhancedLocalDFMAnalyzer:  # lightweight fallback
+                                    def analyze_dfm(self, cad_data, manufacturing_process, material, production_volume):
+                                        try:
+                                            # Basic metrics
+                                            dims = cad_data.get('dimensions', {}) if isinstance(cad_data, dict) else {}
+                                            volume = 0.0
+                                            try:
+                                                volume = float(cad_data.get('total_volume', 0.0))
+                                            except Exception:
+                                                pass
+                                            issues = []
+                                            # Very simple heuristics
+                                            if dims:
+                                                x = float(dims.get('x', 0))
+                                                y = float(dims.get('y', 0))
+                                                z = float(dims.get('z', 0))
+                                                if max(x, y, z) > 300:
+                                                    issues.append({"severity":"low","description":"Large part size may exceed common machine envelopes"})
+                                            data = {
+                                                "analysis_id": f"local_{int(time.time())}",
+                                                "dimensions": dims,
+                                                "overall_manufacturability_score": 65 if not issues else 45,
+                                                "design_issues": issues,
+                                                "manufacturing_features": {"complexity_rating": "Medium"},
+                                                "process_recommendations": [manufacturing_process] if manufacturing_process else [],
+                                                "material_suggestions": [material] if material else [],
+                                            }
+                                            return {"success": True, "data": data, "service": "local_fallback"}
+                                        except Exception as _e:
+                                            return {"success": False, "error": str(_e), "service": "local_fallback"}
                             local_analyzer = EnhancedLocalDFMAnalyzer()
                             
                             # Perform enhanced local analysis
@@ -919,6 +986,25 @@ class ManufacturingFeatureManager:
     def _create_hybrid_dfm_result(self, cloud_result, local_result, manufacturing_process, material, production_volume):
         """Create a hybrid DFM result combining cloud AI insights with enhanced local analysis"""
         try:
+            # Helper: filter placeholder cloud issues
+            def _filter_placeholder_issues(items):
+                placeholders = [
+                    'Unable to perform detailed analysis',
+                    'No detailed analysis available',
+                ]
+                filtered = []
+                for it in (items or []):
+                    if isinstance(it, str):
+                        if any(p.lower() in it.lower() for p in placeholders):
+                            continue
+                        filtered.append(it)
+                    elif isinstance(it, dict):
+                        desc = str(it.get('description', ''))
+                        if any(p.lower() in desc.lower() for p in placeholders):
+                            continue
+                        filtered.append(it)
+                return filtered
+
             # Get data from both sources
             cloud_data = cloud_result.get('data', {})
             local_data = local_result.get('data', {})
@@ -951,11 +1037,11 @@ class ManufacturingFeatureManager:
                     'note': 'Cloud AI analysis not available for this geometry'
                 }
             
-            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (PROBLEM AREAS BUTTON FIX)
-            cloud_design_issues = cloud_data.get('design_issues', [])
+            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (filter placeholders)
+            cloud_design_issues = _filter_placeholder_issues(cloud_data.get('design_issues', []))
             if cloud_design_issues:
                 hybrid_data['design_issues'] = cloud_design_issues
-                print(f"DEBUG: Preserved {len(cloud_design_issues)} design_issues in hybrid result")
+                print(f"DEBUG: Preserved {len(cloud_design_issues)} filtered design_issues in hybrid result")
             
             # 5. Enhanced analysis summary
             hybrid_data['analysis_summary'] = {
@@ -5720,7 +5806,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         layout.addLayout(header_layout)
         
         # Add chat history area
-        self.chat_history = QtWidgets.QTextEdit()
+        # Use QTextBrowser so we can render clickable chips inside the chat
+        self.chat_history = QtWidgets.QTextBrowser()
         self.chat_history.setReadOnly(True)
         self.chat_history.setMinimumHeight(300)
         
@@ -5794,6 +5881,13 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         input_layout.addWidget(self.send_button)
         
         layout.addLayout(input_layout)
+
+        # Connect anchor clicks from chat chips
+        try:
+            self.chat_history.setOpenExternalLinks(False)
+            self.chat_history.anchorClicked.connect(self.on_chat_anchor_clicked)
+        except Exception:
+            pass
         
         # Connect enter key to send message
         self.input_field.installEventFilter(self)
@@ -5819,15 +5913,55 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Add cloud manufacturing features section
         self.add_manufacturing_features_ui(layout)
         
-        # Add initial message
-        self.add_system_message("Welcome to the Manufacturing Co-Pilot!")
-        self.add_system_message("Ask questions about manufacturing or CAD design.")
+        # Initial messages are added after we compute status below
         
-        # Add cloud status message
-        if self.cloud_connected:
-            self.add_system_message(f"Connected to cloud service at {self.cloud_client.api_url}")
-        else:
-            self.add_system_message(f"Failed to connect to cloud service: {self.cloud_client.last_error}")
+        # Condensed status line (single assistant message)
+        try:
+            cloud_str = "Cloud: Connected" if getattr(self, 'cloud_connected', False) else "Cloud: Disconnected"
+            t2c_str = "Text‑to‑CAD: Unknown"
+            if hasattr(self, 'nl_cad_editor') and hasattr(self.nl_cad_editor, 'text_to_cad'):
+                t2c = self.nl_cad_editor.text_to_cad
+                t2c_str = f"Text‑to‑CAD: {'Connected' if getattr(t2c, 'connected', False) else 'Disconnected'}"
+            provider_str = "LLM: OFF"
+            try:
+                import json, os
+                _macro_dir = os.path.dirname(os.path.abspath(__file__))
+                paths = [
+                    os.path.join(os.path.dirname(_macro_dir), 'cloud_config.json'),
+                    os.path.join(_macro_dir, 'cloud_config.json'),
+                    '/Users/samarjit/CascadeProjects/freecad-cloud-copilot/cloud_config.json'
+                ]
+                for p in paths:
+                    if os.path.exists(p):
+                        with open(p, 'r') as f:
+                            cfg = json.load(f)
+                        llm_cfg = cfg.get('llm', {}) if isinstance(cfg, dict) else {}
+                        if llm_cfg.get('enabled', False):
+                            provider_str = f"LLM: {llm_cfg.get('provider', 'ON')}"
+                        else:
+                            provider_str = "LLM: OFF"
+                        break
+            except Exception:
+                # Fall back to env
+                import os
+                if os.getenv('ANTHROPIC_API_KEY'):
+                    provider_str = "LLM: Claude"
+                elif os.getenv('OPENAI_API_KEY'):
+                    provider_str = "LLM: OpenAI"
+            # 1) Status message first
+            self.add_assistant_message(f"Status — {cloud_str} · {t2c_str} · {provider_str}")
+            # 2) Capability greeting next
+            self.add_assistant_message(
+                "Hi! I'm your manufacturing co‑pilot Axis5. I can create parts, modify geometry, or run DFM analysis. "
+                "I can also create shapes like cubes and cylinders, add fillets/chamfers, extrude sketches, and generate gears. "
+                "What are you working on?")
+            # 3) Inline suggestion chips
+            self.add_suggestion_chips_in_chat()
+        except Exception:
+            pass
+
+        # Pilot flag: acknowledge part only once after first user action
+        self._pilot_part_ack_done = False
     
     def eventFilter(self, obj, event):
         """Handle events for input field"""
@@ -5837,6 +5971,49 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 return True
         return super().eventFilter(obj, event)
     
+    def _workspace_has_part(self):
+        """Return True if any solid exists in the active document."""
+        try:
+            import FreeCAD as App
+            doc = App.ActiveDocument
+            if not doc:
+                return False
+            print(f"DEBUG: _workspace_has_part checking doc='{doc.Label or doc.Name}' with {len(getattr(doc,'Objects',[]) or [])} objects")
+            for obj in getattr(doc, 'Objects', []) or []:
+                try:
+                    shp = getattr(obj, 'Shape', None)
+                    obj_type = getattr(obj, 'TypeId', type(obj).__name__)
+                    if shp and not shp.isNull():
+                        solids_ok = hasattr(shp, 'Solids') and len(shp.Solids) > 0
+                        faces_ok = hasattr(shp, 'Faces') and len(shp.Faces) > 0
+                        try:
+                            vol_ok = float(getattr(shp,'Volume',0.0)) > 0.0
+                        except Exception:
+                            vol_ok = False
+                        if solids_ok or (faces_ok and vol_ok):
+                            print(f"DEBUG: Detected part candidate: {obj.Label or obj.Name} ({obj_type}) | solids={getattr(shp,'Solids',None)} volume={getattr(shp,'Volume',None)}")
+                            return True
+                    # Mesh support
+                    if obj_type.startswith('Mesh') or obj_type == 'Mesh::Feature':
+                        msh = getattr(obj,'Mesh',None)
+                        if msh and hasattr(msh,'CountFacets') and msh.CountFacets > 0:
+                            print(f"DEBUG: Detected mesh part candidate: {obj.Label or obj.Name} facets={msh.CountFacets}")
+                            return True
+                except Exception:
+                    continue
+            # Selection fallback: if any selection present, consider as context
+            try:
+                import FreeCADGui
+                sel = FreeCADGui.Selection.getSelectionEx()
+                if sel:
+                    print(f"DEBUG: Selection present ({len(sel)}); treating as part available")
+                    return True
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
+
     def send_message(self):
         """Send a message to the cloud service"""
         message = self.input_field.toPlainText().strip()
@@ -5851,6 +6028,59 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         
         # Show processing indicator
         self.add_system_message("Processing...")
+
+        # Route explicit DFM/manufacturability requests first (tolerant to spelling/variants)
+        try:
+            lower = message.lower()
+            norm = lower.replace('-', ' ').replace('_', ' ')
+            dfm_intent = (
+                ('dfm' in norm) or
+                ('manufactur' in norm and any(w in norm for w in ['analy', 'analyse', 'check', 'assess', 'evaluate', 'review'])) or
+                ('manufacturability' in norm) or
+                ('problem area' in norm) or ('show problem' in norm) or ('manufacturing issues' in norm)
+            )
+            print(f"DEBUG: DFM intent detected? {dfm_intent} | msg='{message}'")
+            if dfm_intent:
+                has_part = self._workspace_has_part()
+                self.remove_last_processing_message()
+                if has_part:
+                    self.add_assistant_message("Got it — analyzing manufacturability of the current part…")
+                    self.on_dfm_clicked()
+                else:
+                    # As a last resort, run DFM against any preselected sub-shapes if present
+                    try:
+                        import FreeCADGui
+                        if FreeCADGui.Selection.getSelection():
+                            self.add_assistant_message("I don't see a solid body, but you have a selection. I'll run a targeted DFM analysis on the selection…")
+                            self.on_dfm_clicked()
+                            return
+                    except Exception:
+                        pass
+                    self.add_assistant_message("I don't see a part in the workspace. Import a STEP/IGES or create a shape, then I'll run an Advance DFM analysis.")
+                return
+        except Exception:
+            pass
+
+        # Lightweight greeting/engagement handler
+        try:
+            _greet_words = {"hi", "hello", "hey", "hola", "yo", "namaste"}
+            if message.lower() in _greet_words or message.lower().startswith(("hi ", "hello ", "hey ")):
+                self.remove_last_processing_message()
+                self.add_assistant_message("Hi! I'm your manufacturing co‑pilot. I can create parts, modify geometry, or run DFM analysis. What are you working on?")
+                return
+        except Exception:
+            pass
+
+        # Pilot: After first user action, if a part exists, acknowledge once
+        try:
+            if not getattr(self, '_pilot_part_ack_done', False):
+                if self._workspace_has_part():
+                    self.add_system_message("Detected a part in the workspace.")
+                    # Gentle, single follow-up to engage (only when not DFM intent)
+                    self.add_assistant_message("Would you like me to run an Advance DFM analysis, show problem areas, or make a CAD edit?")
+                    self._pilot_part_ack_done = True
+        except Exception:
+            pass
         
         # Try text-to-CAD first (if available)
         if hasattr(self, 'nl_cad_editor') and hasattr(self.nl_cad_editor, 'text_to_cad') and self.nl_cad_editor.text_to_cad.is_text_to_cad_request(message):
@@ -5909,7 +6139,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                             response_text = f"Error: {response['error']}"
                         else:
                             print(f"Debug: Received empty response from cloud: {response}")
-                            response_text = "I'm processing your request locally."
+                            response_text = "I couldn't get a reply from the cloud service. I can help you create/modify CAD or run DFM analysis. What would you like to do?"
                         
                         # Add fallback response
                         self.add_assistant_message(response_text)
@@ -5924,7 +6154,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                         response_text = f"Error: {response['error']}"
                     else:
                         print(f"Debug: Received empty response from cloud: {response}")
-                        response_text = "I'm processing your request locally."
+                        response_text = "I couldn't get a reply from the cloud service. I can help you create/modify CAD or run DFM analysis. What would you like to do?"
                     
                     # Add fallback response
                     self.add_assistant_message(response_text)
@@ -5965,6 +6195,26 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             # Process command with NL CAD editor
             result = self.nl_cad_editor.process_command(text)
             
+            # Add route badge if available (non-invasive UI info)
+            try:
+                route = result.get('route') if isinstance(result, dict) else None
+                if route:
+                    # Normalize known routes
+                    route_map = {
+                        'text_to_cad_server': 'Text-to-CAD server',
+                        'local_handler': 'Local handler',
+                        'llm_assisted_code': 'LLM-assisted code'
+                    }
+                    route_label = route_map.get(route, route)
+                    self.add_system_message(f"Route: {route_label}")
+                # Indicate if LLM refinement occurred
+                if isinstance(result, dict) and result.get('llm_refined'):
+                    rp = result.get('refined_prompt')
+                    if rp:
+                        self.add_system_message("LLM refined the prompt for clarity")
+            except Exception:
+                pass
+
             if result['success']:
                 # Add success message
                 self.add_system_message(f"[OK] {result['message']}")
@@ -6043,10 +6293,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.cloud_client.test_connection()
     
     def add_system_message(self, message):
-        """Add a system message to the chat history"""
+        """Add a system message to the chat history (shown as Axis 5, no timestamps)"""
         print(f"DEBUG: add_system_message called with message: {message}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] System:</b> {message}"
+        chat_entry = f"<b>Axis 5:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -6084,10 +6333,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         print("DEBUG: No processing message found to remove")
     
     def add_user_message(self, message):
-        """Add a user message to the chat history"""
+        """Add a user message to the chat history (no timestamps)"""
         print(f"DEBUG: add_user_message called with message: {message}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] You:</b> {message}"
+        chat_entry = f"<b>You:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -6105,10 +6353,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self._update_chat_display()
     
     def add_assistant_message(self, message):
-        """Add an assistant message to the chat history"""
+        """Add an assistant message to the chat history (no timestamps)"""
         print(f"DEBUG: add_assistant_message called with message length: {len(message)}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] Axis 5:</b> {message}"
+        chat_entry = f"<b>Axis 5:</b> {message}"
         print(f"DEBUG: Adding entry to chat_entries, length: {len(chat_entry)}")
         
         # Initialize chat_entries as a list if it doesn't exist
@@ -6141,8 +6388,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list")
                 self.chat_entries = [str(self.chat_entries)]
             
-            # Check if chat_history attribute exists and is a QTextEdit widget
-            if hasattr(self, 'chat_history') and isinstance(self.chat_history, QtWidgets.QTextEdit):
+            # Check if chat_history attribute exists and is a QTextEdit/QTextBrowser widget
+            if hasattr(self, 'chat_history') and isinstance(self.chat_history, (QtWidgets.QTextEdit, QtWidgets.QTextBrowser)):
                 print("DEBUG: chat_history is a QTextEdit widget")
                 print(f"DEBUG: Found {len(self.chat_entries)} chat entries")
                 
@@ -6281,6 +6528,50 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         
         # Set a random suggestion in the input field
         self.input_field.setText(random.choice(suggestions))
+        
+    # ---------- Quick actions handlers (chips under input) ----------
+    def on_quick_create_cube(self):
+        try:
+            # Insert a simple prompt and send through normal pipeline
+            self.input_field.setText("create a 20 mm cube")
+            self.send_message()
+        except Exception as e:
+            self.add_system_message(f"Couldn't start cube creation: {e}")
+    
+    def on_quick_dfm(self):
+        try:
+            if hasattr(self, 'on_dfm_clicked'):
+                self.on_dfm_clicked()
+            else:
+                self.add_system_message("DFM feature not available in this build.")
+        except Exception as e:
+            self.add_system_message(f"Couldn't start DFM analysis: {e}")
+    
+    def on_quick_show_problems(self):
+        try:
+            if hasattr(self, 'on_show_problems_clicked'):
+                self.on_show_problems_clicked()
+            else:
+                self.add_system_message("Show Problem Areas feature not available in this build.")
+        except Exception as e:
+            self.add_system_message(f"Couldn't show problem areas: {e}")
+    
+    def on_quick_import(self):
+        try:
+            dlg = QtWidgets.QFileDialog()
+            dlg.setNameFilter("STEP/IGES Files (*.step *.stp *.iges *.igs)")
+            if dlg.exec_():
+                files = dlg.selectedFiles()
+                if files:
+                    path = files[0]
+                    try:
+                        import ImportGui
+                        ImportGui.open(path)
+                    except Exception:
+                        FreeCAD.openDocument(path)
+                    self.add_assistant_message("Imported file. Want me to run an Advance DFM analysis or show problem areas?")
+        except Exception as e:
+            self.add_system_message(f"Couldn't import file: {e}")
     
     def on_clear_clicked(self):
         """Handle clear button click"""
@@ -6479,19 +6770,34 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     design_issues = data.get('design_issues', [])
                     print(f"DEBUG: Found {len(design_issues)} design_issues: {design_issues}")
                     
-                    # Convert design_issues to our format
+                    # Filter placeholder messages from cloud
+                    placeholders = [
+                        'Unable to perform detailed analysis',
+                        'No detailed analysis available',
+                    ]
+                    def _is_placeholder(desc:str):
+                        dl = desc.lower()
+                        return any(p.lower() in dl for p in placeholders)
+                    
+                    filtered_di = []
                     for issue in design_issues:
                         if isinstance(issue, str):
-                            print(f"DEBUG: Converting string issue: {issue}")
-                            issues.append({
-                                'severity': 'medium',
-                                'description': issue
-                            })
+                            if _is_placeholder(issue):
+                                print("DEBUG: Dropping placeholder design_issue")
+                                continue
+                            filtered_di.append({'severity':'medium','description':issue})
                         elif isinstance(issue, dict):
-                            print(f"DEBUG: Adding dict issue: {issue}")
-                            issues.append(issue)
+                            desc = str(issue.get('description',''))
+                            if _is_placeholder(desc):
+                                print("DEBUG: Dropping placeholder design_issue dict")
+                                continue
+                            filtered_di.append(issue)
                     
-                    print(f"DEBUG: Converted {len(issues)} design_issues to issues format")
+                    # Append filtered issues
+                    for fi in filtered_di:
+                        issues.append(fi)
+                    
+                    print(f"DEBUG: Converted {len(filtered_di)} filtered design_issues to issues format")
                 elif 'design_issues' in data:
                     print(f"DEBUG: Skipping design_issues conversion - already have {len(issues)} issues")
                 else:
