@@ -17,6 +17,23 @@ except Exception:
     build_llm_from_config = None  # type: ignore
     BaseLLMClient = object  # type: ignore
 
+# Optional component recipes (additive)
+try:
+    from utils.textcad_components import detect_component, build_component_prompt, parse_alloy_wheel_params
+except Exception:
+    def detect_component(_: str) -> Optional[str]:
+        return None
+    def build_component_prompt(_: str, __: Optional[str]) -> str:
+        return _
+    def parse_alloy_wheel_params(_: str) -> Dict[str, Any]:
+        return {}
+
+try:
+    from utils.component_generators import generate_alloy_wheel_code
+except Exception:
+    def generate_alloy_wheel_code(_: Dict[str, Any]) -> str:
+        return ""
+
 class TextToCADIntegration:
     """
     Handles text-to-CAD conversion using cloud services and local fallbacks
@@ -123,7 +140,8 @@ class TextToCADIntegration:
             'cylinder', 'cube', 'box', 'sphere', 'cone', 'tube',
             'bottle', 'container', 'housing', 'case', 'cover',
             'shaft', 'bearing', 'bushing', 'spacer', 'washer',
-            'plate', 'panel', 'frame', 'support', 'clamp'
+            'plate', 'panel', 'frame', 'support', 'clamp',
+            'wheel', 'alloy wheel', 'rim', 'disc brake', 'brake rotor'
         ]
         
         # Special patterns
@@ -163,6 +181,10 @@ class TextToCADIntegration:
         try:
             original_prompt = prompt
 
+            # Component detection (non-invasive). If a known component is detected,
+            # we will augment the prompt with strict generation constraints.
+            component_id = detect_component(original_prompt)
+
             # Optional LLM refinement (non-invasive): rewrite/normalize prompt
             refined_prompt = original_prompt
             llm_used = False
@@ -185,6 +207,9 @@ class TextToCADIntegration:
                 except Exception as _llm_err:
                     print(f"[LLM] Refinement skipped (non-fatal): {_llm_err}")
 
+            # If component detected, add strict recipe constraints to the prompt
+            refined_prompt = build_component_prompt(refined_prompt, component_id)
+
             # Prepare request
             url = f"{self.base_url}/api/v1/text-to-cad"
             headers = {'Content-Type': 'application/json'}
@@ -194,7 +219,8 @@ class TextToCADIntegration:
             payload = {
                 'prompt': refined_prompt,
                 'format': 'freecad_python',
-                'include_analysis': True
+                'include_analysis': True,
+                'component': component_id or ''
             }
             
             # Make request
@@ -207,9 +233,54 @@ class TextToCADIntegration:
             
             if response.status_code == 200:
                 result = response.json()
+                code = result.get('freecad_code', '') or ''
+                # If server returned a trivial primitive for a known component, try local recipe fallback
+                if component_id == 'alloy_wheel':
+                    trivial = ('makecylinder' in code.lower()) or (len(code) < 400)
+                    if trivial:
+                        # 1) Try alternate in-process generator module (non-invasive)
+                        try:
+                            # Build a tiny FreeCAD script that calls the alt generator with the original prompt.
+                            # Use json.dumps to safely embed the prompt as a Python string literal.
+                            alt_code = (
+                                "from utils.wheel_alt_generator import create_wheel_from_command\n"
+                                + "create_wheel_from_command(" + json.dumps(original_prompt) + ")\n"
+                            )
+                            return {
+                                'success': True,
+                                'freecad_code': alt_code,
+                                'engineering_analysis': 'Local recipe: Alloy wheel generator (alt module)',
+                                'metadata': {'source':'local_recipe_alt','component':'alloy_wheel'},
+                                'server_response': result,
+                                'route': 'local_recipe_alt',
+                                'llm_refined': llm_used,
+                                'original_prompt': original_prompt,
+                                'refined_prompt': refined_prompt if llm_used else original_prompt
+                            }
+                        except Exception as _e_alt:
+                            print(f"[TextToCAD] Alt wheel generator not available: {_e_alt}")
+
+                        # 2) Fallback to existing param-code generator
+                        try:
+                            params = parse_alloy_wheel_params(original_prompt)
+                            local_code = generate_alloy_wheel_code(params)
+                            if local_code:
+                                return {
+                                    'success': True,
+                                    'freecad_code': local_code,
+                                    'engineering_analysis': 'Local recipe: Alloy wheel generator',
+                                    'metadata': {'source':'local_recipe','component':'alloy_wheel','params':params},
+                                    'server_response': result,
+                                    'route': 'local_recipe',
+                                    'llm_refined': llm_used,
+                                    'original_prompt': original_prompt,
+                                    'refined_prompt': refined_prompt if llm_used else original_prompt
+                                }
+                        except Exception as _e:
+                            print(f"[TextToCAD] Local alloy wheel fallback failed: {_e}")
                 return {
                     'success': True,
-                    'freecad_code': result.get('freecad_code', ''),
+                    'freecad_code': code,
                     'engineering_analysis': result.get('engineering_analysis', ''),
                     'metadata': result.get('metadata', {}),
                     'server_response': result,
@@ -243,12 +314,32 @@ class TextToCADIntegration:
         Execute FreeCAD code safely
         """
         try:
+            # Basic preflight safety: block dangerous modules/ops
+            forbidden = [
+                'import os', 'subprocess', 'socket', 'urllib', 'requests', 'open(', '__import__',
+                'eval(', 'exec(', 'sys.exit', 'shutil', 'pathlib.Path.home('
+            ]
+            low = code.lower()
+            for token in forbidden:
+                if token in low:
+                    return {
+                        'success': False,
+                        'error': f'Unsafe code detected (token: {token}). Aborting execution.'
+                    }
+
             # Import FreeCAD modules
             import FreeCAD
             import Part
-            
-            # Execute the code
-            exec(code)
+
+            # Execute the code with explicit globals so generated scripts
+            # can access FreeCAD/Part as expected inside exec
+            safe_globals = {
+                '__builtins__': __builtins__,
+                'App': FreeCAD,
+                'FreeCAD': FreeCAD,
+                'Part': Part,
+            }
+            exec(code, safe_globals, {})
             
             # Update FreeCAD GUI to make objects visible - ENHANCED FOR AXIS 5
             try:

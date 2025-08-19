@@ -32,5 +32,11 @@
     "timeout": 30,
     "ask_followups": true,
     "max_followups": 3
+  },
+  "features": {
+    "text_to_cad_enabled": true,
+    "dfm_enabled": true,
+    "learning_agent_enabled": false,
+    "shadow_mode": true
   }
 }

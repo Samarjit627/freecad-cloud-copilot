@@ -1,0 +1,11 @@
+# CODEOWNERS
+# Replace @your-github-handle with your actual GitHub handle or team.
+# These paths require review from the owner before merging into protected branches.
+
+StandaloneCoPilot.FCMacro    @your-github-handle
+text_to_cad_integration.py   @your-github-handle
+utils/llm_client.py          @your-github-handle
+cloud_config.json            @your-github-handle
+
+# Optionally, protect all files by default (uncomment and set an owner/team):
+# * @your-github-handle

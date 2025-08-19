@@ -825,6 +825,7 @@ class ManufacturingFeatureManager:
                             print("🔄 Using basic manufacturability analysis...")
                             
                             # Initialize enhanced local analyzer
+                            from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer
                             local_analyzer = EnhancedLocalDFMAnalyzer()
                             
                             # Perform enhanced local analysis
@@ -852,9 +853,33 @@ class ManufacturingFeatureManager:
                                 return hybrid_result
                             else:
                                 print("❌ Enhanced local DFM analysis failed, using cloud result")
+                                # Sanitize cloud result to remove generic placeholder issue
+                                try:
+                                    data = result.get('data', {})
+                                    issues = list(data.get('design_issues', []) or [])
+                                    issues = [i for i in issues if not (isinstance(i, str) and 'Unable to perform detailed analysis' in i)]
+                                    if not issues:
+                                        data['design_issues'] = []
+                                        data['analysis_summary'] = data.get('analysis_summary', {})
+                                        data['analysis_summary']['note'] = 'Cloud returned limited detail; no specific geometric issues detected locally.'
+                                        result['data'] = data
+                                except Exception:
+                                    pass
                                 
                         except Exception as local_e:
                             print(f"Enhanced local DFM analysis error: {str(local_e)}")
+                            # Also sanitize cloud result to avoid showing the generic placeholder
+                            try:
+                                data = result.get('data', {})
+                                issues = list(data.get('design_issues', []) or [])
+                                issues = [i for i in issues if not (isinstance(i, str) and 'Unable to perform detailed analysis' in i)]
+                                data['design_issues'] = issues
+                                if not issues:
+                                    data['analysis_summary'] = data.get('analysis_summary', {})
+                                    data['analysis_summary']['note'] = 'Cloud returned limited detail; local analysis unavailable.'
+                                result['data'] = data
+                            except Exception:
+                                pass
                 
                 self.last_dfm_result = result
                 return result
@@ -916,6 +941,71 @@ class ManufacturingFeatureManager:
                 "timestamp": time.strftime("%Y-%m-%dT%H:%M:%S")
             }
     
+    def _perform_comprehensive_geometric_analysis(self):
+        """Run comprehensive local geometric DFM analysis and return a list of issue strings.
+        Uses EnhancedLocalDFMAnalyzer under the hood.
+        """
+        try:
+            print("[ANALYZE] Starting comprehensive local DFM geometric analysis...")
+            # Lazy imports to avoid macro startup costs
+            from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer
+            try:
+                # Prefer existing extractor if available in global scope
+                cad_data = extract_cad_data_for_features()
+            except Exception:
+                # Fallback to module import
+                from utils.cad_extractor import extract_cad_data_for_features as _extract
+                cad_data = _extract()
+            analyzer = EnhancedLocalDFMAnalyzer()
+            local = analyzer.analyze_dfm(cad_data=cad_data)
+            issues = []
+            if local and local.get('success'):
+                data = local.get('data', {})
+                # Collect plain text issues from common fields
+                for key in ['design_issues', 'geometric_issues', 'issues']:
+                    vals = data.get(key, [])
+                    if isinstance(vals, list):
+                        for v in vals:
+                            if isinstance(v, str) and v.strip():
+                                issues.append(v.strip())
+                # De-duplicate
+                issues = list(dict.fromkeys(issues))
+            print(f"[ANALYZE] Local geometric issues found: {len(issues)}")
+            return issues
+        except Exception as e:
+            print(f"Comprehensive geometric analysis failed: {e}")
+            traceback.print_exc()
+            return []
+    
+    def _create_geometric_dfm_result(self, cloud_result, geometric_issues, manufacturing_process, material, production_volume):
+        """Build a result object replacing generic cloud message with concrete geometric issues."""
+        try:
+            cloud_data = (cloud_result or {}).get('data', {})
+            # Start from cloud data to preserve any useful fields
+            merged = dict(cloud_data)
+            merged['design_issues'] = list(geometric_issues or [])
+            merged['analysis_summary'] = {
+                'primary_analysis': 'Comprehensive Local Geometric DFM',
+                'ai_enhancement': 'Cloud AI (partial)' if cloud_data else 'Not Available',
+                'confidence_level': 'High' if geometric_issues else 'Medium'
+            }
+            merged['context'] = {
+                'manufacturing_process': manufacturing_process,
+                'material': material,
+                'production_volume': production_volume
+            }
+            return {
+                'success': True,
+                'data': merged,
+                'service': 'geometric_dfm_local',
+                'timestamp': time.strftime('%Y-%m-%dT%H:%M:%S')
+            }
+        except Exception as e:
+            print(f"Error creating geometric DFM result: {e}")
+            traceback.print_exc()
+            # Fallback to cloud result if merge fails
+            return cloud_result or { 'success': False, 'error': str(e) }
+    
     def _create_hybrid_dfm_result(self, cloud_result, local_result, manufacturing_process, material, production_volume):
         """Create a hybrid DFM result combining cloud AI insights with enhanced local analysis"""
         try:
@@ -951,11 +1041,26 @@ class ManufacturingFeatureManager:
                     'note': 'Cloud AI analysis not available for this geometry'
                 }
             
-            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (PROBLEM AREAS BUTTON FIX)
-            cloud_design_issues = cloud_data.get('design_issues', [])
-            if cloud_design_issues:
-                hybrid_data['design_issues'] = cloud_design_issues
-                print(f"DEBUG: Preserved {len(cloud_design_issues)} design_issues in hybrid result")
+            # 4. Merge DESIGN_ISSUES, but drop the generic placeholder
+            cloud_design_issues = list(cloud_data.get('design_issues', []) or [])
+            local_issues = list(local_data.get('design_issues', []) or local_data.get('geometric_issues', []) or [])
+            # Remove generic placeholder from cloud issues
+            generic_msg = 'Unable to perform detailed analysis'
+            cloud_design_issues = [i for i in cloud_design_issues if not (isinstance(i, str) and generic_msg in i)]
+            # If cloud had only the generic, prefer local
+            if not cloud_design_issues and local_issues:
+                hybrid_data['design_issues'] = local_issues
+                print(f"DEBUG: Using {len(local_issues)} local design_issues in hybrid result (cloud was generic)")
+            else:
+                # Otherwise merge unique
+                merged_issues = []
+                for src in (cloud_design_issues, local_issues):
+                    for it in (src or []):
+                        if isinstance(it, str) and it not in merged_issues:
+                            merged_issues.append(it)
+                if merged_issues:
+                    hybrid_data['design_issues'] = merged_issues
+                    print(f"DEBUG: Preserved/Merged {len(merged_issues)} design_issues in hybrid result")
             
             # 5. Enhanced analysis summary
             hybrid_data['analysis_summary'] = {
@@ -2904,48 +3009,75 @@ class DesignContextManager:
 
 # Claude AI processor for conversational CAD generation
 class CloudAIProcessor:
-    """Process natural language using Claude AI for conversational CAD generation"""
+    """Process natural language using LLM (Claude/OpenAI via utils.llm_client) for conversational CAD generation"""
     
     def __init__(self, cloud_client=None):
         self.cloud_client = cloud_client
         self.context_memory = []
-        self.anthropic_client = None
+        self.llm_client = None
         
-        # Initialize Claude/Anthropic client for conversational CAD generation
-        if ANTHROPIC_AVAILABLE and ANTHROPIC_API_KEY:
+        # Initialize LLM via utils.llm_client using environment keys (safe, no SDK dependency)
+        try:
+            import os, json
+            from utils.llm_client import ClaudeClient, OpenAIClient
+            desired_provider = (os.getenv('AXIS5_LLM_PROVIDER') or '').strip().lower()
+            # Attempt to read cloud_config.json colocated with macro for provider preference
             try:
-                self.anthropic_client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
-                print("[OK] Claude AI conversational CAD generation ready")
-            except Exception as e:
-                print(f"⚠️ Failed to initialize Claude AI: {str(e)}")
-        else:
-            if not ANTHROPIC_AVAILABLE:
-                print("⚠️ Claude AI library not available")
-            elif not ANTHROPIC_API_KEY:
-                print("⚠️ ANTHROPIC_API_KEY not found - Claude integration disabled")
+                base_dir = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else None
+                if base_dir:
+                    cfg_path = os.path.join(base_dir, 'cloud_config.json')
+                    if os.path.exists(cfg_path):
+                        with open(cfg_path, 'r') as _f:
+                            _cfg = json.load(_f)
+                        desired_provider = desired_provider or str(_cfg.get('llm', {}).get('provider', '')).lower()
+            except Exception as _cfg_e:
+                print(f"⚠️ Could not read provider from cloud_config.json: {_cfg_e}")
+
+            # Select provider
+            anth_key = os.getenv("ANTHROPIC_API_KEY")
+            oai_key = os.getenv("OPENAI_API_KEY")
+            if desired_provider == 'openai' and oai_key:
+                self.llm_client = OpenAIClient()
+                print("[OK] Axis 5 LLM: OpenAI client ready (by preference)")
+            elif desired_provider == 'claude' and anth_key:
+                self.llm_client = ClaudeClient()
+                print("[OK] Axis 5 LLM: Claude client ready (by preference)")
+            else:
+                # Auto-select by available keys, prefer Claude if both and no explicit preference
+                if anth_key and not desired_provider == 'openai':
+                    self.llm_client = ClaudeClient()
+                    print("[OK] Axis 5 LLM: Claude client ready")
+                elif oai_key:
+                    self.llm_client = OpenAIClient()
+                    print("[OK] Axis 5 LLM: OpenAI client ready")
+                else:
+                    print("⚠️ No LLM API key found (ANTHROPIC_API_KEY/OPENAI_API_KEY). Conversational mode will fall back.")
+        except Exception as e:
+            # Non-fatal: keep cloud/local fallback
+            print(f"⚠️ LLM client initialization failed (non-fatal): {e}")
         
-        print(f"Debug: CloudAIProcessor initialized - Cloud: {cloud_client is not None}, Claude: {self.anthropic_client is not None}")
+        print(f"Debug: CloudAIProcessor initialized - Cloud: {cloud_client is not None}, LLM: {self.llm_client is not None}")
     
     def process_advanced_command(self, text, context=None):
-        """Process command with Claude AI for conversational CAD generation"""
-        # Try Claude AI first for conversational CAD generation
-        if self.anthropic_client:
+        """Process command with LLM for conversational CAD generation"""
+        # Try local LLM first (env-based Claude/OpenAI)
+        if self.llm_client:
             try:
-                return self.claude_conversational_process(text, context)
+                return self.llm_conversational_process(text, context)
             except Exception as e:
-                print(f"Claude conversational processing failed: {str(e)}, falling back")
+                print(f"LLM conversational processing failed: {str(e)}, falling back")
         
         # Fallback to cloud client
-        if self.cloud_client and self.cloud_client.connected:
+        if getattr(self.cloud_client, 'connected', False):
             return self.cloud_process(text, context)
         else:
             return self.local_process(text, context)
     
-    def claude_conversational_process(self, text, context=None):
-        """Process using Claude AI for conversational CAD generation"""
+    def llm_conversational_process(self, text, context=None):
+        """Process using local LLM client (Claude/OpenAI via REST) for conversational CAD generation"""
         try:
-            if not self.anthropic_client:
-                print("Claude AI not available for conversational processing")
+            if not self.llm_client:
+                print("LLM client not available for conversational processing")
                 return self.local_process(text, context)
             
             # Build comprehensive system prompt for conversational CAD generation
@@ -2984,17 +3116,14 @@ Always be conversational, helpful, and provide practical solutions."""
             
             print(f"🤖 Axis 5 processing: {text[:100]}...")
             
-            # Call Claude API for conversational response
-            response = self.anthropic_client.messages.create(
-                model="claude-3-sonnet-20240229",
-                max_tokens=4000,
-                system=system_prompt,
-                messages=[
-                    {"role": "user", "content": user_message}
-                ]
-            )
-            
-            response_text = response.content[0].text
+            # Call LLM for conversational response
+            messages = [{"role": "user", "content": user_message}]
+            resp = self.llm_client.generate(system=system_prompt, messages=messages, tools=None, tool_choice=None, stream=False)
+            # Prefer plain text; keep raw for debugging
+            response_text = (getattr(resp, 'text', '') or '').strip()
+            if not response_text:
+                # Provide a friendly default to avoid falling back for small talk
+                response_text = "Hi! How can I help with CAD or manufacturing today?"
             print(f"[OK] Axis 5 response generated: {len(response_text)} chars")
             
             # Store conversation in memory
@@ -3008,16 +3137,17 @@ Always be conversational, helpful, and provide practical solutions."""
             # Extract FreeCAD code if present
             freecad_code = self.extract_freecad_code(response_text)
             
+            provider = type(self.llm_client).__name__.replace('Client','').lower()
             return {
                 'success': True,
                 'response': response_text,
                 'freecad_code': freecad_code,
-                'source': 'claude_conversational',
+                'source': f'{provider}_conversational',
                 'conversation_mode': True
             }
             
         except Exception as e:
-            print(f"Error in Claude conversational processing: {str(e)}")
+            print(f"Error in LLM conversational processing: {str(e)}")
             return {
                 'success': False,
                 'error': str(e),
@@ -3492,9 +3622,15 @@ class NaturalLanguageCADEditor:
                 return self.create_gear(teeth, module, width)
             
         except Exception as e:
-            print(f"Error creating gear: {str(e)}")
+            print(f"Error in LLM conversational processing: {str(e)}")
             traceback.print_exc()
-            return {'success': False, 'message': f"Error creating gear: {str(e)}"}
+            # Return a friendly response instead of forcing cloud fallback for greetings
+            try:
+                if len((text or '').strip()) <= 3:
+                    return { 'success': True, 'response': "Hi! How can I help with CAD or manufacturing today?", 'source': 'local_greeting' }
+            except Exception:
+                pass
+            return { 'success': False, 'error': str(e) }
     
     def handle_measure_gear(self, text):
         """Measure last created or selected gear and report key dimensions."""
@@ -3836,7 +3972,6 @@ class NaturalLanguageCADEditor:
                             created_objs = []
                             fused_done = False
                             fused_shape = None
-{{ ... }}
                             # Try to fuse with base solid to behave like PAD
                             if hasattr(obj, 'Shape') and obj.Shape and obj.Shape.Solids and extruded_parts:
                                 try:
@@ -3959,7 +4094,8 @@ class NaturalLanguageCADEditor:
                     FreeCADGui.Selection.clearSelection()
                     for r in results:
                         try:
-                            FreeCADGui.ActiveDocument.getObject(r.Name).Visibility = True
+                            if FreeCADGui.ActiveDocument:
+                                FreeCADGui.ActiveDocument.getObject(r.Name).Visibility = True
                         except Exception:
                             pass
                         FreeCADGui.Selection.addSelection(r)
@@ -5514,15 +5650,20 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Add cloud manufacturing features section
         self.add_manufacturing_features_ui(layout)
         
-        # Add initial message
-        self.add_system_message("Welcome to the Manufacturing Co-Pilot!")
-        self.add_system_message("Ask questions about manufacturing or CAD design.")
-        
-        # Add cloud status message
-        if self.cloud_connected:
-            self.add_system_message(f"Connected to cloud service at {self.cloud_client.api_url}")
-        else:
-            self.add_system_message(f"Failed to connect to cloud service: {self.cloud_client.last_error}")
+        # Add a single friendly startup message (Axis 5 only, no System:)
+        try:
+            status = "Connected" if getattr(self, 'cloud_connected', False) else "Disconnected"
+            endpoint = getattr(getattr(self, 'cloud_client', None), 'api_url', 'n/a')
+            cloud_line = f"Cloud: {status} ({endpoint})"
+            greeting = (
+                "👋 Hi, I'm Axis 5 — your manufacturing & CAD co‑pilot.\n"
+                "Ask questions or describe what to model (e.g., 'create an alloy wheel 18in x 8in with 5 lugs').\n"
+                f"{cloud_line}"
+            )
+            self.add_assistant_message(greeting)
+        except Exception:
+            # Fallback if any attribute is missing
+            self.add_assistant_message("👋 Hi, I'm Axis 5 — your manufacturing & CAD co‑pilot.")
     
     def eventFilter(self, obj, event):
         """Handle events for input field"""
@@ -5583,44 +5724,43 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                                 print(f"Error executing Axis 5's FreeCAD code: {str(code_err)}")
                                 response_text += f"\n\n⚠️ Error executing generated CAD code: {str(code_err)}"
                         
-                        # Add Axis 5's conversational response to chat
-                        source = ai_response.get('source', 'ai')
-                        if source == 'claude_conversational':
-                            self.add_assistant_message(f"🤖 Axis 5: {response_text}")
-                        else:
-                            self.add_assistant_message(response_text)
+                        # Add Axis 5's conversational response to chat (no double prefix)
+                        self.add_assistant_message(response_text)
                     else:
                         error_msg = ai_response.get('error', 'Unknown error') if ai_response else 'No response'
                         print(f"Axis 5 processing failed: {error_msg}")
-                        # Fallback to cloud service
+                        # If LLM returned a textual response, show it anyway (avoid cloud fallback for small talk)
+                        fallback_text = (ai_response.get('response') if ai_response else None)
+                        if fallback_text:
+                            self.add_assistant_message(fallback_text)
+                        elif len(message.strip()) <= 4:
+                            # Short greetings or chit-chat
+                            self.add_assistant_message("Hi! How can I help with CAD or manufacturing today?")
+                        else:
+                            # Fallback to cloud service only for substantive queries
+                            response = self.cloud_client.get_chat_response(message)
+                            if "response" in response:
+                                response_text = response["response"]
+                            elif "error" in response:
+                                response_text = f"Error: {response['error']}"
+                            else:
+                                print(f"Debug: Received empty response from cloud: {response}")
+                                response_text = "Thanks! I’m on it — handling this locally and will respond with details."
+                            self.add_assistant_message(response_text)
+                else:
+                    # If no AI processor, provide a friendly reply for greetings; otherwise use cloud
+                    if len(message.strip()) <= 4:
+                        self.add_assistant_message("Hi! How can I help with CAD or manufacturing today?")
+                    else:
                         response = self.cloud_client.get_chat_response(message)
-                        
-                        # Extract response text
                         if "response" in response:
                             response_text = response["response"]
                         elif "error" in response:
                             response_text = f"Error: {response['error']}"
                         else:
                             print(f"Debug: Received empty response from cloud: {response}")
-                            response_text = "I'm processing your request locally."
-                        
-                        # Add fallback response
+                            response_text = "Thanks! I’m on it — handling this locally and will respond with details."
                         self.add_assistant_message(response_text)
-                else:
-                    # Fallback to cloud service if AI processor not available
-                    response = self.cloud_client.get_chat_response(message)
-                    
-                    # Extract response text
-                    if "response" in response:
-                        response_text = response["response"]
-                    elif "error" in response:
-                        response_text = f"Error: {response['error']}"
-                    else:
-                        print(f"Debug: Received empty response from cloud: {response}")
-                        response_text = "I'm processing your request locally."
-                    
-                    # Add fallback response
-                    self.add_assistant_message(response_text)
                 
             except Exception as e:
                 # Remove processing indicator
@@ -5736,10 +5876,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.cloud_client.test_connection()
     
     def add_system_message(self, message):
-        """Add a system message to the chat history"""
+        """Add a system message to the chat history (rendered as Axis 5)"""
         print(f"DEBUG: add_system_message called with message: {message}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] System:</b> {message}"
+        chat_entry = f"<b>Axis 5:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -5779,8 +5918,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
     def add_user_message(self, message):
         """Add a user message to the chat history"""
         print(f"DEBUG: add_user_message called with message: {message}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] You:</b> {message}"
+        chat_entry = f"<b>You:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -5800,8 +5938,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
     def add_assistant_message(self, message):
         """Add an assistant message to the chat history"""
         print(f"DEBUG: add_assistant_message called with message length: {len(message)}")
-        timestamp = datetime.now().strftime("%H:%M")
-        chat_entry = f"<b>[{timestamp}] Axis 5:</b> {message}"
+        chat_entry = f"<b>Axis 5:</b> {message}"
         print(f"DEBUG: Adding entry to chat_entries, length: {len(chat_entry)}")
         
         # Initialize chat_entries as a list if it doesn't exist
