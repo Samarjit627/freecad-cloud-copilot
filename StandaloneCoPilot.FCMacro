@@ -2337,10 +2337,10 @@ class ManufacturingFeatureManager:
             # Find the mesh or solid object
             target_obj = None
             for obj in doc.Objects:
-                if hasattr(obj, 'Mesh') and obj.Mesh.CountFacets > 0:
+                if hasattr(obj, "Mesh") and obj.Mesh.CountFacets > 0:
                     target_obj = obj
                     break
-                elif hasattr(obj, 'Shape') and obj.Shape.Volume > 0:
+                elif hasattr(obj, "Shape") and obj.Shape.Volume > 0:
                     target_obj = obj
                     break
             
@@ -3119,7 +3119,7 @@ Always be conversational, helpful, and provide practical solutions."""
         # Extract features
         if 'hole' in text_lower or 'drill' in text_lower:
             result['features'].append('holes')
-        if 'fillet' in text_lower or 'round' in text_lower:
+        if 'fillet' in text_lower or 'round' in text_lower or 'corner' in text_lower:
             result['features'].append('fillets')
         if 'chamfer' in text_lower or 'bevel' in text_lower:
             result['features'].append('chamfers')
@@ -3785,11 +3785,50 @@ class NaturalLanguageCADEditor:
                             print("Debug: No faces resolved from selection; skipping face-extrude path")
                         else:
                             print(f"Debug: Found {len(faces)} face(s) to extrude")
-                            # Create extrusions for faces
+                            # Faces selected: extrude each selected face along its normal
                             extruded_parts = []
                             for f in faces:
                                 try:
-                                    extruded_parts.append(f.extrude(extrude_vector))
+                                    # Use face normal as direction
+                                    try:
+                                        n = f.normalAt(f.CenterOfMass)
+                                    except Exception:
+                                        # Fallback: use surface normal at u,v = 0.5,0.5
+                                        try:
+                                            umin, umax, vmin, vmax = f.ParameterRange
+                                            n = f.normalAt((umin+umax)/2.0, (vmin+vmax)/2.0)
+                                        except Exception:
+                                            n = FreeCAD.Vector(0,0,1)
+                                    if n.Length == 0:
+                                        n = FreeCAD.Vector(0,0,1)
+                                    try:
+                                        n.normalize()  # in-place unit vector
+                                    except Exception:
+                                        n = FreeCAD.Vector(0,0,1)
+                                    dir_mag = (distance if direction == 'up' else -distance)
+                                    dir_vec = n * dir_mag
+
+                                    # Create prism and ensure solid
+                                    try:
+                                        shell = f.extrude(dir_vec)
+                                    except Exception:
+                                        shell = None
+                                    part = None
+                                    if shell:
+                                        try:
+                                            if not getattr(shell, 'Solids', []):
+                                                part = Part.Solid(Part.Shell(shell.Faces))
+                                            else:
+                                                part = shell
+                                        except Exception:
+                                            part = None
+                                    if part is None:
+                                        try:
+                                            part = Part.makePrism(f, dir_vec)
+                                        except Exception as e2:
+                                            print(f"Debug: makePrism fallback failed: {e2}")
+                                            raise
+                                    extruded_parts.append(part)
                                 except Exception as face_err:
                                     print(f"Debug: Face extrusion failed: {face_err}")
                                     error_messages.append(f"Face extrusion failed on {obj.Name}: {face_err}")
@@ -3797,20 +3836,83 @@ class NaturalLanguageCADEditor:
                             created_objs = []
                             fused_done = False
                             fused_shape = None
+{{ ... }}
                             # Try to fuse with base solid to behave like PAD
                             if hasattr(obj, 'Shape') and obj.Shape and obj.Shape.Solids and extruded_parts:
                                 try:
-                                    fused_shape = obj.Shape.copy()
-                                    for p in extruded_parts:
-                                        fused_shape = fused_shape.fuse(p)
+                                    # Validate extruded parts and ensure they are solids
+                                    valid_parts = []
+                                    for idx, p in enumerate(extruded_parts, 1):
+                                        if getattr(p, 'isNull', None) and p.isNull():
+                                            print(f"Debug: Extruded part #{idx} is null; skipping")
+                                            continue
+                                        if getattr(p, 'isValid', None) and not p.isValid():
+                                            try:
+                                                p = p.copy()
+                                                p = p.removeSplitter()
+                                            except Exception:
+                                                pass
+                                        # If the prism isn't a solid (common when extruding a face), try to solidify
+                                        try:
+                                            if not getattr(p, 'Solids', []):
+                                                # If shape is a shell, convert to solid
+                                                p = Part.makeSolid(p)
+                                        except Exception as _solid_err:
+                                            print(f"Debug: Could not solidify extruded part #{idx}: {_solid_err}")
+                                        valid_parts.append(p)
+                                    if not valid_parts:
+                                        print("Debug: No valid extruded parts to fuse")
+                                        raise RuntimeError("No valid extruded parts")
+
+                                    # Build a single target to fuse
+                                    try:
+                                        extrude_target = Part.Compound(valid_parts) if len(valid_parts) > 1 else valid_parts[0]
+                                    except Exception:
+                                        extrude_target = valid_parts[0]
+
+                                    base_shape = obj.Shape.copy()
+                                    # First fuse attempt
+                                    fused_try = base_shape.fuse(extrude_target)
+                                    if getattr(fused_try, 'isNull', None) and fused_try.isNull():
+                                        print("Debug: First fuse produced null shape")
+                                        raise RuntimeError("Null fuse result")
+                                    if getattr(fused_try, 'isValid', None) and not fused_try.isValid():
+                                        # Cleanup and retry on copies
+                                        fused_try = fused_try.removeSplitter()
+                                    fused_shape = fused_try
                                     fused_done = True
                                 except Exception as fuse_err:
                                     print(f"Debug: Fuse after face extrude failed on {obj.Name}: {fuse_err}")
-                                    fused_done = False
-                                    fused_shape = None
+                                    # Fallback 2: document-level MultiFuse
+                                    try:
+                                        tmp_objs = []
+                                        for idx, p in enumerate(valid_parts, 1):
+                                            tmp = doc.addObject("Part::Feature", f"_TmpFaceExtrude_{obj.Name}_{idx}")
+                                            tmp.Shape = p
+                                            tmp_objs.append(tmp)
+                                        fuse_feat = doc.addObject("Part::MultiFuse", f"_TmpFuse_{obj.Name}")
+                                        fuse_feat.Shapes = [obj] + tmp_objs
+                                        doc.recompute()
+                                        if hasattr(fuse_feat, 'Shape') and fuse_feat.Shape and (not fuse_feat.Shape.isNull()):
+                                            fused_shape = fuse_feat.Shape.copy()
+                                            fused_done = True
+                                        # Cleanup temp objects regardless
+                                        try:
+                                            doc.removeObject(fuse_feat.Name)
+                                        except Exception:
+                                            pass
+                                        for t in tmp_objs:
+                                            try:
+                                                doc.removeObject(t.Name)
+                                            except Exception:
+                                                pass
+                                    except Exception as mf_err:
+                                        print(f"Debug: MultiFuse fallback failed on {obj.Name}: {mf_err}")
+                                        fused_done = False
+                                        fused_shape = None
                             
                             try:
-                                if fused_done and fused_shape and fused_shape.isValid():
+                                if fused_done and fused_shape and (not hasattr(fused_shape, 'isNull') or not fused_shape.isNull()) and (not hasattr(fused_shape, 'isValid') or fused_shape.isValid()):
                                     # Modify base in-place to behave like a true pad
                                     obj.Shape = fused_shape
                                     created_objs.append(obj)
