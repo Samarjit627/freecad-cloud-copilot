@@ -3564,11 +3564,25 @@ class NaturalLanguageCADEditor:
                     new_shape = base.Shape.makeChamfer(size, edge_objs)
                     ch = doc.addObject("Part::Feature", f"Chamfer_{base.Name}")
                     ch.Shape = new_shape
+                    # Hide original object to avoid duplicates
+                    try:
+                        if FreeCADGui.ActiveDocument:
+                            FreeCADGui.ActiveDocument.getObject(base.Name).Visibility = False
+                    except Exception as _vis_err:
+                        print(f"Debug: Could not hide source object {base.Name}: {_vis_err}")
                     results.append(ch)
                 except Exception as op_err:
                     print(f"Chamfer operation failed on {base.Name}: {op_err}")
             doc.recompute()
             if results:
+                # Select new chamfer features for clarity
+                try:
+                    if FreeCADGui.ActiveDocument:
+                        FreeCADGui.Selection.clearSelection()
+                        for r in results:
+                            FreeCADGui.Selection.addSelection(r)
+                except Exception:
+                    pass
                 return {'success': True, 'message': f"Created {len(results)} chamfer(s) of {size}mm", 'chamfers': results}
             return {'success': False, 'message': 'No chamfers were created'}
         except Exception as e:
@@ -3780,6 +3794,12 @@ class NaturalLanguageCADEditor:
                                 result_obj = doc.addObject("Part::Feature", extrude_name)
                                 result_obj.Shape = extruded_shape
                                 result_obj.ViewObject.Visibility = True
+                                # Hide source object to avoid duplicate visual
+                                try:
+                                    if FreeCADGui.ActiveDocument:
+                                        FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                                except Exception as _vis_err:
+                                    print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
                                 
                                 print(f"Debug: Successfully created face extrusion: {extrude_name}")
                                 success_count += 1
@@ -3804,6 +3824,12 @@ class NaturalLanguageCADEditor:
                                     result_obj = doc.addObject("Part::Feature", extrude_name)
                                     result_obj.Shape = extruded_shape
                                     result_obj.ViewObject.Visibility = True
+                                    # Hide source sketch container if appropriate
+                                    try:
+                                        if FreeCADGui.ActiveDocument:
+                                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                                    except Exception as _vis_err:
+                                        print(f"Debug: Could not hide source sketch {obj.Name}: {_vis_err}")
                                     
                                     print(f"Debug: Successfully created sketch extrusion: {extrude_name}")
                                     success_count += 1
@@ -3842,6 +3868,12 @@ class NaturalLanguageCADEditor:
                                 # Ensure object is visible and properly rendered
                                 result_obj.ViewObject.Visibility = True
                                 result_obj.ViewObject.DisplayMode = "Flat Lines"  # Clean display mode
+                                # Hide source object to avoid duplicate visual
+                                try:
+                                    if FreeCADGui.ActiveDocument:
+                                        FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                                except Exception as _vis_err:
+                                    print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
                                 
                                 # Make the extruded object more visible
                                 try:
@@ -3880,7 +3912,7 @@ class NaturalLanguageCADEditor:
             
             # Recompute document
             doc.recompute()
-            
+
             # Update view
             if FreeCADGui.ActiveDocument:
                 try:
@@ -3916,8 +3948,17 @@ class NaturalLanguageCADEditor:
             print(f"Handling fillet: {text}")
             
             # Extract radius
-            radius_match = re.search(r'(?:radius|of|by|at)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?', text, re.IGNORECASE)
-            radius = float(radius_match.group(1)) if radius_match else 2.0
+            radius = 2.0
+            patterns = [
+                r'(?:radius|of|by|at)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?',
+                r'(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)\s*.*fillet',
+                r'fillet\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?'
+            ]
+            for pat in patterns:
+                m = re.search(pat, text, re.IGNORECASE)
+                if m:
+                    radius = float(m.group(1))
+                    break
             print(f"Debug: Fillet radius = {radius}mm")
             
             # Check if edges are selected
@@ -3970,30 +4011,31 @@ class NaturalLanguageCADEditor:
                     new_shape = obj.Shape.makeFillet(radius, edge_objs)
                     fil = doc.addObject("Part::Feature", f"Fillet_{obj.Name}")
                     fil.Shape = new_shape
+                    # Hide original object to avoid duplicates
+                    try:
+                        if FreeCADGui.ActiveDocument:
+                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                    except Exception as _vis_err:
+                        print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
                     results.append(fil)
                 except Exception as op_err:
                     print(f"Fillet operation failed on {obj.Name}: {op_err}")
-                    fillet.Edges = edge_strings
-                    
-                    # Hide original object
-                    if hasattr(FreeCADGui, "ActiveDocument") and FreeCADGui.ActiveDocument:
-                        try:
-                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
-                            print(f"Debug: Set original object {obj.Name} visibility to False")
-                        except Exception as vis_err:
-                            print(f"Debug: Error setting visibility: {str(vis_err)}")
-                    
-                    results.append({
-                        'object': fillet,
-                        'radius': radius,
-                        'edges': len(edge_strings)
-                    })
+                    traceback.print_exc()
                     # Skip object on failure; continue others
                     continue
             
             # Return success or failure
             if results:
                 print(f"Debug: Created {len(results)} fillet(s)")
+                # Recompute and select new features for clarity
+                try:
+                    doc.recompute()
+                    if FreeCADGui.ActiveDocument:
+                        FreeCADGui.Selection.clearSelection()
+                        for r in results:
+                            FreeCADGui.Selection.addSelection(r)
+                except Exception:
+                    pass
                 return {'success': True, 'message': f"Created {len(results)} fillet(s) of {radius}mm", 'fillets': results}
             else:
                 print("Debug: No fillets created")
