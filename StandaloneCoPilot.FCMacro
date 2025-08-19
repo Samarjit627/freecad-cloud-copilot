@@ -23,6 +23,7 @@ import traceback
 import time
 import math
 import threading
+import re
 from datetime import datetime
 import Mesh, MeshPart
 from collections import defaultdict
@@ -3496,7 +3497,6 @@ class NaturalLanguageCADEditor:
     def handle_chamfer(self, text):
         """Handle chamfer commands (apply to selected edges or all edges)."""
         try:
-            import re
             # Extract chamfer size
             size = 1.0
             m = re.search(r'(?:size|by|of|at)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?', text, re.IGNORECASE)
@@ -3513,21 +3513,24 @@ class NaturalLanguageCADEditor:
                 base = s.Object
                 if not base or not hasattr(base, 'Shape'):
                     continue
-                ch = doc.addObject("Part::Chamfer", f"Chamfer_{base.Name}")
-                ch.Base = base
-                # If edges selected, use them; else all edges
-                edges = []
+                # Collect edge objects
+                edge_objs = []
                 if getattr(s, 'SubElementNames', []):
                     for name in s.SubElementNames:
                         if name.startswith('Edge'):
-                            idx = int(name[4:])
-                            edges.append((base, (idx, size, size)))
-                if not edges:
+                            idx0 = int(name[4:]) - 1
+                            if 0 <= idx0 < len(base.Shape.Edges):
+                                edge_objs.append(base.Shape.Edges[idx0])
+                if not edge_objs:
                     # All edges
-                    for i, _e in enumerate(base.Shape.Edges, start=1):
-                        edges.append((base, (i, size, size)))
-                ch.Edges = edges
-                results.append(ch)
+                    edge_objs = list(base.Shape.Edges)
+                try:
+                    new_shape = base.Shape.makeChamfer(size, edge_objs)
+                    ch = doc.addObject("Part::Feature", f"Chamfer_{base.Name}")
+                    ch.Shape = new_shape
+                    results.append(ch)
+                except Exception as op_err:
+                    print(f"Chamfer operation failed on {base.Name}: {op_err}")
             doc.recompute()
             if results:
                 return {'success': True, 'message': f"Created {len(results)} chamfer(s) of {size}mm", 'chamfers': results}
@@ -3877,7 +3880,7 @@ class NaturalLanguageCADEditor:
             print(f"Handling fillet: {text}")
             
             # Extract radius
-            radius_match = re.search(r'(?:radius|of)\s*(\d+(?:\.\d+)?)\s*(?:mm)?', text, re.IGNORECASE)
+            radius_match = re.search(r'(?:radius|of|by|at)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?', text, re.IGNORECASE)
             radius = float(radius_match.group(1)) if radius_match else 2.0
             print(f"Debug: Fillet radius = {radius}mm")
             
@@ -3915,9 +3918,23 @@ class NaturalLanguageCADEditor:
                 print(f"Debug: Object has {len(obj.Shape.Edges)} edges")
                 
                 # Check if specific edges are selected
-                selected_edges = []
+                edge_objs = []
                 if hasattr(sel_obj, 'SubElementNames') and sel_obj.SubElementNames:
                     print(f"Debug: Found {len(sel_obj.SubElementNames)} sub-elements")
+                    for name in sel_obj.SubElementNames:
+                        if name.startswith('Edge'):
+                            idx0 = int(name[4:]) - 1
+                            if 0 <= idx0 < len(obj.Shape.Edges):
+                                edge_objs.append(obj.Shape.Edges[idx0])
+                if not edge_objs:
+                    edge_objs = list(obj.Shape.Edges)
+                try:
+                    new_shape = obj.Shape.makeFillet(radius, edge_objs)
+                    fil = doc.addObject("Part::Feature", f"Fillet_{obj.Name}")
+                    fil.Shape = new_shape
+                    results.append(fil)
+                except Exception as op_err:
+                    print(f"Fillet operation failed on {obj.Name}: {op_err}")
                     for sub in sel_obj.SubElementNames:
                         if sub.startswith('Edge'):
                             edge_idx = int(sub.replace('Edge', '')) - 1
