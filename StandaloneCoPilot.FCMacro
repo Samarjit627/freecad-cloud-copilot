@@ -3811,10 +3811,9 @@ class NaturalLanguageCADEditor:
                             
                             try:
                                 if fused_done and fused_shape and fused_shape.isValid():
-                                    name = f"ExtrudeFuse_{obj.Name}_{int(abs(distance))}mm"
-                                    feat = doc.addObject("Part::Feature", name)
-                                    feat.Shape = fused_shape
-                                    created_objs.append(feat)
+                                    # Modify base in-place to behave like a true pad
+                                    obj.Shape = fused_shape
+                                    created_objs.append(obj)
                                 else:
                                     # Fall back to separate features
                                     for idx, part in enumerate(extruded_parts, 1):
@@ -3826,12 +3825,7 @@ class NaturalLanguageCADEditor:
                                 print(f"Debug: Failed adding extrude feature(s): {add_err}")
                                 error_messages.append(f"Failed adding extrude feature(s) for {obj.Name}: {add_err}")
                             
-                            # Hide source for visual clarity
-                            try:
-                                if FreeCADGui.ActiveDocument:
-                                    FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
-                            except Exception as _vis_err:
-                                print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
+                            # Do not hide base for face-extrude; keep it visible in both fused and non-fused cases
                             
                             # Accumulate
                             if created_objs:
@@ -3839,6 +3833,12 @@ class NaturalLanguageCADEditor:
                                     results = []
                                 results.extend(created_objs)
                                 success_count += 1
+                                # Select base too: if fused (in-place), select the modified base; if not fused, select both
+                                try:
+                                    if FreeCADGui.ActiveDocument:
+                                        FreeCADGui.Selection.addSelection(FreeCAD.ActiveDocument.getObject(obj.Name))
+                                except Exception:
+                                    pass
                                 print(f"Debug: Successfully created face extrusion: {created_objs[0].Name}")
                             continue
                 except Exception as err:
