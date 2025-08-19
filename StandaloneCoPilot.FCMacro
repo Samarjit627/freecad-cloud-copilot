@@ -3452,8 +3452,44 @@ class NaturalLanguageCADEditor:
             # Extract width if specified
             width_match = re.search(r'width\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
             width = float(width_match.group(1)) if width_match else 10.0
-            
-            return self.create_gear(teeth, module, width)
+            # Detect helical/double-helical and optional angle
+            double_helical = bool(re.search(r'double\s+helical', text, re.IGNORECASE))
+            helical_only = bool(re.search(r'\bhelical\b', text, re.IGNORECASE)) and not double_helical
+            helix_angle = None
+            ang_m = re.search(r'(?:helical|helix)\s*(?:angle\s*)?(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            if ang_m:
+                helix_angle = float(ang_m.group(1))
+            elif double_helical or helical_only:
+                helix_angle = 15.0
+
+            # Prefer gears workbench via cad_templates.gear_template
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("Gear")
+            try:
+                import sys, os
+                try:
+                    # Attempt to add project root to sys.path if needed
+                    macro_root = os.path.dirname(os.path.abspath(__file__)) if '__file__' in globals() else None
+                    if macro_root and macro_root not in sys.path:
+                        sys.path.insert(0, macro_root)
+                except Exception:
+                    pass
+                from cad_templates import gear_template as gt
+                msg_src = "Gears WB"
+                gt.create_gear(
+                    doc=doc,
+                    module=module,
+                    teeth=teeth,
+                    thickness=width,
+                    bore_diameter=5,
+                    pressure_angle=20,
+                    helix_angle=(helix_angle if helix_angle is not None else 0),
+                    double_helical=double_helical
+                )
+                doc.recompute()
+                return {'success': True, 'message': f"[OK] Created gear via {msg_src}: {teeth} teeth, module {module}, thickness {width}mm"}
+            except Exception as e:
+                print(f"Gears workbench path failed, using fallback: {e}")
+                return self.create_gear(teeth, module, width)
             
         except Exception as e:
             print(f"Error creating gear: {str(e)}")
@@ -3906,6 +3942,8 @@ class NaturalLanguageCADEditor:
                 traceback.print_exc()
                 return {'success': False, 'message': f"Selection error: {str(sel_err)}"}
             
+            # Ensure document handle for creation
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
             results = []
             for sel_obj in selection:
                 obj = sel_obj.Object
@@ -3917,7 +3955,7 @@ class NaturalLanguageCADEditor:
                     
                 print(f"Debug: Object has {len(obj.Shape.Edges)} edges")
                 
-                # Check if specific edges are selected
+                # Collect selected edges; default to all edges
                 edge_objs = []
                 if hasattr(sel_obj, 'SubElementNames') and sel_obj.SubElementNames:
                     print(f"Debug: Found {len(sel_obj.SubElementNames)} sub-elements")
@@ -3935,35 +3973,6 @@ class NaturalLanguageCADEditor:
                     results.append(fil)
                 except Exception as op_err:
                     print(f"Fillet operation failed on {obj.Name}: {op_err}")
-                    for sub in sel_obj.SubElementNames:
-                        if sub.startswith('Edge'):
-                            edge_idx = int(sub.replace('Edge', '')) - 1
-                            selected_edges.append(edge_idx)
-                            print(f"Debug: Selected edge {edge_idx}")
-                
-                # If no specific edges selected, use all edges
-                if not selected_edges:
-                    print("Debug: No specific edges selected, using all edges")
-                    selected_edges = list(range(len(obj.Shape.Edges)))
-                
-                if not selected_edges:
-                    print(f"Debug: No edges found for object {obj.Name}")
-                    continue
-                
-                try:
-                    # Create fillet
-                    fillet_name = f"Fillet_{obj.Name}"
-                    print(f"Debug: Creating fillet object {fillet_name}")
-                    fillet = FreeCAD.ActiveDocument.addObject("Part::Fillet", fillet_name)
-                    fillet.Base = obj
-                    
-                    # Add edges to fillet
-                    edge_strings = []
-                    for edge_idx in selected_edges:
-                        if edge_idx < len(obj.Shape.Edges):
-                            edge_strings.append((edge_idx+1, radius, radius))
-                    
-                    print(f"Debug: Adding {len(edge_strings)} edges to fillet")
                     fillet.Edges = edge_strings
                     
                     # Hide original object
@@ -3979,23 +3988,16 @@ class NaturalLanguageCADEditor:
                         'radius': radius,
                         'edges': len(edge_strings)
                     })
-                    print(f"Debug: Successfully added fillet to results")
-                except Exception as fillet_err:
-                    print(f"Debug: Error creating fillet: {str(fillet_err)}")
-                    traceback.print_exc()
+                    # Skip object on failure; continue others
+                    continue
             
-            # Recompute document
-            FreeCAD.ActiveDocument.recompute()
-            
-            if not results:
+            # Return success or failure
+            if results:
+                print(f"Debug: Created {len(results)} fillet(s)")
+                return {'success': True, 'message': f"Created {len(results)} fillet(s) of {radius}mm", 'fillets': results}
+            else:
+                print("Debug: No fillets created")
                 return {'success': False, 'message': 'No fillets were created'}
-                
-            return {
-                'success': True,
-                'message': f'Created {len(results)} fillet(s) with radius {radius}mm',
-                'fillets': results
-            }
-            
         except Exception as e:
             print(f"Error creating fillet: {str(e)}")
             traceback.print_exc()
