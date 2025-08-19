@@ -17,7 +17,6 @@ import os
 import FreeCAD
 import FreeCADGui
 import json
-import re
 import os
 import sys
 import traceback
@@ -766,39 +765,6 @@ class ManufacturingFeatureManager:
             except Exception as e:
                 print(f"Error initializing cloud integration: {str(e)}")
                 traceback.print_exc()
-
-    def add_suggestion_chips_in_chat(self):
-        """Append clickable suggestion chips as an assistant message that scrolls with history."""
-        chip_style = (
-            "display:inline-block; margin:2px 6px 2px 0; padding:4px 10px;"
-            "border:1px solid #444; border-radius:14px; background:#2a2a2a; color:#ddd;"
-            "text-decoration:none; font-size:12px;"
-        )
-        html = (
-            f"<b>Axis 5:</b> "
-            f"<a href='action:create_cube' style='{chip_style}'>Create a cube</a>"
-            f"<a href='action:dfm' style='{chip_style}'>Run Advance DFM analysis</a>"
-            f"<a href='action:show_problems' style='{chip_style}'>Show problem areas</a>"
-            f"<a href='action:import' style='{chip_style}'>Import STEP/IGES</a>"
-        )
-        if not hasattr(self, 'chat_entries') or self.chat_entries is None:
-            self.chat_entries = []
-        self.chat_entries.append(html)
-        self._update_chat_display()
-
-    def on_chat_anchor_clicked(self, qurl):
-        try:
-            action = qurl.toString()
-            if action == 'action:create_cube':
-                self.on_quick_create_cube()
-            elif action == 'action:dfm':
-                self.on_quick_dfm()
-            elif action == 'action:show_problems':
-                self.on_quick_show_problems()
-            elif action == 'action:import':
-                self.on_quick_import()
-        except Exception as e:
-            self.add_system_message(f"Couldn't handle action: {e}")
     
     def analyze_dfm(self, manufacturing_process="3d_printing", material="pla", production_volume=1, advanced_analysis=True):
         """Analyze design for manufacturability using industry-grade DFM engine"""
@@ -857,41 +823,7 @@ class ManufacturingFeatureManager:
                             # FALLBACK TO BASIC ANALYSIS IF NO GEOMETRIC ISSUES FOUND
                             print("🔄 Using basic manufacturability analysis...")
                             
-                            # Initialize enhanced local analyzer (safe import with local fallback)
-                            try:
-                                from utils.enhanced_local_dfm import EnhancedLocalDFMAnalyzer  # type: ignore
-                            except Exception:
-                                print("DEBUG: utils.enhanced_local_dfm not available, using built-in lightweight analyzer")
-                                class EnhancedLocalDFMAnalyzer:  # lightweight fallback
-                                    def analyze_dfm(self, cad_data, manufacturing_process, material, production_volume):
-                                        try:
-                                            # Basic metrics
-                                            dims = cad_data.get('dimensions', {}) if isinstance(cad_data, dict) else {}
-                                            volume = 0.0
-                                            try:
-                                                volume = float(cad_data.get('total_volume', 0.0))
-                                            except Exception:
-                                                pass
-                                            issues = []
-                                            # Very simple heuristics
-                                            if dims:
-                                                x = float(dims.get('x', 0))
-                                                y = float(dims.get('y', 0))
-                                                z = float(dims.get('z', 0))
-                                                if max(x, y, z) > 300:
-                                                    issues.append({"severity":"low","description":"Large part size may exceed common machine envelopes"})
-                                            data = {
-                                                "analysis_id": f"local_{int(time.time())}",
-                                                "dimensions": dims,
-                                                "overall_manufacturability_score": 65 if not issues else 45,
-                                                "design_issues": issues,
-                                                "manufacturing_features": {"complexity_rating": "Medium"},
-                                                "process_recommendations": [manufacturing_process] if manufacturing_process else [],
-                                                "material_suggestions": [material] if material else [],
-                                            }
-                                            return {"success": True, "data": data, "service": "local_fallback"}
-                                        except Exception as _e:
-                                            return {"success": False, "error": str(_e), "service": "local_fallback"}
+                            # Initialize enhanced local analyzer
                             local_analyzer = EnhancedLocalDFMAnalyzer()
                             
                             # Perform enhanced local analysis
@@ -986,25 +918,6 @@ class ManufacturingFeatureManager:
     def _create_hybrid_dfm_result(self, cloud_result, local_result, manufacturing_process, material, production_volume):
         """Create a hybrid DFM result combining cloud AI insights with enhanced local analysis"""
         try:
-            # Helper: filter placeholder cloud issues
-            def _filter_placeholder_issues(items):
-                placeholders = [
-                    'Unable to perform detailed analysis',
-                    'No detailed analysis available',
-                ]
-                filtered = []
-                for it in (items or []):
-                    if isinstance(it, str):
-                        if any(p.lower() in it.lower() for p in placeholders):
-                            continue
-                        filtered.append(it)
-                    elif isinstance(it, dict):
-                        desc = str(it.get('description', ''))
-                        if any(p.lower() in desc.lower() for p in placeholders):
-                            continue
-                        filtered.append(it)
-                return filtered
-
             # Get data from both sources
             cloud_data = cloud_result.get('data', {})
             local_data = local_result.get('data', {})
@@ -1037,11 +950,11 @@ class ManufacturingFeatureManager:
                     'note': 'Cloud AI analysis not available for this geometry'
                 }
             
-            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (filter placeholders)
-            cloud_design_issues = _filter_placeholder_issues(cloud_data.get('design_issues', []))
+            # 4. PRESERVE DESIGN_ISSUES FROM CLOUD DATA (PROBLEM AREAS BUTTON FIX)
+            cloud_design_issues = cloud_data.get('design_issues', [])
             if cloud_design_issues:
                 hybrid_data['design_issues'] = cloud_design_issues
-                print(f"DEBUG: Preserved {len(cloud_design_issues)} filtered design_issues in hybrid result")
+                print(f"DEBUG: Preserved {len(cloud_design_issues)} design_issues in hybrid result")
             
             # 5. Enhanced analysis summary
             hybrid_data['analysis_summary'] = {
@@ -1402,10 +1315,9 @@ class ManufacturingFeatureManager:
                 
                 # Force view refresh to make rectangles visible
                 try:
-                    import os, FreeCADGui
+                    import FreeCADGui
                     if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
-                        if os.getenv('AXIS5_FITALL_ON_CREATE', '0') == '1':
-                            FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
                         FreeCADGui.updateGui()
                     print(f"DEBUG: Document recomputed and view refreshed - {len(issues)} DFM rectangles should now be visible")
                 except Exception as e:
@@ -3206,7 +3118,7 @@ Always be conversational, helpful, and provide practical solutions."""
         # Extract features
         if 'hole' in text_lower or 'drill' in text_lower:
             result['features'].append('holes')
-        if 'fillet' in text_lower or 'round' in text_lower or 'corner' in text_lower:
+        if 'fillet' in text_lower or 'round' in text_lower:
             result['features'].append('fillets')
         if 'chamfer' in text_lower or 'bevel' in text_lower:
             result['features'].append('chamfers')
@@ -3340,23 +3252,18 @@ class NaturalLanguageCADEditor:
         
         # Always route native advanced commands first to avoid sidecar no-op
         text_lower = text.lower()
-        if (('measure' in text_lower or 'inspect' in text_lower or 'dimension' in text_lower or 'dimensions' in text_lower)
-            and 'gear' in text_lower):
+        if (("measure" in text_lower or "inspect" in text_lower or "dimension" in text_lower or "dimensions" in text_lower)
+            and "gear" in text_lower):
             return self.handle_measure_gear(text)
         if 'gear' in text_lower or 'cog' in text_lower:
             print(f"Debug: Detected gear command early: {text}")
             return self.handle_gear(text)
-        
-        # Check for specific advanced commands first (extrude/fillet)
         if 'extrude' in text_lower or 'extend' in text_lower or 'pull' in text_lower:
             print(f"Debug: Detected extrude command: {text}")
             return self.handle_extrude(text)
-            
         if 'fillet' in text_lower or 'round' in text_lower or 'corner' in text_lower:
             print(f"Debug: Detected fillet command: {text}")
             return self.handle_fillet(text)
-        
-        # Chamfer native routing to avoid sidecar no-op
         if 'chamfer' in text_lower or 'bevel' in text_lower:
             print(f"Debug: Detected chamfer command: {text}")
             return self.handle_chamfer(text)
@@ -3369,7 +3276,7 @@ class NaturalLanguageCADEditor:
         if self.claude_available and self.should_use_claude(text):
             return self.handle_claude_request(text)
         
-        # Then complex AI spec
+        # Complex AI spec last
         if self.is_complex_command(text):
             ai_spec = self.ai_processor.process_advanced_command(text, self.context.get_context())
             return self.create_from_ai_spec(ai_spec)
@@ -3437,20 +3344,9 @@ class NaturalLanguageCADEditor:
                 box = Part.makeBox(length, width, height)
                 obj = doc.addObject("Part::Feature", obj_type.capitalize())
                 obj.Shape = box
-                # Commit changes
-                doc.recompute()
-                # Align view and selection on creation (isometric + fit)
-                try:
-                    if hasattr(FreeCADGui, 'Selection'):
-                        FreeCADGui.Selection.clearSelection()
-                        if obj:
-                            FreeCADGui.Selection.addSelection(obj)
-                    if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                        FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                    FreeCADGui.updateGui()
-                except Exception:
-                    pass
+            
+            # Commit changes
+            doc.recompute()
             
             # Add features if specified
             if 'features' in params:
@@ -3503,17 +3399,6 @@ class NaturalLanguageCADEditor:
                 obj = doc.addObject("Part::Feature", "Box")
                 obj.Shape = box
                 doc.recompute()
-                # Align view and selection on creation
-                try:
-                    if hasattr(FreeCADGui, 'Selection'):
-                        FreeCADGui.Selection.clearSelection()
-                        FreeCADGui.Selection.addSelection(obj)
-                    if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                        FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                    FreeCADGui.updateGui()
-                except Exception:
-                    pass
                 
                 result = {'success': True, 'message': f"Created box with AI specifications", 'object': obj}
             
@@ -3535,17 +3420,6 @@ class NaturalLanguageCADEditor:
                 obj = doc.addObject("Part::Feature", "Cylinder")
                 obj.Shape = cylinder
                 doc.recompute()
-                # Align view and selection on creation
-                try:
-                    if hasattr(FreeCADGui, 'Selection'):
-                        FreeCADGui.Selection.clearSelection()
-                        FreeCADGui.Selection.addSelection(obj)
-                    if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                        FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                    FreeCADGui.updateGui()
-                except Exception:
-                    pass
                 
                 result = {'success': True, 'message': f"Created cylinder with AI specifications", 'object': obj}
                 
@@ -3562,143 +3436,106 @@ class NaturalLanguageCADEditor:
             return {'success': False, 'message': f"Error: {str(e)}"}
             
     def handle_gear(self, text):
-        # Ensure regex is available even if global imports changed
-        try:
-            import re  # noqa: F401
-        except Exception:
-            re = None
         """Create a gear based on text description"""
         try:
             print(f"Creating gear from: {text}")
-            # Prefer the template manager (supports helix/double-helical/FCGear)
-            import sys, os
-            try:
-                base_dir = os.path.dirname(__file__)
-            except Exception:
-                base_dir = os.getcwd()
-            cad_templates_dir = os.path.join(base_dir, 'cad_templates')
-            if cad_templates_dir not in sys.path:
-                sys.path.append(cad_templates_dir)
-            try:
-                import template_manager as _tm
-                manager = _tm.get_template_manager()
-                template, params = manager.parse_text_request(text)
-                if template == 'gear':
-                    # Ensure an active document
-                    doc = FreeCAD.ActiveDocument or FreeCAD.newDocument('Gear')
-                    obj = manager.create_part('gear', doc=doc, **params)
-                    if obj is not None:
-                        try:
-                            import FreeCADGui
-                            FreeCADGui.ActiveDocument = FreeCADGui.getDocument(doc.Name)
-                            obj.ViewObject.Visibility = True
-                            FreeCAD.ActiveDocument.recompute()
-                            FreeCADGui.Selection.clearSelection()
-                            FreeCADGui.Selection.addSelection(obj)
-                            FreeCADGui.updateGui()
-                        except Exception as _:
-                            pass
-                        return {'success': True, 'message': 'Created gear via template manager', 'object': obj}
-                    else:
-                        print('Template manager failed to create gear; falling back to legacy')
-                else:
-                    print(f'Template manager parsed template={template}; falling back to legacy')
-            except Exception as tm_err:
-                print(f'Template manager unavailable or failed: {tm_err}')
-
-            # Legacy fallback (spur-like)
-            # Extract teeth/module/width minimally for legacy path
+            
+            # Extract teeth count
             teeth_match = re.search(r'(\d+)\s*(?:tooth|teeth|toothed)', text, re.IGNORECASE)
             teeth = int(teeth_match.group(1)) if teeth_match else 20
+            
+            # Extract module if specified
             module_match = re.search(r'module\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
             module = float(module_match.group(1)) if module_match else 2.0
-            width_match = re.search(r'width|thickness\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
-            # Fix regex precedence: try width first, then thickness
-            if not width_match:
-                width_match = re.search(r'(?:width|thickness)\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
+            
+            # Extract width if specified
+            width_match = re.search(r'width\s*(\d+(?:\.\d+)?)', text, re.IGNORECASE)
             width = float(width_match.group(1)) if width_match else 10.0
+            
             return self.create_gear(teeth, module, width)
             
         except Exception as e:
             print(f"Error creating gear: {str(e)}")
             traceback.print_exc()
             return {'success': False, 'message': f"Error creating gear: {str(e)}"}
-
+    
     def handle_measure_gear(self, text):
         """Measure last created or selected gear and report key dimensions."""
         try:
-            import FreeCAD as App
-            doc = App.ActiveDocument
+            doc = FreeCAD.ActiveDocument
             if not doc:
                 return {'success': False, 'message': 'No active document'}
-            # Prefer selected object
+            # Prefer selection
+            gear_obj = None
             try:
                 import FreeCADGui
                 sel = FreeCADGui.Selection.getSelection()
+                if sel:
+                    gear_obj = sel[-1]
             except Exception:
-                sel = []
-            candidates = sel if sel else list(reversed(doc.Objects))
-            gear = None
-            for o in candidates:
-                # Skip annotations or objects without a Shape
-                try:
-                    type_id = getattr(o, 'TypeId', '')
-                    if 'Annotation' in type_id:
-                        continue
-                except Exception:
-                    pass
-                shp = getattr(o, 'Shape', None)
-                if shp is None:
-                    continue
-                if hasattr(o, 'num_teeth') or (getattr(o, 'Name', '').lower().startswith('gear') or 'Gear' in getattr(o, 'Label', '')):
-                    gear = o
-                    break
-            if not gear:
-                return {'success': False, 'message': 'No gear-like object found'}
-            # Extract properties with fallbacks
-            def _get(obj, names, default=None):
-                for n in names:
-                    if hasattr(obj, n):
-                        try:
-                            return float(getattr(obj, n))
-                        except Exception:
-                            try:
-                                return int(getattr(obj, n))
-                            except Exception:
-                                pass
-                return default
-            teeth = int(_get(gear, ['num_teeth','teeth','NbTeeth','NumberOfTeeth','z'], 0))
-            module = float(_get(gear, ['module','Module','m'], 0.0) or 0.0)
-            pa = float(_get(gear, ['pressure_angle','PressureAngle','alpha'], 20.0) or 20.0)
-            beta = float(_get(gear, ['helix_angle','HelixAngle','beta','Beta'], 0.0) or 0.0)
-            # Height/width from property or from shape bounding box
-            try:
-                height = float(_get(gear, ['height','Width','Thickness','w'], 0.0))
-                if not height or height <= 0:
-                    height = float(getattr(gear, 'Shape').BoundBox.ZLength)
-            except Exception:
-                height = float(getattr(gear, 'Shape').BoundBox.ZLength)
-            bore = float(_get(gear, ['bore_diameter','axle_holesize'], 0.0) or 0.0)
-            # Compute diameters from module/teeth
-            pd = module * teeth if module and teeth else gear.Shape.BoundBox.DiagonalLength/5.0
-            od = pd + 2*module if module else gear.Shape.BoundBox.XLength
-            rd = pd - 2.5*module if module else max(od - 3*module, 0)
-            hand = 'Left' if beta < 0 else ('Right' if beta > 0 else 'Spur')
-            msg = (
-                f"Measured gear '{gear.Label or gear.Name}':\n"
-                f"- Teeth: {teeth}\n"
-                f"- Module: {module:g}  PA: {pa:g}°  Helix: {beta:g}° ({hand})\n"
-                f"- Pitch Ø: {pd:.2f} mm\n"
-                f"- Outer Ø: {od:.2f} mm\n"
-                f"- Root Ø: {rd:.2f} mm\n"
-                f"- Width: {height:.2f} mm\n"
-                f"- Bore: {bore:.2f} mm"
-            )
+                pass
+            # Fallback: last Gear_* object
+            if not gear_obj:
+                for obj in reversed(doc.Objects):
+                    if obj.Name.startswith('Gear_') or obj.Label.lower().startswith('gear'):
+                        gear_obj = obj
+                        break
+            if not gear_obj or not hasattr(gear_obj, 'Shape'):
+                return {'success': False, 'message': 'No gear found to measure'}
+            bb = gear_obj.Shape.BoundBox
+            od = max(bb.XLength, bb.YLength)
+            width = bb.ZLength
+            msg = f"Gear dimensions — Outer Diameter: {od:.2f} mm, Width: {width:.2f} mm"
             print(msg)
-            return {'success': True, 'message': msg, 'object': gear}
+            return {'success': True, 'message': msg, 'object': gear_obj, 'metrics': {'outer_diameter': od, 'width': width}}
         except Exception as e:
+            print(f"Error measuring gear: {str(e)}")
             traceback.print_exc()
-            return {'success': False, 'message': f'Error measuring gear: {str(e)}'}
+            return {'success': False, 'message': f"Error measuring gear: {str(e)}"}
+
+    def handle_chamfer(self, text):
+        """Handle chamfer commands (apply to selected edges or all edges)."""
+        try:
+            import re
+            # Extract chamfer size
+            size = 1.0
+            m = re.search(r'(?:size|by|of|at)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?', text, re.IGNORECASE)
+            if m:
+                size = float(m.group(1))
+            # Ensure document
+            doc = FreeCAD.ActiveDocument or FreeCAD.newDocument("CADPart")
+            import FreeCADGui
+            sel_ex = FreeCADGui.Selection.getSelectionEx()
+            if not sel_ex:
+                return {'success': False, 'message': 'Select an object or edges to chamfer'}
+            results = []
+            for s in sel_ex:
+                base = s.Object
+                if not base or not hasattr(base, 'Shape'):
+                    continue
+                ch = doc.addObject("Part::Chamfer", f"Chamfer_{base.Name}")
+                ch.Base = base
+                # If edges selected, use them; else all edges
+                edges = []
+                if getattr(s, 'SubElementNames', []):
+                    for name in s.SubElementNames:
+                        if name.startswith('Edge'):
+                            idx = int(name[4:])
+                            edges.append((base, (idx, size, size)))
+                if not edges:
+                    # All edges
+                    for i, _e in enumerate(base.Shape.Edges, start=1):
+                        edges.append((base, (i, size, size)))
+                ch.Edges = edges
+                results.append(ch)
+            doc.recompute()
+            if results:
+                return {'success': True, 'message': f"Created {len(results)} chamfer(s) of {size}mm", 'chamfers': results}
+            return {'success': False, 'message': 'No chamfers were created'}
+        except Exception as e:
+            print(f"Error creating chamfer: {str(e)}")
+            traceback.print_exc()
+            return {'success': False, 'message': f"Error creating chamfer: {str(e)}"}
     
     def create_gear(self, teeth=20, module=2.0, width=10.0):
         """Create a gear with the specified parameters"""
@@ -3813,7 +3650,7 @@ class NaturalLanguageCADEditor:
         """Handle extrusion commands with improved reliability"""
         try:
             print(f"Handling extrusion: {text}")
-            print(f"Debug: ===== EXTRUDE OPERATION START (v2025-08-18-1) =====")
+            print("Debug: ===== EXTRUDE OPERATION START =====")
             
             # Extract distance with better pattern matching
             distance_patterns = [
@@ -3891,89 +3728,26 @@ class NaturalLanguageCADEditor:
                                     if face_index < len(obj.Shape.Faces):
                                         faces.append(obj.Shape.Faces[face_index])
                         
-                        sub_objects = sel_item.SubObjects
-                        print(f"Debug: Found {len(sub_objects)} face(s) to extrude")
-                        # If no face actually selected, infer a face from the single solid (robust for cubes)
-                        if len(sub_objects) == 0 and hasattr(obj, 'Shape') and len(obj.Shape.Faces) > 0:
+                        if faces:
+                            print(f"Debug: Found {len(faces)} face(s) to extrude")
+                            face = faces[0]  # Use the first face
+                            
                             try:
-                                print("Debug: No selected face; attempting face inference from solid")
-                                faces = obj.Shape.Faces
-                                # Prefer largest planar face with normal ~ +Z
-                                import math
-                                def face_area(f):
-                                    try:
-                                        return f.Area
-                                    except Exception:
-                                        return 0.0
-                                def face_normal(f):
-                                    try:
-                                        # sample at face parameter mid-point
-                                        u1,u2,v1,v2 = f.ParameterRange
-                                        mid = f.normalAt((u1+u2)/2.0, (v1+v2)/2.0)
-                                        return mid
-                                    except Exception:
-                                        try:
-                                            return f.Surface.Axis
-                                        except Exception:
-                                            return None
-                                # Score faces: planar first, then alignment with +Z, then area
-                                def score(f):
-                                    planar = int(getattr(getattr(f, 'Surface', None), 'isPlanar', lambda: False)())
-                                    n = face_normal(f)
-                                    align = 0.0
-                                    if n is not None:
-                                        try:
-                                            nz = n.normalize()
-                                            align = max(0.0, min(1.0, nz.z))
-                                        except Exception:
-                                            pass
-                                    return (planar, align, face_area(f))
-                                best = max(faces, key=score)
-                                sub_objects = [best]
-                                print("Debug: Inferred 1 face from solid for extrusion")
-                            except Exception as infer_err:
-                                print(f"Debug: Face inference failed: {infer_err}")
-                        
-                        try:
-                            print("Debug: Attempting direct face extrusion [shape-based]")
-                            vec = FreeCAD.Vector(0,0,distance if direction == 'up' else -distance)
-                            print(f"Debug: Extrusion vector: {vec}")
-                            # Robust path across FreeCAD versions: always extrude the actual Part.Face shape
-                            # Determine a concrete face from either selected subelements or inferred face
-                            face_obj = None
-                            if hasattr(sel_item, 'SubElementNames') and sel_item.SubElementNames:
-                                for sub_name in sel_item.SubElementNames:
-                                    if sub_name.startswith('Face'):
-                                        idx = int(sub_name[4:]) - 1
-                                        if 0 <= idx < len(obj.Shape.Faces):
-                                            face_obj = obj.Shape.Faces[idx]
-                                            break
-                            if face_obj is None:
-                                face_obj = sub_objects[0]
-
-                            extruded_shape = face_obj.extrude(vec)
-                            result_obj = FreeCAD.ActiveDocument.addObject("Part::Feature", f"Extrude_{obj.Label}_{int(distance)}mm")
-                            result_obj.Shape = extruded_shape
-                            FreeCAD.ActiveDocument.recompute()
-                            print(f"Debug: Successfully created face extrusion (shape): {result_obj.Name}")
-
-                            result_obj.ViewObject.Visibility = True
-                            success_count += 1
-                            # Align view and selection for user visibility
-                            try:
-                                if hasattr(FreeCADGui, 'Selection'):
-                                    FreeCADGui.Selection.clearSelection()
-                                    FreeCADGui.Selection.addSelection(result_obj)
-                                if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                                    FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                                    FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                                FreeCADGui.updateGui()
-                            except Exception as _view_err:
-                                print(f"Debug: View alignment after extrude failed: {_view_err}")
-
-                        except Exception as face_err:
-                            print(f"Debug: Direct face extrusion failed: {str(face_err)}")
-                            error_messages.append(f"Face extrusion failed: {str(face_err)}")
+                                print("Debug: Attempting direct face extrusion")
+                                extruded_shape = face.extrude(extrude_vector)
+                                
+                                # Create new object
+                                extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
+                                result_obj = doc.addObject("Part::Feature", extrude_name)
+                                result_obj.Shape = extruded_shape
+                                result_obj.ViewObject.Visibility = True
+                                
+                                print(f"Debug: Successfully created face extrusion: {extrude_name}")
+                                success_count += 1
+                                
+                            except Exception as face_err:
+                                print(f"Debug: Direct face extrusion failed: {str(face_err)}")
+                                error_messages.append(f"Face extrusion failed: {str(face_err)}")
                     
                     # Case 2: Sketch object
                     elif obj.TypeId == "Sketcher::SketchObject":
@@ -4102,17 +3876,9 @@ class NaturalLanguageCADEditor:
         try:
             print(f"Handling fillet: {text}")
             
-            # Extract radius (support: radius X, of X, by X, bare number X)
-            radius = 2.0
-            patterns = [
-                r'(?:radius|of|by)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?',
-                r'\b(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)\b',
-            ]
-            for pat in patterns:
-                m = re.search(pat, text, re.IGNORECASE)
-                if m:
-                    radius = float(m.group(1))
-                    break
+            # Extract radius
+            radius_match = re.search(r'(?:radius|of)\s*(\d+(?:\.\d+)?)\s*(?:mm)?', text, re.IGNORECASE)
+            radius = float(radius_match.group(1)) if radius_match else 2.0
             print(f"Debug: Fillet radius = {radius}mm")
             
             # Check if edges are selected
@@ -4140,64 +3906,28 @@ class NaturalLanguageCADEditor:
             results = []
             for sel_obj in selection:
                 obj = sel_obj.Object
-                print(f"Debug: Processing object for fillet: {obj.Name} (Type: {getattr(obj,'TypeId','?')})")
-                # If selection is an App::Part container, try to resolve to the latest child GeoFeature
-                if getattr(obj, 'TypeId', '').startswith('App::Part') and hasattr(obj, 'Group'):
-                    for child in reversed(list(getattr(obj, 'Group', []))):
-                        if hasattr(child, 'Shape') and hasattr(child.Shape, 'Edges') and len(child.Shape.Edges) > 0:
-                            print(f"Debug: Resolved container '{obj.Name}' to child feature '{child.Name}' for fillet base")
-                            obj = child
-                            break
+                print(f"Debug: Processing object for fillet: {obj.Name}")
                 
                 if not hasattr(obj, 'Shape') or not hasattr(obj.Shape, 'Edges') or len(obj.Shape.Edges) == 0:
                     print(f"Debug: Object {obj.Name} has no edges to fillet")
                     continue
-                
+                    
                 print(f"Debug: Object has {len(obj.Shape.Edges)} edges")
                 
-                # Determine target edges: prioritize explicitly selected edges,
-                # otherwise infer boundary edges from selected faces; as a last
-                # resort, use all edges of the object.
+                # Check if specific edges are selected
                 selected_edges = []
-                face_indices = []
                 if hasattr(sel_obj, 'SubElementNames') and sel_obj.SubElementNames:
                     print(f"Debug: Found {len(sel_obj.SubElementNames)} sub-elements")
                     for sub in sel_obj.SubElementNames:
                         if sub.startswith('Edge'):
                             edge_idx = int(sub.replace('Edge', '')) - 1
-                            if 0 <= edge_idx < len(obj.Shape.Edges):
-                                selected_edges.append(edge_idx)
-                                print(f"Debug: Selected edge {edge_idx}")
-                        elif sub.startswith('Face'):
-                            try:
-                                f_idx = int(sub.replace('Face', '')) - 1
-                                if 0 <= f_idx < len(obj.Shape.Faces):
-                                    face_indices.append(f_idx)
-                            except Exception:
-                                pass
-                # If faces were selected but no explicit edges, use the faces' boundary edges
-                if not selected_edges and face_indices:
-                    try:
-                        obj_edges = obj.Shape.Edges
-                        for f_idx in face_indices:
-                            f_edges = obj.Shape.Faces[f_idx].Edges
-                            for e in f_edges:
-                                for i, base_e in enumerate(obj_edges):
-                                    if e.isSame(base_e):
-                                        if i not in selected_edges:
-                                            selected_edges.append(i)
-                        print(f"Debug: Inferred {len(selected_edges)} edge(s) from selected face(s)")
-                    except Exception as infer_err:
-                        print(f"Debug: Failed inferring edges from faces: {infer_err}")
-                # Final fallback policy: only use ALL edges if explicitly requested in text
+                            selected_edges.append(edge_idx)
+                            print(f"Debug: Selected edge {edge_idx}")
+                
+                # If no specific edges selected, use all edges
                 if not selected_edges:
-                    explicit_all = re.search(r"\b(all\s+edges|entire|all\s+around|every\s+edge)\b", text, re.IGNORECASE)
-                    if explicit_all:
-                        print("Debug: Explicit 'all edges' requested; using all object edges")
-                        selected_edges = list(range(len(obj.Shape.Edges)))
-                    else:
-                        print("Debug: No edges/faces selected; skipping fillet to avoid unpredictable 'all edges' application")
-                        continue
+                    print("Debug: No specific edges selected, using all edges")
+                    selected_edges = list(range(len(obj.Shape.Edges)))
                 
                 if not selected_edges:
                     print(f"Debug: No edges found for object {obj.Name}")
@@ -4213,68 +3943,22 @@ class NaturalLanguageCADEditor:
                     # Add edges to fillet
                     edge_strings = []
                     for edge_idx in selected_edges:
-                        if 0 <= edge_idx < len(obj.Shape.Edges):
+                        if edge_idx < len(obj.Shape.Edges):
                             edge_strings.append((edge_idx+1, radius, radius))
                     
-                    print(f"Debug: Adding {len(edge_strings)} edges to fillet -> {edge_strings}")
+                    print(f"Debug: Adding {len(edge_strings)} edges to fillet")
                     fillet.Edges = edge_strings
                     
-                    # Ensure result is visible and selected (avoid perceived vanish)
-                    try:
-                        fillet.ViewObject.Visibility = True
-                        fillet.ViewObject.DisplayMode = "Flat Lines"
-                        FreeCAD.ActiveDocument.recompute()
-                        if hasattr(FreeCADGui, 'Selection'):
-                            FreeCADGui.Selection.clearSelection()
-                            FreeCADGui.Selection.addSelection(fillet)
-                            if FreeCADGui.ActiveDocument:
-                                FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                                FreeCADGui.updateGui()
-                        print(f"Debug: Highlighted new fillet feature and kept original visible: {obj.Name}")
-                    except Exception as vis_err:
-                        print(f"Debug: Visibility/select error: {str(vis_err)}")
-
-                    # In-place apply: bake fillet result back into the original object to avoid duplicates
-                    try:
-                        FreeCAD.ActiveDocument.recompute()
-                        # Preserve placement to avoid any visual move/rotation
+                    # Hide original object
+                    if hasattr(FreeCADGui, "ActiveDocument") and FreeCADGui.ActiveDocument:
                         try:
-                            _orig_placement = obj.Placement.copy()
-                        except Exception:
-                            _orig_placement = obj.Placement
-                        baked_shape = fillet.Shape.copy()
-                        obj.Shape = baked_shape
-                        try:
-                            obj.Placement = _orig_placement
-                        except Exception:
-                            pass
-                        # Clean up the transient feature
-                        try:
-                            FreeCAD.ActiveDocument.removeObject(fillet.Name)
-                            print(f"Debug: Removed transient fillet feature '{fillet.Name}' and applied in-place")
-                        except Exception as rm_err:
-                            # If removal fails, at least hide it
-                            print(f"Debug: Could not remove fillet feature ({rm_err}), hiding instead")
-                            try:
-                                fillet.ViewObject.Visibility = False
-                            except Exception:
-                                pass
-                        # Reselect the base object
-                        try:
-                            if hasattr(FreeCADGui, 'Selection'):
-                                FreeCADGui.Selection.clearSelection()
-                                FreeCADGui.Selection.addSelection(obj)
-                            if FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                                FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                                FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                            FreeCADGui.updateGui()
-                        except Exception:
-                            pass
-                    except Exception as bake_err:
-                        print(f"Debug: In-place fillet baking failed: {bake_err}")
+                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                            print(f"Debug: Set original object {obj.Name} visibility to False")
+                        except Exception as vis_err:
+                            print(f"Debug: Error setting visibility: {str(vis_err)}")
                     
                     results.append({
-                        'object': obj,
+                        'object': fillet,
                         'radius': radius,
                         'edges': len(edge_strings)
                     })
@@ -4299,167 +3983,6 @@ class NaturalLanguageCADEditor:
             print(f"Error creating fillet: {str(e)}")
             traceback.print_exc()
             return {'success': False, 'message': f"Error creating fillet: {str(e)}"}
-
-    def handle_chamfer(self, text):
-        """Handle chamfer commands with selection-aware edges and robust visibility"""
-        try:
-            print(f"Handling chamfer: {text}")
-            import re
-            # Extract chamfer size (distance)
-            size = 1.0
-            size_patterns = [
-                r'(?:size|distance|offset|of|by)\s*(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)?',
-                r'\b(\d+(?:\.\d+)?)\s*(?:mm|millimeters?)\b',
-            ]
-            for pat in size_patterns:
-                sm = re.search(pat, text, re.IGNORECASE)
-                if sm:
-                    size = float(sm.group(1))
-                    break
-            print(f"Debug: Chamfer size = {size}mm")
-
-            # Get selection or auto-select last object
-            try:
-                selection = FreeCADGui.Selection.getSelectionEx()
-                print(f"Debug: Found {len(selection)} selected objects")
-                if not selection:
-                    doc = FreeCAD.ActiveDocument
-                    if doc and len(doc.Objects) > 0:
-                        last_obj = doc.Objects[-1]
-                        print(f"Debug: Auto-selecting last created object: {last_obj.Name}")
-                        FreeCADGui.Selection.addSelection(last_obj)
-                        selection = FreeCADGui.Selection.getSelectionEx()
-                    else:
-                        return {'success': False, 'message': 'Please select an object or edges first'}
-            except Exception as sel_err:
-                print(f"Debug: Selection error: {str(sel_err)}")
-                return {'success': False, 'message': f'Selection error: {str(sel_err)}'}
-
-            results = []
-            for sel_obj in selection:
-                obj = sel_obj.Object
-                print(f"Debug: Processing object for chamfer: {obj.Name} (Type: {getattr(obj,'TypeId','?')})")
-                # If selection is an App::Part container, resolve to latest child GeoFeature
-                if getattr(obj, 'TypeId', '').startswith('App::Part') and hasattr(obj, 'Group'):
-                    for child in reversed(list(getattr(obj, 'Group', []))):
-                        if hasattr(child, 'Shape') and hasattr(child.Shape, 'Edges') and len(child.Shape.Edges) > 0:
-                            print(f"Debug: Resolved container '{obj.Name}' to child feature '{child.Name}' for chamfer base")
-                            obj = child
-                            break
-                if not hasattr(obj, 'Shape') or not hasattr(obj.Shape, 'Edges') or len(obj.Shape.Edges) == 0:
-                    print(f"Debug: Object {obj.Name} has no edges to chamfer")
-                    continue
-
-                # Determine which edges to chamfer: explicit edges first,
-                # else boundary edges of selected faces, else all edges.
-                selected_edges = []
-                face_indices = []
-                if hasattr(sel_obj, 'SubElementNames') and sel_obj.SubElementNames:
-                    for sub in sel_obj.SubElementNames:
-                        if sub.startswith('Edge'):
-                            idx = int(sub.replace('Edge', '')) - 1
-                            if 0 <= idx < len(obj.Shape.Edges):
-                                selected_edges.append(idx)
-                        elif sub.startswith('Face'):
-                            try:
-                                f_idx = int(sub.replace('Face', '')) - 1
-                                if 0 <= f_idx < len(obj.Shape.Faces):
-                                    face_indices.append(f_idx)
-                            except Exception:
-                                pass
-                if not selected_edges and face_indices:
-                    try:
-                        obj_edges = obj.Shape.Edges
-                        for f_idx in face_indices:
-                            f_edges = obj.Shape.Faces[f_idx].Edges
-                            for e in f_edges:
-                                for i, base_e in enumerate(obj_edges):
-                                    if e.isSame(base_e) and i not in selected_edges:
-                                        selected_edges.append(i)
-                        print(f"Debug: Inferred {len(selected_edges)} edge(s) from selected face(s)")
-                    except Exception as infer_err:
-                        print(f"Debug: Failed inferring edges from faces: {infer_err}")
-                if not selected_edges:
-                    explicit_all = re.search(r"\b(all\s+edges|entire|all\s+around|every\s+edge)\b", text, re.IGNORECASE)
-                    if explicit_all:
-                        print("Debug: Explicit 'all edges' requested; using all object edges")
-                        selected_edges = list(range(len(obj.Shape.Edges)))
-                    else:
-                        print("Debug: No edges/faces selected; skipping chamfer to avoid unpredictable 'all edges' application")
-                        continue
-
-                try:
-                    chamfer_name = f"Chamfer_{obj.Name}"
-                    print(f"Debug: Creating chamfer object {chamfer_name}")
-                    ch = FreeCAD.ActiveDocument.addObject("Part::Chamfer", chamfer_name)
-                    ch.Base = obj
-                    # Build edges list: (edge_index, size1, size2)
-                    edges_payload = [(i+1, size, size) for i in selected_edges if 0 <= i < len(obj.Shape.Edges)]
-                    print(f"Debug: Adding {len(edges_payload)} edges to chamfer -> {edges_payload}")
-                    ch.Edges = edges_payload
-
-                    # Ensure result is visible and selected
-                    try:
-                        ch.ViewObject.Visibility = True
-                        ch.ViewObject.DisplayMode = "Flat Lines"
-                        FreeCAD.ActiveDocument.recompute()
-                        if hasattr(FreeCADGui, 'Selection'):
-                            FreeCADGui.Selection.clearSelection()
-                            FreeCADGui.Selection.addSelection(ch)
-                            if FreeCADGui.ActiveDocument:
-                                FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                                FreeCADGui.updateGui()
-                    except Exception as vis_err:
-                        print(f"Debug: Visibility/select error: {str(vis_err)}")
-
-                    # In-place apply: bake chamfer result back into the original object to avoid duplicates
-                    try:
-                        FreeCAD.ActiveDocument.recompute()
-                        # Preserve placement to avoid any visual move/rotation
-                        try:
-                            _orig_placement = obj.Placement.copy()
-                        except Exception:
-                            _orig_placement = obj.Placement
-                        baked_shape = ch.Shape.copy()
-                        obj.Shape = baked_shape
-                        try:
-                            obj.Placement = _orig_placement
-                        except Exception:
-                            pass
-                        # Remove transient chamfer feature
-                        try:
-                            FreeCAD.ActiveDocument.removeObject(ch.Name)
-                            print(f"Debug: Removed transient chamfer feature '{ch.Name}' and applied in-place")
-                        except Exception as rm_err:
-                            print(f"Debug: Could not remove chamfer feature ({rm_err}), hiding instead")
-                            try:
-                                ch.ViewObject.Visibility = False
-                            except Exception:
-                                pass
-                        # Reselect the base object
-                        try:
-                            if hasattr(FreeCADGui, 'Selection'):
-                                FreeCADGui.Selection.clearSelection()
-                                FreeCADGui.Selection.addSelection(obj)
-                                FreeCADGui.updateGui()
-                        except Exception:
-                            pass
-                    except Exception as bake_err:
-                        print(f"Debug: In-place chamfer baking failed: {bake_err}")
-
-                    results.append({'object': obj, 'size': size, 'edges': len(edges_payload)})
-                    print("Debug: Successfully created chamfer (in-place)")
-                except Exception as ch_err:
-                    print(f"Debug: Error creating chamfer: {str(ch_err)}")
-
-            FreeCAD.ActiveDocument.recompute()
-            if not results:
-                return {'success': False, 'message': 'No chamfers were created'}
-            return {'success': True, 'message': f"Created {len(results)} chamfer(s) of {size}mm", 'chamfers': results}
-        except Exception as e:
-            print(f"Error creating chamfer: {str(e)}")
-            traceback.print_exc()
-            return {'success': False, 'message': f"Error creating chamfer: {str(e)}"}
     
     def should_use_claude(self, text):
         """Determine if Claude should handle this request"""
@@ -4647,26 +4170,6 @@ Please provide a helpful response with specific recommendations or FreeCAD code 
                     else:
                         print("[OK] AXIS 5 DEBUG: FreeCAD code executed successfully - CAD object should be visible in 3D view")
                         print(f"[OK] AXIS 5 DEBUG: Enhanced GUI updates should have been applied for visibility")
-                        # Force isometric view + fit and reselect the most recent object to ensure visibility
-                        try:
-                            doc = FreeCAD.ActiveDocument
-                            if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument and FreeCADGui.ActiveDocument.ActiveView:
-                                FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                                FreeCADGui.ActiveDocument.ActiveView.fitAll()
-                            # Try to select the last created visible object
-                            if doc and hasattr(FreeCADGui, 'Selection') and hasattr(doc, 'Objects'):
-                                last_obj = None
-                                for obj in reversed(doc.Objects):
-                                    if hasattr(obj, 'ViewObject') and getattr(obj.ViewObject, 'Visibility', True):
-                                        last_obj = obj
-                                        break
-                                if last_obj:
-                                    FreeCADGui.Selection.clearSelection()
-                                    FreeCADGui.Selection.addSelection(last_obj)
-                            FreeCADGui.updateGui()
-                            print("[OK] AXIS 5 DEBUG: Forced isometric + fit and reselection applied")
-                        except Exception as _view_err:
-                            print(f"[WARN] AXIS 5 DEBUG: Post-exec view alignment failed: {_view_err}")
                 else:
                     print("❌ AXIS 5 DEBUG: No FreeCAD code received from server")
                 
@@ -5806,8 +5309,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         layout.addLayout(header_layout)
         
         # Add chat history area
-        # Use QTextBrowser so we can render clickable chips inside the chat
-        self.chat_history = QtWidgets.QTextBrowser()
+        self.chat_history = QtWidgets.QTextEdit()
         self.chat_history.setReadOnly(True)
         self.chat_history.setMinimumHeight(300)
         
@@ -5881,13 +5383,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         input_layout.addWidget(self.send_button)
         
         layout.addLayout(input_layout)
-
-        # Connect anchor clicks from chat chips
-        try:
-            self.chat_history.setOpenExternalLinks(False)
-            self.chat_history.anchorClicked.connect(self.on_chat_anchor_clicked)
-        except Exception:
-            pass
         
         # Connect enter key to send message
         self.input_field.installEventFilter(self)
@@ -5913,55 +5408,15 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Add cloud manufacturing features section
         self.add_manufacturing_features_ui(layout)
         
-        # Initial messages are added after we compute status below
+        # Add initial message
+        self.add_system_message("Welcome to the Manufacturing Co-Pilot!")
+        self.add_system_message("Ask questions about manufacturing or CAD design.")
         
-        # Condensed status line (single assistant message)
-        try:
-            cloud_str = "Cloud: Connected" if getattr(self, 'cloud_connected', False) else "Cloud: Disconnected"
-            t2c_str = "Text‑to‑CAD: Unknown"
-            if hasattr(self, 'nl_cad_editor') and hasattr(self.nl_cad_editor, 'text_to_cad'):
-                t2c = self.nl_cad_editor.text_to_cad
-                t2c_str = f"Text‑to‑CAD: {'Connected' if getattr(t2c, 'connected', False) else 'Disconnected'}"
-            provider_str = "LLM: OFF"
-            try:
-                import json, os
-                _macro_dir = os.path.dirname(os.path.abspath(__file__))
-                paths = [
-                    os.path.join(os.path.dirname(_macro_dir), 'cloud_config.json'),
-                    os.path.join(_macro_dir, 'cloud_config.json'),
-                    '/Users/samarjit/CascadeProjects/freecad-cloud-copilot/cloud_config.json'
-                ]
-                for p in paths:
-                    if os.path.exists(p):
-                        with open(p, 'r') as f:
-                            cfg = json.load(f)
-                        llm_cfg = cfg.get('llm', {}) if isinstance(cfg, dict) else {}
-                        if llm_cfg.get('enabled', False):
-                            provider_str = f"LLM: {llm_cfg.get('provider', 'ON')}"
-                        else:
-                            provider_str = "LLM: OFF"
-                        break
-            except Exception:
-                # Fall back to env
-                import os
-                if os.getenv('ANTHROPIC_API_KEY'):
-                    provider_str = "LLM: Claude"
-                elif os.getenv('OPENAI_API_KEY'):
-                    provider_str = "LLM: OpenAI"
-            # 1) Status message first
-            self.add_assistant_message(f"Status — {cloud_str} · {t2c_str} · {provider_str}")
-            # 2) Capability greeting next
-            self.add_assistant_message(
-                "Hi! I'm your manufacturing co‑pilot Axis5. I can create parts, modify geometry, or run DFM analysis. "
-                "I can also create shapes like cubes and cylinders, add fillets/chamfers, extrude sketches, and generate gears. "
-                "What are you working on?")
-            # 3) Inline suggestion chips
-            self.add_suggestion_chips_in_chat()
-        except Exception:
-            pass
-
-        # Pilot flag: acknowledge part only once after first user action
-        self._pilot_part_ack_done = False
+        # Add cloud status message
+        if self.cloud_connected:
+            self.add_system_message(f"Connected to cloud service at {self.cloud_client.api_url}")
+        else:
+            self.add_system_message(f"Failed to connect to cloud service: {self.cloud_client.last_error}")
     
     def eventFilter(self, obj, event):
         """Handle events for input field"""
@@ -5971,49 +5426,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 return True
         return super().eventFilter(obj, event)
     
-    def _workspace_has_part(self):
-        """Return True if any solid exists in the active document."""
-        try:
-            import FreeCAD as App
-            doc = App.ActiveDocument
-            if not doc:
-                return False
-            print(f"DEBUG: _workspace_has_part checking doc='{doc.Label or doc.Name}' with {len(getattr(doc,'Objects',[]) or [])} objects")
-            for obj in getattr(doc, 'Objects', []) or []:
-                try:
-                    shp = getattr(obj, 'Shape', None)
-                    obj_type = getattr(obj, 'TypeId', type(obj).__name__)
-                    if shp and not shp.isNull():
-                        solids_ok = hasattr(shp, 'Solids') and len(shp.Solids) > 0
-                        faces_ok = hasattr(shp, 'Faces') and len(shp.Faces) > 0
-                        try:
-                            vol_ok = float(getattr(shp,'Volume',0.0)) > 0.0
-                        except Exception:
-                            vol_ok = False
-                        if solids_ok or (faces_ok and vol_ok):
-                            print(f"DEBUG: Detected part candidate: {obj.Label or obj.Name} ({obj_type}) | solids={getattr(shp,'Solids',None)} volume={getattr(shp,'Volume',None)}")
-                            return True
-                    # Mesh support
-                    if obj_type.startswith('Mesh') or obj_type == 'Mesh::Feature':
-                        msh = getattr(obj,'Mesh',None)
-                        if msh and hasattr(msh,'CountFacets') and msh.CountFacets > 0:
-                            print(f"DEBUG: Detected mesh part candidate: {obj.Label or obj.Name} facets={msh.CountFacets}")
-                            return True
-                except Exception:
-                    continue
-            # Selection fallback: if any selection present, consider as context
-            try:
-                import FreeCADGui
-                sel = FreeCADGui.Selection.getSelectionEx()
-                if sel:
-                    print(f"DEBUG: Selection present ({len(sel)}); treating as part available")
-                    return True
-            except Exception:
-                pass
-        except Exception:
-            pass
-        return False
-
     def send_message(self):
         """Send a message to the cloud service"""
         message = self.input_field.toPlainText().strip()
@@ -6028,59 +5440,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         
         # Show processing indicator
         self.add_system_message("Processing...")
-
-        # Route explicit DFM/manufacturability requests first (tolerant to spelling/variants)
-        try:
-            lower = message.lower()
-            norm = lower.replace('-', ' ').replace('_', ' ')
-            dfm_intent = (
-                ('dfm' in norm) or
-                ('manufactur' in norm and any(w in norm for w in ['analy', 'analyse', 'check', 'assess', 'evaluate', 'review'])) or
-                ('manufacturability' in norm) or
-                ('problem area' in norm) or ('show problem' in norm) or ('manufacturing issues' in norm)
-            )
-            print(f"DEBUG: DFM intent detected? {dfm_intent} | msg='{message}'")
-            if dfm_intent:
-                has_part = self._workspace_has_part()
-                self.remove_last_processing_message()
-                if has_part:
-                    self.add_assistant_message("Got it — analyzing manufacturability of the current part…")
-                    self.on_dfm_clicked()
-                else:
-                    # As a last resort, run DFM against any preselected sub-shapes if present
-                    try:
-                        import FreeCADGui
-                        if FreeCADGui.Selection.getSelection():
-                            self.add_assistant_message("I don't see a solid body, but you have a selection. I'll run a targeted DFM analysis on the selection…")
-                            self.on_dfm_clicked()
-                            return
-                    except Exception:
-                        pass
-                    self.add_assistant_message("I don't see a part in the workspace. Import a STEP/IGES or create a shape, then I'll run an Advance DFM analysis.")
-                return
-        except Exception:
-            pass
-
-        # Lightweight greeting/engagement handler
-        try:
-            _greet_words = {"hi", "hello", "hey", "hola", "yo", "namaste"}
-            if message.lower() in _greet_words or message.lower().startswith(("hi ", "hello ", "hey ")):
-                self.remove_last_processing_message()
-                self.add_assistant_message("Hi! I'm your manufacturing co‑pilot. I can create parts, modify geometry, or run DFM analysis. What are you working on?")
-                return
-        except Exception:
-            pass
-
-        # Pilot: After first user action, if a part exists, acknowledge once
-        try:
-            if not getattr(self, '_pilot_part_ack_done', False):
-                if self._workspace_has_part():
-                    self.add_system_message("Detected a part in the workspace.")
-                    # Gentle, single follow-up to engage (only when not DFM intent)
-                    self.add_assistant_message("Would you like me to run an Advance DFM analysis, show problem areas, or make a CAD edit?")
-                    self._pilot_part_ack_done = True
-        except Exception:
-            pass
         
         # Try text-to-CAD first (if available)
         if hasattr(self, 'nl_cad_editor') and hasattr(self.nl_cad_editor, 'text_to_cad') and self.nl_cad_editor.text_to_cad.is_text_to_cad_request(message):
@@ -6112,9 +5471,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                                 if FreeCAD.ActiveDocument:
                                     FreeCAD.ActiveDocument.recompute()
                                 if hasattr(FreeCADGui, 'ActiveDocument') and FreeCADGui.ActiveDocument:
-                                    import os
-                                    if os.getenv('AXIS5_FITALL_ON_CREATE', '0') == '1':
-                                        FreeCADGui.ActiveDocument.ActiveView.fitAll()
+                                    FreeCADGui.ActiveDocument.ActiveView.fitAll()
                                 response_text += "\n\n[OK] CAD model generated successfully and visible in 3D view!"
                             except Exception as code_err:
                                 print(f"Error executing Axis 5's FreeCAD code: {str(code_err)}")
@@ -6139,7 +5496,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                             response_text = f"Error: {response['error']}"
                         else:
                             print(f"Debug: Received empty response from cloud: {response}")
-                            response_text = "I couldn't get a reply from the cloud service. I can help you create/modify CAD or run DFM analysis. What would you like to do?"
+                            response_text = "I'm processing your request locally."
                         
                         # Add fallback response
                         self.add_assistant_message(response_text)
@@ -6154,7 +5511,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                         response_text = f"Error: {response['error']}"
                     else:
                         print(f"Debug: Received empty response from cloud: {response}")
-                        response_text = "I couldn't get a reply from the cloud service. I can help you create/modify CAD or run DFM analysis. What would you like to do?"
+                        response_text = "I'm processing your request locally."
                     
                     # Add fallback response
                     self.add_assistant_message(response_text)
@@ -6195,26 +5552,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             # Process command with NL CAD editor
             result = self.nl_cad_editor.process_command(text)
             
-            # Add route badge if available (non-invasive UI info)
-            try:
-                route = result.get('route') if isinstance(result, dict) else None
-                if route:
-                    # Normalize known routes
-                    route_map = {
-                        'text_to_cad_server': 'Text-to-CAD server',
-                        'local_handler': 'Local handler',
-                        'llm_assisted_code': 'LLM-assisted code'
-                    }
-                    route_label = route_map.get(route, route)
-                    self.add_system_message(f"Route: {route_label}")
-                # Indicate if LLM refinement occurred
-                if isinstance(result, dict) and result.get('llm_refined'):
-                    rp = result.get('refined_prompt')
-                    if rp:
-                        self.add_system_message("LLM refined the prompt for clarity")
-            except Exception:
-                pass
-
             if result['success']:
                 # Add success message
                 self.add_system_message(f"[OK] {result['message']}")
@@ -6293,9 +5630,10 @@ class StandaloneCoPilot(QtWidgets.QWidget):
             self.cloud_client.test_connection()
     
     def add_system_message(self, message):
-        """Add a system message to the chat history (shown as Axis 5, no timestamps)"""
+        """Add a system message to the chat history"""
         print(f"DEBUG: add_system_message called with message: {message}")
-        chat_entry = f"<b>Axis 5:</b> {message}"
+        timestamp = datetime.now().strftime("%H:%M")
+        chat_entry = f"<b>[{timestamp}] System:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -6333,9 +5671,10 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         print("DEBUG: No processing message found to remove")
     
     def add_user_message(self, message):
-        """Add a user message to the chat history (no timestamps)"""
+        """Add a user message to the chat history"""
         print(f"DEBUG: add_user_message called with message: {message}")
-        chat_entry = f"<b>You:</b> {message}"
+        timestamp = datetime.now().strftime("%H:%M")
+        chat_entry = f"<b>[{timestamp}] You:</b> {message}"
         
         # Initialize chat_entries as a list if it doesn't exist
         if not hasattr(self, 'chat_entries') or self.chat_entries is None:
@@ -6353,9 +5692,10 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self._update_chat_display()
     
     def add_assistant_message(self, message):
-        """Add an assistant message to the chat history (no timestamps)"""
+        """Add an assistant message to the chat history"""
         print(f"DEBUG: add_assistant_message called with message length: {len(message)}")
-        chat_entry = f"<b>Axis 5:</b> {message}"
+        timestamp = datetime.now().strftime("%H:%M")
+        chat_entry = f"<b>[{timestamp}] Axis 5:</b> {message}"
         print(f"DEBUG: Adding entry to chat_entries, length: {len(chat_entry)}")
         
         # Initialize chat_entries as a list if it doesn't exist
@@ -6388,8 +5728,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                 print(f"DEBUG: Converting chat_entries from {type(self.chat_entries)} to list")
                 self.chat_entries = [str(self.chat_entries)]
             
-            # Check if chat_history attribute exists and is a QTextEdit/QTextBrowser widget
-            if hasattr(self, 'chat_history') and isinstance(self.chat_history, (QtWidgets.QTextEdit, QtWidgets.QTextBrowser)):
+            # Check if chat_history attribute exists and is a QTextEdit widget
+            if hasattr(self, 'chat_history') and isinstance(self.chat_history, QtWidgets.QTextEdit):
                 print("DEBUG: chat_history is a QTextEdit widget")
                 print(f"DEBUG: Found {len(self.chat_entries)} chat entries")
                 
@@ -6528,50 +5868,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         
         # Set a random suggestion in the input field
         self.input_field.setText(random.choice(suggestions))
-        
-    # ---------- Quick actions handlers (chips under input) ----------
-    def on_quick_create_cube(self):
-        try:
-            # Insert a simple prompt and send through normal pipeline
-            self.input_field.setText("create a 20 mm cube")
-            self.send_message()
-        except Exception as e:
-            self.add_system_message(f"Couldn't start cube creation: {e}")
-    
-    def on_quick_dfm(self):
-        try:
-            if hasattr(self, 'on_dfm_clicked'):
-                self.on_dfm_clicked()
-            else:
-                self.add_system_message("DFM feature not available in this build.")
-        except Exception as e:
-            self.add_system_message(f"Couldn't start DFM analysis: {e}")
-    
-    def on_quick_show_problems(self):
-        try:
-            if hasattr(self, 'on_show_problems_clicked'):
-                self.on_show_problems_clicked()
-            else:
-                self.add_system_message("Show Problem Areas feature not available in this build.")
-        except Exception as e:
-            self.add_system_message(f"Couldn't show problem areas: {e}")
-    
-    def on_quick_import(self):
-        try:
-            dlg = QtWidgets.QFileDialog()
-            dlg.setNameFilter("STEP/IGES Files (*.step *.stp *.iges *.igs)")
-            if dlg.exec_():
-                files = dlg.selectedFiles()
-                if files:
-                    path = files[0]
-                    try:
-                        import ImportGui
-                        ImportGui.open(path)
-                    except Exception:
-                        FreeCAD.openDocument(path)
-                    self.add_assistant_message("Imported file. Want me to run an Advance DFM analysis or show problem areas?")
-        except Exception as e:
-            self.add_system_message(f"Couldn't import file: {e}")
     
     def on_clear_clicked(self):
         """Handle clear button click"""
@@ -6770,34 +6066,19 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     design_issues = data.get('design_issues', [])
                     print(f"DEBUG: Found {len(design_issues)} design_issues: {design_issues}")
                     
-                    # Filter placeholder messages from cloud
-                    placeholders = [
-                        'Unable to perform detailed analysis',
-                        'No detailed analysis available',
-                    ]
-                    def _is_placeholder(desc:str):
-                        dl = desc.lower()
-                        return any(p.lower() in dl for p in placeholders)
-                    
-                    filtered_di = []
+                    # Convert design_issues to our format
                     for issue in design_issues:
                         if isinstance(issue, str):
-                            if _is_placeholder(issue):
-                                print("DEBUG: Dropping placeholder design_issue")
-                                continue
-                            filtered_di.append({'severity':'medium','description':issue})
+                            print(f"DEBUG: Converting string issue: {issue}")
+                            issues.append({
+                                'severity': 'medium',
+                                'description': issue
+                            })
                         elif isinstance(issue, dict):
-                            desc = str(issue.get('description',''))
-                            if _is_placeholder(desc):
-                                print("DEBUG: Dropping placeholder design_issue dict")
-                                continue
-                            filtered_di.append(issue)
+                            print(f"DEBUG: Adding dict issue: {issue}")
+                            issues.append(issue)
                     
-                    # Append filtered issues
-                    for fi in filtered_di:
-                        issues.append(fi)
-                    
-                    print(f"DEBUG: Converted {len(filtered_di)} filtered design_issues to issues format")
+                    print(f"DEBUG: Converted {len(issues)} design_issues to issues format")
                 elif 'design_issues' in data:
                     print(f"DEBUG: Skipping design_issues conversion - already have {len(issues)} issues")
                 else:
