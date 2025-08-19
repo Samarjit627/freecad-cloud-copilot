@@ -630,7 +630,7 @@ class DFMSelectionObserver:
                             
                             # Enhanced tooltip with better formatting
                             tooltip_text = f"""<div style='background-color: #ffffcc; padding: 8px; border: 2px solid #ff6600; border-radius: 4px;'>
-<b style='color: #cc0000;'>🔍 DFM Manufacturing Issue</b><br/>
+<b style='color: #cc0000;'>[DFM] Manufacturing Issue</b><br/>
 <span style='color: #000000;'>{issue_description}</span><br/>
 <i style='color: #666666; font-size: 10px;'>Click for details in Manufacturing Issues section</i>
 </div>"""
@@ -708,7 +708,7 @@ class DFMSelectionObserver:
                             print("DEBUG: Detailed DFM issue info added to chat interface")
                         else:
                             # Fallback message
-                            self.task_panel.add_system_message(f"🔍 **Selected DFM Issue:** {issue_description}")
+                            self.task_panel.add_system_message(f"[DFM] **Selected DFM Issue:** {issue_description}")
                             print("DEBUG: Basic DFM issue info added to chat interface")
                 except Exception as chat_e:
                     print(f"DEBUG: Failed to show issue in chat interface: {chat_e}")
@@ -790,11 +790,11 @@ class ManufacturingFeatureManager:
                     )
                     
                     if has_insufficient_analysis:
-                        print("🔄 Cloud DFM returned insufficient analysis, using comprehensive geometric analysis...")
+                        print("Cloud DFM returned insufficient analysis, using comprehensive geometric analysis...")
                         
                         try:
                             # DIRECT COMPREHENSIVE GEOMETRIC ANALYSIS
-                            print("🔍 Performing comprehensive geometric analysis...")
+                            print("[ANALYZE] Performing comprehensive geometric analysis...")
                             
                             # Extract CAD data for analysis
                             cad_data = extract_cad_data_for_features()
@@ -2325,7 +2325,7 @@ class ManufacturingFeatureManager:
     def _perform_comprehensive_geometric_analysis(self):
         """Perform comprehensive geometric analysis and return detected issues"""
         try:
-            print("🔍 Starting comprehensive geometric analysis...")
+            print("[ANALYZE] Starting comprehensive geometric analysis...")
             
             # Get active document
             doc = FreeCAD.ActiveDocument
@@ -4153,16 +4153,16 @@ Please provide a helpful response with specific recommendations or FreeCAD code 
             # Execute the FreeCAD code to actually create the CAD object and make it visible - AXIS 5 DEBUG
             if result.get("success", False):
                 freecad_code = result.get("freecad_code", "")
-                print(f"🔍 AXIS 5 DEBUG: Got FreeCAD code with length: {len(freecad_code)}")
+                print(f"AXIS 5 DEBUG: Got FreeCAD code with length: {len(freecad_code)}")
                 if freecad_code:
-                    print(f"🔍 AXIS 5 DEBUG: About to execute FreeCAD code via enhanced execute_freecad_code")
-                    print(f"🔍 AXIS 5 DEBUG: First 200 chars of code: {freecad_code[:200]}...")
+                    print(f"AXIS 5 DEBUG: About to execute FreeCAD code via enhanced execute_freecad_code")
+                    print(f"AXIS 5 DEBUG: First 200 chars of code: {freecad_code[:200]}...")
                     
                     execution_result = self.text_to_cad.execute_freecad_code(freecad_code)
-                    print(f"🔍 AXIS 5 DEBUG: Execution result: {execution_result}")
+                    print(f"AXIS 5 DEBUG: Execution result: {execution_result}")
                     
                     if not execution_result.get("success", False):
-                        print(f"❌ AXIS 5 DEBUG: Failed to execute FreeCAD code: {execution_result.get('error', 'Unknown error')}")
+                        print(f"AXIS 5 DEBUG [ERROR]: Failed to execute FreeCAD code: {execution_result.get('error', 'Unknown error')}")
                         return {
                             "success": False,
                             "message": f"Failed to execute CAD code: {execution_result.get('error', 'Unknown error')}"
@@ -5787,7 +5787,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     return
                 
                 # Run full DFM analysis with professional overlays
-                self.add_assistant_message(f"🔍 Analyzing {object_count} objects in '{doc_name}' for manufacturing issues...")
+                self.add_assistant_message(f"Analyzing {object_count} objects in '{doc_name}' for manufacturing issues...")
                 
                 # Run DFM analysis using the manufacturing feature manager
                 result = self.mfg_feature_manager.analyze_dfm(
@@ -5803,9 +5803,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     score = data.get('manufacturability_score', 0)
                     
                     self.add_assistant_message(f"[OK] DFM Analysis Complete!\n\n"
-                                             f"📊 Manufacturability Score: {score}/100\n"
-                                             f"🔍 Found {len(issues)} manufacturing issues\n\n"
-                                             f"🎯 **Professional overlays with tooltips are now active!**\n"
+                                             f"Manufacturability Score: {score}/100\n"
+                                             f"Found {len(issues)} manufacturing issues\n\n"
+                                             f"**Professional overlays with tooltips are now active!**\n"
                                              f"• **Hover** over colored areas to see issue details\n"
                                              f"• **Click** on overlays to pin/unpin tooltips\n"
                                              f"• Overlays automatically follow object movements")
