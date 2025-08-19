@@ -3759,6 +3759,7 @@ class NaturalLanguageCADEditor:
             # Process the selection
             success_count = 0
             error_messages = []
+            results = []
             
             for sel_item in selection:
                 try:
@@ -3771,156 +3772,98 @@ class NaturalLanguageCADEditor:
                     if hasattr(sel_item, 'SubObjects') and sel_item.SubObjects:
                         print(f"Debug: Found {len(sel_item.SubObjects)} sub-objects")
                         
-                        # Look for faces in the selection using proper FreeCAD API
+                        # Gather faces selected on this object
                         faces = []
-                        if hasattr(sel_item, 'SubElementNames'):
+                        if hasattr(sel_item, 'SubElementNames') and hasattr(obj, 'Shape') and obj.Shape:
                             for sub_name in sel_item.SubElementNames:
                                 if sub_name.startswith('Face'):
-                                    # Get face index and extract the actual face from the shape
-                                    face_index = int(sub_name[4:]) - 1
-                                    if face_index < len(obj.Shape.Faces):
-                                        faces.append(obj.Shape.Faces[face_index])
+                                    idx = int(sub_name[4:]) - 1
+                                    if 0 <= idx < len(obj.Shape.Faces):
+                                        faces.append(obj.Shape.Faces[idx])
                         
-                        if faces:
+                        if not faces:
+                            print("Debug: No faces resolved from selection; skipping face-extrude path")
+                        else:
                             print(f"Debug: Found {len(faces)} face(s) to extrude")
-                            face = faces[0]  # Use the first face
+                            # Create extrusions for faces
+                            extruded_parts = []
+                            for f in faces:
+                                try:
+                                    extruded_parts.append(f.extrude(extrude_vector))
+                                except Exception as face_err:
+                                    print(f"Debug: Face extrusion failed: {face_err}")
+                                    error_messages.append(f"Face extrusion failed on {obj.Name}: {face_err}")
+                            
+                            created_objs = []
+                            fused_done = False
+                            fused_shape = None
+                            # Try to fuse with base solid to behave like PAD
+                            if hasattr(obj, 'Shape') and obj.Shape and obj.Shape.Solids and extruded_parts:
+                                try:
+                                    fused_shape = obj.Shape.copy()
+                                    for p in extruded_parts:
+                                        fused_shape = fused_shape.fuse(p)
+                                    fused_done = True
+                                except Exception as fuse_err:
+                                    print(f"Debug: Fuse after face extrude failed on {obj.Name}: {fuse_err}")
+                                    fused_done = False
+                                    fused_shape = None
                             
                             try:
-                                print("Debug: Attempting direct face extrusion")
-                                extruded_shape = face.extrude(extrude_vector)
-                                
-                                # Create new object
-                                extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
-                                result_obj = doc.addObject("Part::Feature", extrude_name)
-                                result_obj.Shape = extruded_shape
-                                result_obj.ViewObject.Visibility = True
-                                # Hide source object to avoid duplicate visual
-                                try:
-                                    if FreeCADGui.ActiveDocument:
-                                        FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
-                                except Exception as _vis_err:
-                                    print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
-                                
-                                print(f"Debug: Successfully created face extrusion: {extrude_name}")
-                                success_count += 1
-                                
-                            except Exception as face_err:
-                                print(f"Debug: Direct face extrusion failed: {str(face_err)}")
-                                error_messages.append(f"Face extrusion failed: {str(face_err)}")
-                    
-                    # Case 2: Sketch object
-                    elif obj.TypeId == "Sketcher::SketchObject":
-                        print("Debug: Processing sketch object")
-                        try:
-                            # Try to create a face from the sketch and extrude it
-                            sketch_wires = obj.Shape.Wires
-                            if sketch_wires:
-                                wire = sketch_wires[0]
-                                if wire.isClosed():
-                                    face = Part.Face(wire)
-                                    extruded_shape = face.extrude(extrude_vector)
-                                    
-                                    extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
-                                    result_obj = doc.addObject("Part::Feature", extrude_name)
-                                    result_obj.Shape = extruded_shape
-                                    result_obj.ViewObject.Visibility = True
-                                    # Hide source sketch container if appropriate
-                                    try:
-                                        if FreeCADGui.ActiveDocument:
-                                            FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
-                                    except Exception as _vis_err:
-                                        print(f"Debug: Could not hide source sketch {obj.Name}: {_vis_err}")
-                                    
-                                    print(f"Debug: Successfully created sketch extrusion: {extrude_name}")
-                                    success_count += 1
+                                if fused_done and fused_shape and fused_shape.isValid():
+                                    name = f"ExtrudeFuse_{obj.Name}_{int(abs(distance))}mm"
+                                    feat = doc.addObject("Part::Feature", name)
+                                    feat.Shape = fused_shape
+                                    created_objs.append(feat)
                                 else:
-                                    error_messages.append(f"Sketch {obj.Name} is not closed")
-                            else:
-                                error_messages.append(f"Sketch {obj.Name} has no wires")
-                                
-                        except Exception as sketch_err:
-                            print(f"Debug: Sketch processing failed: {str(sketch_err)}")
-                            error_messages.append(f"Sketch processing failed: {str(sketch_err)}")
-                    
-                    # Case 3: Objects with faces (try to extrude the largest face)
-                    elif hasattr(obj, 'Shape') and obj.Shape.Faces:
-                        print("Debug: Processing object with faces")
-                        try:
-                            # Get the largest face (most likely the one to extrude)
-                            largest_face = max(obj.Shape.Faces, key=lambda f: f.Area)
-                            print("Debug: Attempting clean face extrusion")
+                                    # Fall back to separate features
+                                    for idx, part in enumerate(extruded_parts, 1):
+                                        name = f"Extrude_{obj.Name}_{int(abs(distance))}mm_{idx}"
+                                        ext_obj = doc.addObject("Part::Feature", name)
+                                        ext_obj.Shape = part
+                                        created_objs.append(ext_obj)
+                            except Exception as add_err:
+                                print(f"Debug: Failed adding extrude feature(s): {add_err}")
+                                error_messages.append(f"Failed adding extrude feature(s) for {obj.Name}: {add_err}")
+                            
+                            # Hide source for visual clarity
                             try:
-                                # Create a clean copy of the face to avoid corruption
-                                face_copy = largest_face.copy()
-                                
-                                # Create extrusion using proper FreeCAD extrude method
-                                extruded_shape = face_copy.extrude(extrude_vector)
-                                
-                                # Ensure the shape is valid
-                                if not extruded_shape.isValid():
-                                    print("Debug: Invalid extruded shape, attempting to fix")
-                                    extruded_shape = extruded_shape.fix()
-                                
-                                extrude_name = f"Extrude_{obj.Name}_{int(abs(distance))}mm"
-                                result_obj = doc.addObject("Part::Feature", extrude_name)
-                                result_obj.Shape = extruded_shape
-                                
-                                # Ensure object is visible and properly rendered
-                                result_obj.ViewObject.Visibility = True
-                                result_obj.ViewObject.DisplayMode = "Flat Lines"  # Clean display mode
-                                # Hide source object to avoid duplicate visual
-                                try:
-                                    if FreeCADGui.ActiveDocument:
-                                        FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
-                                except Exception as _vis_err:
-                                    print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
-                                
-                                # Make the extruded object more visible
-                                try:
-                                    result_obj.ViewObject.ShapeColor = (0.0, 0.8, 0.0)  # Green color
-                                    result_obj.ViewObject.Transparency = 20  # Slightly transparent
-                                    
-                                    # Force document recompute
-                                    doc.recompute()
-                                    
-                                    # Clear selection and select the new object
-                                    FreeCADGui.Selection.clearSelection()
-                                    FreeCADGui.Selection.addSelection(result_obj)
-                                    
-                                    # Force view update
-                                    FreeCADGui.updateGui()
-                                except:
-                                    pass
-                                
-                                print(f"Debug: Successfully created clean face extrusion: {extrude_name}")
+                                if FreeCADGui.ActiveDocument:
+                                    FreeCADGui.ActiveDocument.getObject(obj.Name).Visibility = False
+                            except Exception as _vis_err:
+                                print(f"Debug: Could not hide source object {obj.Name}: {_vis_err}")
+                            
+                            # Accumulate
+                            if created_objs:
+                                if 'results' not in locals():
+                                    results = []
+                                results.extend(created_objs)
                                 success_count += 1
-                            
-                            except Exception as face_err:
-                                print(f"Debug: Face extrusion failed: {str(face_err)}")
-                                error_messages.append(f"Face extrusion failed: {str(face_err)}")
-                            
-                        except Exception as obj_err:
-                            print(f"Debug: Object face extrusion failed: {str(obj_err)}")
-                            error_messages.append(f"Object extrusion failed: {str(obj_err)}")
+                                print(f"Debug: Successfully created face extrusion: {created_objs[0].Name}")
+                            continue
+                except Exception as err:
+                    print(f"Debug: Direct face extrusion failed on {obj.Name}: {err}")
                     
-                    else:
-                        error_messages.append(f"Object {obj.Name} cannot be extruded (type: {obj.TypeId})")
-                    
-                except Exception as item_err:
-                    print(f"Debug: Error processing selection item: {str(item_err)}")
-                    error_messages.append(f"Processing error: {str(item_err)}")
-            
-            # Recompute document
-            doc.recompute()
+                success_count += 1
+                
+            # Recompute and update view/selection
+            try:
+                doc.recompute()
+            except Exception:
+                pass
 
-            # Update view
-            if FreeCADGui.ActiveDocument:
-                try:
-                    FreeCADGui.ActiveDocument.ActiveView.viewAxometric()
-                    FreeCADGui.updateGui()
-                except:
-                    pass  # View update is not critical
-            
+            try:
+                if FreeCADGui.ActiveDocument and results:
+                    FreeCADGui.Selection.clearSelection()
+                    for r in results:
+                        try:
+                            FreeCADGui.ActiveDocument.getObject(r.Name).Visibility = True
+                        except Exception:
+                            pass
+                        FreeCADGui.Selection.addSelection(r)
+            except Exception:
+                pass
+
             # Return results
             if success_count > 0:
                 message = f"Successfully extruded {success_count} item(s) by {distance}mm {direction}"
@@ -3929,7 +3872,7 @@ class NaturalLanguageCADEditor:
                 
                 print(f"Debug: {message}")
                 print("Debug: ===== EXTRUDE OPERATION COMPLETE =====")
-                return {'success': True, 'message': message}
+                return {'success': True, 'message': message, 'extrusions': results}
             else:
                 error_summary = "; ".join(error_messages) if error_messages else "Unknown error"
                 print(f"Debug: No extrusions created. Errors: {error_summary}")
