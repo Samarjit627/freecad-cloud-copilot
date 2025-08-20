@@ -68,6 +68,25 @@ Users can select multiple agents to collaborate on complex manufacturing queries
 
 The system provides intelligent fallback responses when cloud connectivity is unavailable, ensuring continuity of service.
 
+## Custom BOM Window (Checkpoint 8)
+
+The macro includes a custom, floating Bill of Materials (BOM) window with Indian market costing in INR.
+
+How to use:
+
+- **Open BOM**: Click the `BOM` button in the task panel.
+- **Quantity prompt**: A dialog asks for your required production quantity. This seeds the BOM's amortization quantity for tooling-based processes (e.g., injection molding).
+- **Per-row selections**: In the BOM table, each part row has dropdowns for **Process** and **Material**.
+- **Live costs**: Unit and extended costs update immediately when you change process/material or amortization quantity.
+- **Cost breakdown**: Hover any cell to see a detailed per-row breakdown (cycle time, material, scrap, tooling amortization, setup, etc.). The same text appears in the Notes column.
+- **Per-unit at quantity**: The bottom panel shows a “Per-Unit at Qty” figure derived from the grand total divided by the selected quantity.
+- **Exports**: Use buttons to export the BOM to CSV/XLSX.
+
+Notes:
+
+- Tooling costs are amortized by the “Amortization Quantity” shown in the BOM window; it defaults to your entered quantity but can be adjusted at any time.
+- Pricing, densities, and process parameters are configurable in `pricing_in.json`.
+
 ## Development
 
 This project is structured to allow for incremental improvements while maintaining compatibility with the existing functionality.
