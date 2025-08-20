@@ -865,10 +865,10 @@ class ManufacturingFeatureManager:
                                         result['data'] = data
                                 except Exception:
                                     pass
-                                
+                        
                         except Exception as local_e:
                             print(f"Enhanced local DFM analysis error: {str(local_e)}")
-                            # Also sanitize cloud result to avoid showing the generic placeholder
+                            # Sanitize cloud result to avoid showing the generic placeholder
                             try:
                                 data = result.get('data', {})
                                 issues = list(data.get('design_issues', []) or [])
@@ -880,26 +880,53 @@ class ManufacturingFeatureManager:
                                 result['data'] = data
                             except Exception:
                                 pass
-                
-                self.last_dfm_result = result
-                return result
-            # Otherwise use cloud functions if available
-            elif _CLOUD_FUNCTIONS_AVAILABLE:
-                result = analyze_dfm(manufacturing_process, material, production_volume)
-                self.last_dfm_result = result
-                return result
-            # Fall back to direct API call
-            else:
-                payload = {
-                    "manufacturing_process": manufacturing_process,
-                    "material": material,
-                    "production_volume": production_volume,
-                    "advanced_analysis": advanced_analysis,
-                    "cad_data": extract_cad_data_for_features()
-                }
-                result = call_feature("dfm_analysis", payload)
-                self.last_dfm_result = result
-                return result
+                        
+                        # NEW: If cloud reported success but returned zero issues, try local comprehensive analysis
+                        try:
+                            # Determine issue count from any known fields
+                            issues_list = []
+                            if isinstance(data.get('issues'), list):
+                                issues_list = data.get('issues')
+                            elif isinstance(data.get('manufacturing_issues'), list):
+                                issues_list = data.get('manufacturing_issues')
+                            elif isinstance(data.get('design_issues'), list):
+                                issues_list = data.get('design_issues')
+                            if len(issues_list) == 0:
+                                print("DEBUG: Cloud DFM returned 0 issues; attempting local comprehensive analysis to augment result...")
+                                geometric_issues = self._perform_comprehensive_geometric_analysis()
+                                if geometric_issues and len(geometric_issues) > 0:
+                                    enhanced_result = self._create_geometric_dfm_result(
+                                        cloud_result=result,
+                                        geometric_issues=geometric_issues,
+                                        manufacturing_process=manufacturing_process,
+                                        material=material,
+                                        production_volume=production_volume
+                                    )
+                                    print(f"[OK] Augmented cloud result with {len(geometric_issues)} local geometric issues")
+                                    self.last_dfm_result = enhanced_result
+                                    return enhanced_result
+                        except Exception as _augment_err:
+                            print(f"DEBUG: Failed to augment zero-issue cloud result with local analysis: {_augment_err}")
+                    
+                    self.last_dfm_result = result
+                    return result
+                # Otherwise use cloud functions if available
+                elif _CLOUD_FUNCTIONS_AVAILABLE:
+                    result = analyze_dfm(manufacturing_process, material, production_volume)
+                    self.last_dfm_result = result
+                    return result
+                # Fall back to direct API call
+                else:
+                    payload = {
+                        "manufacturing_process": manufacturing_process,
+                        "material": material,
+                        "production_volume": production_volume,
+                        "advanced_analysis": advanced_analysis,
+                        "cad_data": extract_cad_data_for_features()
+                    }
+                    result = call_feature("dfm_analysis", payload)
+                    self.last_dfm_result = result
+                    return result
                 
         except Exception as e:
             print(f"Error in DFM analysis: {str(e)}")
