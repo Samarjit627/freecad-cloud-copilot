@@ -3340,6 +3340,23 @@ class NaturalLanguageCADEditor:
             print(f"Error initializing Text-to-CAD integration: {str(e)}")
             self.text_to_cad = None
         
+        # Read feature flags (non-breaking; defaults keep current behavior)
+        self.sheet_metal_enabled = False
+        # Internal guard to prevent repeated async retries
+        self._sm_async_retry_inflight = False
+        # Internal guard for auto-reopen watcher
+        self._sm_restore_chat_pending = False
+        try:
+            with open(config_path, 'r') as _cfgf:
+                _cfg = json.load(_cfgf)
+                self.sheet_metal_enabled = bool(
+                    (_cfg.get('features') or {}).get('sheet_metal_enabled', False)
+                )
+                print(f"SheetMetal feature flag: {self.sheet_metal_enabled}")
+        except Exception as _cfg_e:
+            # Keep default False silently to avoid disturbing behavior
+            pass
+
         # Initialize Claude/Anthropic integration
         self.anthropic_client = None
         self.claude_available = False
@@ -3399,6 +3416,14 @@ class NaturalLanguageCADEditor:
             print(f"Debug: Detected chamfer command: {text}")
             return self.handle_chamfer(text)
         
+        # Feature-flagged SheetMetal routing (non-invasive)
+        if self.sheet_metal_enabled and self._sheet_metal_intent(text_lower):
+            try:
+                return self._route_sheet_metal(text)
+            except Exception as _sm_e:
+                print(f"SheetMetal routing error (ignored, falling back): {_sm_e}")
+
+        
         # If not a native handler, consider Text-to-CAD sidecar next
         if self.text_to_cad and self.text_to_cad.is_text_to_cad_request(text):
             return self.handle_text_to_cad_request(text)
@@ -3420,6 +3445,169 @@ class NaturalLanguageCADEditor:
         
         # Default to create handler if no match
         return self.handle_create(text)
+
+    # ---------- SheetMetal integration (feature-flagged, minimal) ----------
+    def _sheet_metal_intent(self, text_lower: str) -> bool:
+        """Lightweight intent check to avoid disturbing existing routing."""
+        keywords = (
+            'sheet metal', 'sheet-metal', 'sheetmetal',
+            'base wall', 'base flange', 'flange', 'bend', 'fold',
+            'cutout', 'slot', 'unfold', 'flatten', 'flat pattern', 'thickness'
+        )
+        return any(k in text_lower for k in keywords)
+
+    def _route_sheet_metal(self, text: str):
+        """Lazy-load the standalone SheetMetal macro and execute its processor.
+        Non-breaking: if anything fails, raise to caller to fall back.
+        """
+        import importlib.util, importlib.machinery
+        this_dir = os.path.dirname(os.path.abspath(__file__))
+        target = os.path.join(this_dir, 'macro', 'SheetMetalCoPilot.FCMacro')
+        if not os.path.exists(target):
+            raise FileNotFoundError('SheetMetalCoPilot.FCMacro not found at macro/SheetMetalCoPilot.FCMacro')
+
+        loader = importlib.machinery.SourceFileLoader('SheetMetalCoPilot_impl', target)
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        mod = importlib.util.module_from_spec(spec)
+        loader.exec_module(mod)
+
+        if hasattr(mod, 'sheetmetal_process_command'):
+            ctx = None
+            try:
+                ctx = self.context.get_context() if hasattr(self, 'context') else None
+            except Exception:
+                ctx = None
+            res = mod.sheetmetal_process_command(text, ctx)
+            # If SheetMetal asks us to close our own task panel and retry, schedule a deferred close-and-retry
+            # so we don't close during the current UI event. This avoids Qt crashes.
+            try:
+                if isinstance(res, dict) and res.get('code') == 'RETRY_AFTER_CLOSE':
+                    self._schedule_close_copilot_and_retry(text)
+                    # Inform the user and return immediately; actual retry happens asynchronously
+                    try:
+                        FreeCAD.Console.PrintMessage("Main Co-Pilot: Closing chat panel safely and retrying SheetMetal...\n")
+                    except Exception:
+                        pass
+                    return {"success": False, "message": "Closing Co-Pilot panel and retrying SheetMetal...", "code": "RETRY_SCHEDULED"}
+            except Exception as _route_retry_e:
+                print(f"SheetMetal route retry handler error: {_route_retry_e}")
+            # Provide user feedback in console; return the result dict to caller
+            try:
+                FreeCAD.Console.PrintMessage(f"SheetMetal: {res}\n")
+            except Exception:
+                pass
+            return res
+        else:
+            raise RuntimeError('sheetmetal_process_command() not found in SheetMetalCoPilot macro')
+
+    def _schedule_close_copilot_and_retry(self, text: str):
+        """Close our own task panel asynchronously and retry the SheetMetal command safely."""
+        if self._sm_async_retry_inflight:
+            return
+        self._sm_async_retry_inflight = True
+        try:
+            from PySide2 import QtCore
+            def _do_close_and_retry():
+                try:
+                    import FreeCADGui
+                    # Attempt to close only if the active dialog is our Co-Pilot panel, or if API returns a truthy value
+                    try:
+                        active_dlg = None
+                        if hasattr(FreeCADGui, 'Control') and hasattr(FreeCADGui.Control, 'activeDialog'):
+                            active_dlg = FreeCADGui.Control.activeDialog()
+                        # Close if bool (FreeCAD bug) or our panel type name
+                        should_close = False
+                        if isinstance(active_dlg, bool):
+                            should_close = bool(active_dlg)
+                        else:
+                            tname = type(active_dlg).__name__ if active_dlg is not None else ''
+                            should_close = (tname == 'StandaloneCoPilotTaskPanel')
+                        if should_close and hasattr(FreeCADGui, 'Control') and hasattr(FreeCADGui.Control, 'closeDialog'):
+                            FreeCADGui.Control.closeDialog()
+                            # Proactively clear our singleton to avoid stale/deleted Qt object reference
+                            try:
+                                globals_dict = globals()
+                                if '_STANDALONE_INSTANCE' in globals_dict:
+                                    globals_dict['_STANDALONE_INSTANCE'] = None
+                                    print("DEBUG: Cleared _STANDALONE_INSTANCE after closing chat panel")
+                            except Exception as _gerr:
+                                print(f"DEBUG: Failed clearing singleton after close: {_gerr}")
+                    except Exception as _close_err:
+                        print(f"DEBUG: Async close of Co-Pilot panel failed: {_close_err}")
+                    # Retry SheetMetal after a short delay to ensure panel is closed
+                    def _retry_sheetmetal():
+                        try:
+                            self._route_sheet_metal(text)
+                        finally:
+                            self._sm_async_retry_inflight = False
+                    QtCore.QTimer.singleShot(150, _retry_sheetmetal)
+                    # Start watcher to auto-restore the chat when SheetMetal dialog is closed
+                    self._start_restore_chat_watch()
+                except Exception as _err:
+                    print(f"DEBUG: Deferred close-and-retry error: {_err}")
+                    self._sm_async_retry_inflight = False
+            # Defer the close to leave the current event handler
+            QtCore.QTimer.singleShot(0, _do_close_and_retry)
+        except Exception as _sched_err:
+            print(f"DEBUG: Failed to schedule close-and-retry: {_sched_err}")
+            self._sm_async_retry_inflight = False
+
+    def _start_restore_chat_watch(self, poll_ms: int = 250, timeout_sec: int = 60):
+        """Watch for FreeCAD task panel slot to become free, then re-show our chat panel.
+        Non-invasive: only active after SheetMetal-triggered close. Does not affect other flows.
+        """
+        if self._sm_restore_chat_pending:
+            return
+        self._sm_restore_chat_pending = True
+        try:
+            from PySide2 import QtCore
+            import time
+            deadline = time.time() + max(5, timeout_sec)
+
+            def _tick():
+                try:
+                    import FreeCADGui
+                    # Stop conditions
+                    if time.time() > deadline:
+                        self._sm_restore_chat_pending = False
+                        return
+
+                    active = None
+                    try:
+                        if hasattr(FreeCADGui, 'Control') and hasattr(FreeCADGui.Control, 'activeDialog'):
+                            active = FreeCADGui.Control.activeDialog()
+                    except Exception:
+                        active = None
+
+                    # If our chat is already the active dialog, stop
+                    tname = type(active).__name__ if active is not None else ''
+                    if tname == 'StandaloneCoPilotTaskPanel':
+                        self._sm_restore_chat_pending = False
+                        return
+
+                    # If no active task dialog, bring back chat
+                    if not active:
+                        try:
+                            # Only show if function is available
+                            if 'show_standalone_copilot' in globals():
+                                show_standalone_copilot()
+                        except Exception as _reopen_err:
+                            print(f"DEBUG: Failed to auto-reopen chat panel: {_reopen_err}")
+                        finally:
+                            self._sm_restore_chat_pending = False
+                        return
+
+                    # Otherwise keep polling
+                    QtCore.QTimer.singleShot(max(50, poll_ms), _tick)
+                except Exception as _watch_err:
+                    print(f"DEBUG: Chat restore watcher error: {_watch_err}")
+                    self._sm_restore_chat_pending = False
+
+            # Start polling shortly after scheduling retry
+            QtCore.QTimer.singleShot(max(50, poll_ms), _tick)
+        except Exception as _watch_setup_err:
+            print(f"DEBUG: Failed to start restore chat watcher: {_watch_setup_err}")
+            self._sm_restore_chat_pending = False
     
     def handle_create(self, text):
         """Handle create commands"""
@@ -7195,21 +7383,17 @@ def show_standalone_copilot():
     
     # Check if an instance already exists
     if _STANDALONE_INSTANCE is not None:
-        print("Standalone Co-Pilot is already running - activating existing instance")
+        # Validate the Qt object; if invalid/deleted, reset and create a new one
         try:
-            # Try to bring existing instance to front
             _STANDALONE_INSTANCE.activateWindow()
             _STANDALONE_INSTANCE.raise_()
-            
-            # Show message to user
-            QtWidgets.QMessageBox.information(
-                None,
-                "Co-Pilot Already Running",
-                "Manufacturing Co-Pilot is already running. Using the existing instance."
-            )
+            print("Standalone Co-Pilot is already running - activating existing instance")
+            # Optional: only inform on manual clicks; keep silent on auto-restore
+            return
         except Exception as e:
             print(f"Error activating existing instance: {e}")
-        return
+            print("DEBUG: Detected stale _STANDALONE_INSTANCE; resetting and creating a new one")
+            _STANDALONE_INSTANCE = None
     
     try:
         # Close any active FreeCAD task dialogs

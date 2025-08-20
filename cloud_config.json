@@ -35,6 +35,7 @@
   },
   "features": {
     "text_to_cad_enabled": true,
+    "sheet_metal_enabled": true,
     "dfm_enabled": true,
     "learning_agent_enabled": false,
     "shadow_mode": true

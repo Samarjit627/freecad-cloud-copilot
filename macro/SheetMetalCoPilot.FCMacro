@@ -1,0 +1,577 @@
+"""
+SheetMetalCoPilot - Standalone Sheet Metal Macro (Option C)
+
+Purpose:
+- Provide a safe, standalone macro to create and edit SheetMetal features through
+  simple natural-language-like commands.
+- Do NOT wire into main macro yet. Designed to be integrated later.
+- Detects the FreeCAD SheetMetal workbench at runtime and fails gracefully if unavailable.
+
+Usage:
+- Run this macro directly from FreeCAD to open a minimal command prompt, or
+  call `sheetmetal_process_command(text, context=None)` from another macro.
+
+Design notes:
+- Uses FreeCADGui.runCommand with known SheetMetal command IDs when possible.
+- Avoids hard imports of workbench internals to preserve compatibility.
+- Commands are best-effort and may require the user to preselect edges/faces/sketches
+  as per SheetMetal workbench’s expectations.
+
+Author: Cascade (Windsurf)
+License: MIT
+"""
+
+import sys
+import os
+import re
+import importlib
+import traceback
+from typing import Optional, Dict, Any, Tuple, List, Dict as TDict
+
+try:
+    import FreeCAD
+    import FreeCADGui
+except Exception:
+    raise RuntimeError("This macro must be run inside FreeCAD with GUI available.")
+
+# -------------------------------
+# Utilities
+# -------------------------------
+
+def _active_doc_required():
+    """Ensure there is an active document."""
+    if FreeCAD.ActiveDocument is None:
+        FreeCAD.newDocument("SheetMetalDoc")
+        FreeCADGui.activeDocument().activeView().viewAxonometric()
+        FreeCADGui.SendMsgToActiveView("ViewFit")
+
+
+def _sheetmetal_available() -> Tuple[bool, str]:
+    """Check if the SheetMetal workbench appears available.
+    Tries both GUI workbench list and Python module import to reduce false negatives.
+    Returns (available, diagnostics_message)
+    """
+    try:
+        names: List[str] = []
+        wb_dbg = ""
+        wbs = getattr(FreeCADGui, "listWorkbenches", None)
+        if callable(wbs):
+            names = [str(k) for k in wbs().keys()]
+            wb_dbg = "listWorkbenches"
+        else:
+            awb = getattr(FreeCADGui, "availableWorkbenches", None)
+            names = list(awb().keys()) if callable(awb) else []
+            wb_dbg = "availableWorkbenches"
+
+        candidates = {"SheetMetalWorkbench", "SheetMetal", "SMWorkbench"}
+        found_gui = any(any(c.lower() in n.lower() for c in candidates) for n in names)
+
+        imported: List[str] = []
+        for mod in ("SheetMetal", "SheetMetalCmd", "SheetMetalWorkbench", "SMWorkbench"):
+            try:
+                importlib.import_module(mod)
+                imported.append(mod)
+            except Exception:
+                pass
+
+        if found_gui or imported:
+            details = []
+            if found_gui:
+                details.append(f"GUI:{wb_dbg} shows {names}")
+            if imported:
+                details.append(f"imports ok: {imported}")
+            return True, "; ".join(details)
+
+        return False, f"SheetMetal workbench not found. WB list ({wb_dbg}): {names}; sys.path entries: {len(sys.path)}"
+    except Exception as e:
+        return False, f"Error checking workbenches: {e}"
+
+
+def _activate_sheetmetal_wb() -> bool:
+    ok, _ = _sheetmetal_available()
+    if not ok:
+        return False
+    try:
+        # Try common ids (different builds use different IDs)
+        for wb_id in ("SheetMetalWorkbench", "SheetMetal", "SMWorkbench"):
+            try:
+                FreeCADGui.activateWorkbench(wb_id)
+                # Attempt soft import of plugin modules (names vary across versions)
+                for mod in ("SheetMetal", "SheetMetalCmd", "SheetMetalWorkbench"):
+                    try:
+                        importlib.import_module(mod)
+                    except Exception:
+                        pass
+                return True
+            except Exception:
+                pass
+        return False
+    except Exception:
+        return False
+
+
+# -------------------------------
+# Command execution
+# -------------------------------
+
+# Baseline guesses for commands. We will augment/override with discovered commands at runtime.
+SHEETMETAL_COMMANDS = {
+    # Base features
+    "base_wall": ["SheetMetal_AddBaseWall", "SheetMetal_BaseFeature", "SheetMetal_Wall"],
+    # Flange / Bends
+    "flange": ["SheetMetal_AddWall", "SheetMetal_Flange", "SheetMetal_AddRelief"],
+    "bend": ["SheetMetal_Bend"],
+    # Cutouts
+    "cut": ["SheetMetal_Cutout"],
+    # Unfold / Flatten
+    "unfold": ["SheetMetal_Unfold", "SheetMetal_Flatten"],
+    # Thickness / Parameters (often via task panel after command)
+    "thickness": ["SheetMetal_Thickness"],
+}
+
+
+def run_command_any(ids: List[str]) -> bool:
+    """Try a list of command IDs until one succeeds."""
+    for cid in ids:
+        try:
+            if FreeCADGui.runCommand(cid, 0):  # returns bool in many cases
+                return True
+        except Exception:
+            continue
+    return False
+
+
+_NEEDS_RETRY_AFTER_CLOSE = False
+
+def _ensure_no_active_task_panel() -> bool:
+    """Ensure it's safe to open a new task panel.
+    Only auto-close our own StandaloneCoPilotTaskPanel, and do it async to avoid Qt crashes.
+    Returns True if it's safe to proceed, False if some other task panel is open.
+    """
+    try:
+        global _NEEDS_RETRY_AFTER_CLOSE
+        ctrl = getattr(FreeCADGui, 'Control', None)
+        if not ctrl or not hasattr(ctrl, 'activeDialog'):
+            return True
+        dlg = ctrl.activeDialog()
+        if not dlg:
+            return True
+
+        # Some FreeCAD builds return a boolean here instead of the dialog object.
+        # If we only get a truthy boolean, try to detect our Co-Pilot panel via Qt widget scan.
+        if isinstance(dlg, bool):
+            # On some builds, this is just True/False. We can't safely close here.
+            # Ask caller to close Co-Pilot panel and retry.
+            _NEEDS_RETRY_AFTER_CLOSE = True
+            try:
+                FreeCAD.Console.PrintMessage("SheetMetalCoPilot: Requesting caller to close panel and retry (bool)\n")
+            except Exception:
+                pass
+            return False
+
+        # Identify dialog class name safely
+        try:
+            dlg_name = getattr(dlg, '__class__', type(dlg)).__name__
+        except Exception:
+            dlg_name = ''
+
+        # Try to get window title and object name for robust identification
+        dlg_title = ''
+        try:
+            # Some dialogs expose windowTitle() as a callable
+            wt = getattr(dlg, 'windowTitle', None)
+            if callable(wt):
+                dlg_title = wt()
+            elif isinstance(wt, str):
+                dlg_title = wt
+        except Exception:
+            dlg_title = ''
+
+        obj_name = ''
+        try:
+            on = getattr(dlg, 'objectName', None)
+            if callable(on):
+                obj_name = on()
+            elif isinstance(on, str):
+                obj_name = on
+        except Exception:
+            obj_name = ''
+
+        # Consider various patterns as "our" panel
+        title_lc = (dlg_title or '').lower()
+        obj_lc = (obj_name or '').lower()
+        is_our_panel = (
+            'StandaloneCoPilotTaskPanel' == dlg_name or
+            'copilot' in dlg_name.lower() or
+            'co-pilot' in title_lc or
+            'copilot' in title_lc or
+            'manufacturing co-pilot' in title_lc or
+            'copilot' in obj_lc
+        )
+
+        if is_our_panel:
+            # Don't close here to avoid Qt crashes. Ask caller to close and retry.
+            _NEEDS_RETRY_AFTER_CLOSE = True
+            return False
+
+        # Another task panel is active (e.g., Sketcher, PartDesign, etc.)
+        try:
+            FreeCAD.Console.PrintMessage(
+                f"SheetMetalCoPilot: Blocking due to active task panel: class='{dlg_name}', title='{dlg_title}', objectName='{obj_name}'\n"
+            )
+        except Exception:
+            pass
+        return False
+    except Exception:
+        # Fail open to avoid blocking user; SheetMetal may still succeed
+        return True
+
+def _is_copilot_panel_present() -> bool:
+    """Scan Qt widget tree for our Co-Pilot task panel indicators.
+    Looks for objectName/windowTitle/text containing 'Co-Pilot'/'copilot'.
+    """
+    try:
+        from PySide2 import QtWidgets
+        mw = FreeCADGui.getMainWindow()
+        if not mw:
+            return False
+        # Search all widgets under the main window
+        widgets = mw.findChildren(QtWidgets.QWidget)
+        for w in widgets:
+            try:
+                # objectName
+                on = w.objectName() if hasattr(w, 'objectName') else ''
+                if isinstance(on, str) and 'copilot' in on.lower():
+                    try:
+                        FreeCAD.Console.PrintMessage("SheetMetalCoPilot: Detected Co-Pilot by objectName\n")
+                    except Exception:
+                        pass
+                    return True
+                # window title
+                wt = w.windowTitle() if hasattr(w, 'windowTitle') and callable(w.windowTitle) else ''
+                if isinstance(wt, str) and (
+                    'co-pilot' in wt.lower() or 'copilot' in wt.lower() or 'manufacturing co-pilot' in wt.lower() or 'axis 5' in wt.lower()
+                ):
+                    try:
+                        FreeCAD.Console.PrintMessage("SheetMetalCoPilot: Detected Co-Pilot by windowTitle\n")
+                    except Exception:
+                        pass
+                    return True
+                # Text-bearing widgets (labels/buttons)
+                txt = ''
+                if hasattr(w, 'text') and callable(w.text):
+                    try:
+                        txt = w.text()
+                    except Exception:
+                        txt = ''
+                if isinstance(txt, str):
+                    tl = txt.lower()
+                    if (
+                        'co-pilot' in tl or 'copilot' in tl or 'manufacturing co-pilot' in tl or 'axis 5' in tl or 'ask about manufacturing' in tl
+                    ) or ('manufacturing' in tl and 'pilot' in tl):
+                        try:
+                            FreeCAD.Console.PrintMessage("SheetMetalCoPilot: Detected Co-Pilot by text()\n")
+                        except Exception:
+                            pass
+                        return True
+
+                # Accessible/tooltip/placeholder hints
+                acc = ''
+                if hasattr(w, 'accessibleName') and callable(w.accessibleName):
+                    try:
+                        acc = w.accessibleName()
+                    except Exception:
+                        acc = ''
+                if isinstance(acc, str) and ('copilot' in acc.lower() or 'co-pilot' in acc.lower()):
+                    return True
+
+                tip = ''
+                if hasattr(w, 'toolTip') and callable(w.toolTip):
+                    try:
+                        tip = w.toolTip()
+                    except Exception:
+                        tip = ''
+                if isinstance(tip, str) and ('copilot' in tip.lower() or 'co-pilot' in tip.lower()):
+                    return True
+
+                # Placeholder (e.g., QLineEdit)
+                if hasattr(w, 'placeholderText') and callable(w.placeholderText):
+                    try:
+                        ph = w.placeholderText()
+                    except Exception:
+                        ph = ''
+                    if isinstance(ph, str) and ('ask about manufacturing' in ph.lower() or 'co-pilot' in ph.lower() or 'copilot' in ph.lower()):
+                        return True
+            except Exception:
+                continue
+    except Exception:
+        return False
+    return False
+
+
+def _discover_sheetmetal_commands() -> TDict[str, List[str]]:
+    """Discover available SheetMetal commands from GUI registry and map to intents.
+    Returns a dict intent->list of command ids (most specific first).
+    """
+    try:
+        cmds = []
+        lister = getattr(FreeCADGui, "listCommands", None)
+        if callable(lister):
+            cmds = [str(c) for c in lister()]
+        # Filter to SheetMetal commands
+        sm_cmds = [c for c in cmds if c.startswith("SheetMetal_") or c.startswith("SM_")]
+
+        def pick(*keywords: str) -> List[str]:
+            keys = [k.lower() for k in keywords]
+            ranked = []
+            for c in sm_cmds:
+                lc = c.lower()
+                score = sum(1 for k in keys if k in lc)
+                if score:
+                    ranked.append((score, c))
+            ranked.sort(key=lambda x: (-x[0], x[1]))
+            return [c for _, c in ranked]
+
+        discovered: TDict[str, List[str]] = {
+            "base_wall": pick("base", "wall") or pick("base", "flange") or pick("base"),
+            "flange": pick("flange") or pick("wall"),
+            "bend": pick("bend"),
+            "cut": pick("cut", "cutout", "slot"),
+            "unfold": pick("unfold", "flatten", "flat"),
+            "thickness": pick("thickness", "thick"),
+        }
+
+        # Merge with baseline, prefer discovered first
+        merged: TDict[str, List[str]] = {}
+        for intent, base in SHEETMETAL_COMMANDS.items():
+            dyn = discovered.get(intent, [])
+            seen = set()
+            merged_list = []
+            for c in dyn + base:
+                if c and c not in seen:
+                    seen.add(c)
+                    merged_list.append(c)
+            merged[intent] = merged_list
+        return merged
+    except Exception:
+        return SHEETMETAL_COMMANDS
+
+
+# -------------------------------
+# NL command parsing (best-effort, robust to phrasing)
+# -------------------------------
+
+ANGLE_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(?:deg|degree|degrees)?", re.I)
+LENGTH_RE = re.compile(r"(\d+(?:\.\d+)?)\s*(mm|millimeter|millimeters|cm|inch|in|\")?", re.I)
+
+
+def _extract_number(text: str, default: Optional[float] = None) -> Optional[float]:
+    m = ANGLE_RE.search(text)
+    if m:
+        try:
+            return float(m.group(1))
+        except Exception:
+            return default
+    return default
+
+
+def _extract_length_mm(text: str, default: Optional[float] = None) -> Optional[float]:
+    m = LENGTH_RE.search(text)
+    if not m:
+        return default
+    try:
+        val = float(m.group(1))
+    except Exception:
+        return default
+    unit = (m.group(2) or "mm").lower()
+    if unit in ("mm", "millimeter", "millimeters"):
+        return val
+    if unit == "cm":
+        return val * 10.0
+    if unit in ("inch", "in", '"'):
+        return val * 25.4
+    return val
+
+
+# -------------------------------
+# Public API (to integrate later)
+# -------------------------------
+
+def sheetmetal_process_command(text: str, context: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """
+    Execute a sheet metal action derived from a natural language command.
+    - text: user command, e.g. "create base wall from selected sketch thickness 2mm"
+    - context: optional dict for future use (e.g., selected object names, material, defaults)
+
+    Returns a result dict: { success: bool, message: str }
+    """
+    ctx = context or {}
+    try:
+        _active_doc_required()
+        if not _activate_sheetmetal_wb():
+            return {
+                "success": False,
+                "message": "SheetMetal workbench is not available. Please install/enable it.",
+            }
+
+        t = (text or "").strip().lower()
+        if not t:
+            return {"success": False, "message": "Empty command."}
+
+        # Build current command map from discovery
+        cmdmap = _discover_sheetmetal_commands()
+
+        # Ensure no conflicting task panel is open before we invoke SheetMetal commands
+        ok_to_continue = _ensure_no_active_task_panel()
+        # If we requested caller-side close, return a structured retry response first
+        global _NEEDS_RETRY_AFTER_CLOSE
+        if not ok_to_continue and _NEEDS_RETRY_AFTER_CLOSE:
+            _NEEDS_RETRY_AFTER_CLOSE = False
+            return {"success": False, "message": "Closing Co-Pilot panel to run SheetMetal...", "code": "RETRY_AFTER_CLOSE"}
+        # Failsafe: some builds return bool from activeDialog() and global flag may be unreliable
+        try:
+            ctrl = getattr(FreeCADGui, 'Control', None)
+            if not ok_to_continue and ctrl and hasattr(ctrl, 'activeDialog'):
+                ad = ctrl.activeDialog()
+                if isinstance(ad, bool) and ad:
+                    return {"success": False, "message": "Closing Co-Pilot panel to run SheetMetal...", "code": "RETRY_AFTER_CLOSE"}
+        except Exception:
+            pass
+        if not ok_to_continue:
+            return {
+                "success": False,
+                "message": "Another task dialog is open. Please close it or finish that task, then retry.",
+            }
+
+        # Intent classification (simple keyword-based; can be upgraded later)
+        if any(k in t for k in ["base wall", "base flange", "base feature", "create wall"]):
+            ok = run_command_any(cmdmap["base_wall"])
+            msg = "Invoked base wall. Select a sketch/profile if prompted."
+            return {"success": bool(ok), "message": msg}
+
+        if any(k in t for k in ["flange", "edge flange", "add wall"]):
+            # Optional: parse length
+            length = _extract_length_mm(t)
+            ok = run_command_any(cmdmap["flange"])
+            msg = "Invoked flange. Select an edge and set parameters in the task panel."
+            if length is not None:
+                msg += f" Suggested length: {length:.2f} mm (set in dialog)."
+            return {"success": bool(ok), "message": msg}
+
+        if "bend" in t or "fold" in t:
+            angle = _extract_number(t)
+            radius = None
+            # Try to detect radius separately
+            mrad = re.search(r"radius\s*(\d+(?:\.\d+)?)", t)
+            if mrad:
+                try:
+                    radius = float(mrad.group(1))
+                except Exception:
+                    radius = None
+            ok = run_command_any(cmdmap["bend"])
+            msg = "Invoked bend. Select an edge and set parameters in the task panel."
+            if angle is not None:
+                msg += f" Suggested angle: {angle:.1f} deg (set in dialog)."
+            if radius is not None:
+                msg += f" Suggested radius: {radius:.2f} mm (set in dialog)."
+            return {"success": bool(ok), "message": msg}
+
+        if any(k in t for k in ["cut", "cutout", "slot"]):
+            ok = run_command_any(cmdmap["cut"])
+            msg = "Invoked cutout. Provide sketch/face selection as required."
+            return {"success": bool(ok), "message": msg}
+
+        if any(k in t for k in ["unfold", "flatten", "flat pattern", "export dxf"]):
+            ok = run_command_any(cmdmap["unfold"])
+            msg = "Invoked unfold/flatten. Configure export in task panel (e.g., DXF)."
+            return {"success": bool(ok), "message": msg}
+
+        if any(k in t for k in ["thickness", "set thickness"]):
+            thickness = _extract_length_mm(t)
+            ok = run_command_any(cmdmap["thickness"])
+            msg = "Invoked thickness parameter."
+            if thickness is not None:
+                msg += f" Suggested thickness: {thickness:.2f} mm (set in dialog)."
+            return {"success": bool(ok), "message": msg}
+
+        # Fallback
+        return {
+            "success": False,
+            "message": (
+                "Unrecognized sheet metal command. Supported intents: base wall, flange, bend, cut, unfold, thickness."
+            ),
+        }
+
+    except Exception as e:
+        traceback.print_exc()
+        return {"success": False, "message": f"Error: {e}"}
+
+
+# -------------------------------
+# Minimal UI runner (manual use only)
+# -------------------------------
+
+from PySide2 import QtWidgets, QtCore
+
+class _SheetMetalPrompt(QtWidgets.QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SheetMetal CoPilot")
+        self.setMinimumWidth(420)
+        layout = QtWidgets.QVBoxLayout(self)
+
+        self._edit = QtWidgets.QLineEdit(self)
+        self._edit.setPlaceholderText(
+            "e.g., 'create base wall from selected sketch thickness 2mm' or 'add flange 15mm'"
+        )
+        layout.addWidget(self._edit)
+
+        self._output = QtWidgets.QTextEdit(self)
+        self._output.setReadOnly(True)
+        self._output.setMinimumHeight(140)
+        layout.addWidget(self._output)
+
+        btns = QtWidgets.QHBoxLayout()
+        self._run = QtWidgets.QPushButton("Run", self)
+        self._close = QtWidgets.QPushButton("Close", self)
+        btns.addWidget(self._run)
+        btns.addWidget(self._close)
+        layout.addLayout(btns)
+
+        self._run.clicked.connect(self._on_run)
+        self._close.clicked.connect(self.close)
+
+        # Availability banner
+        ok, msg = _sheetmetal_available()
+        banner = QtWidgets.QLabel(self)
+        if ok:
+            banner.setText("SheetMetal workbench: available")
+            banner.setStyleSheet("color: #2d862d;")
+        else:
+            if not msg:
+                msg = "not found"
+            banner.setText(f"SheetMetal workbench: unavailable ({msg})")
+            banner.setStyleSheet("color: #b22222;")
+        layout.addWidget(banner)
+
+    def _on_run(self):
+        text = self._edit.text()
+        res = sheetmetal_process_command(text)
+        self._output.append(f"> {text}")
+        status = "OK" if res.get("success") else "FAIL"
+        self._output.append(f"{status}: {res.get('message')}")
+        self._output.append("")
+
+
+def run():
+    """Entry point when executing this macro directly."""
+    _active_doc_required()
+    dlg = _SheetMetalPrompt(FreeCADGui.getMainWindow())
+    dlg.show()
+    dlg.raise_()
+    dlg.activateWindow()
+
+
+# If executed directly via Macro editor/run
+if __name__ == "__main__":
+    run()
