@@ -6363,11 +6363,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         self.tools_button.clicked.connect(self.on_tools_clicked)
         button_grid.addWidget(self.tools_button, 1, 0)
         
-        # Manufacturing Method Comparison button
-        self.compare_button = QtWidgets.QPushButton("Compare Methods")
-        self.compare_button.setToolTip("Compare different manufacturing methods")
-        self.compare_button.clicked.connect(self.on_compare_clicked)
-        button_grid.addWidget(self.compare_button, 1, 1)
+        # BOM button replaces Compare Methods
+        self.bom_button = QtWidgets.QPushButton("BOM")
+        self.bom_button.setToolTip("Generate Bill of Materials (via BOM Workbench if available)")
+        self.bom_button.clicked.connect(self.on_bom_clicked)
+        button_grid.addWidget(self.bom_button, 1, 1)
         
         # Show Problem Area button (RESTORED HEATMAP OVERLAY FEATURE)
         # Initially hidden - only shown after DFM analysis completes
@@ -6401,6 +6401,213 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         
         # Add the group box to the main layout
         layout.addWidget(mfg_group)
+    
+    def on_bom_clicked(self):
+        """Handle BOM button click: prefer BOM Workbench; fallback to local BOM"""
+        try:
+            # Basic guard: active document required for meaningful BOM
+            if not FreeCAD.ActiveDocument:
+                self.add_system_message("No active document found")
+                self.add_assistant_message("Please open or create a model before generating a BOM.")
+                return
+            
+            self.add_system_message("Preparing Bill of Materials...")
+            
+            # Try BOM Workbench first
+            if self._activate_bom_workbench():
+                cmd = self._find_bom_command()
+                if cmd:
+                    self.add_system_message(f"Launching BOM Workbench command: {cmd}")
+                    self._run_bom_command_after_close(cmd)
+                    return
+                else:
+                    print("DEBUG: No suitable BOM command discovered; using local BOM fallback")
+            else:
+                print("DEBUG: BOM Workbench not available; using local BOM fallback")
+            
+            # Fallback: local BOM generation
+            summary_text = self._generate_local_bom()
+            self.add_assistant_message(summary_text)
+        except Exception as e:
+            self.add_system_message(f"Error generating BOM: {str(e)}")
+            traceback.print_exc()
+    
+    def _activate_bom_workbench(self) -> bool:
+        """Attempt to activate the Bill of Materials workbench. Returns True if activated."""
+        try:
+            candidates = [
+                'BOM', 'BOMWorkbench', 'BillOfMaterials', 'BillOfMaterialsWB', 'BOM WB'
+            ]
+            for name in candidates:
+                try:
+                    FreeCADGui.activateWorkbench(name)
+                    print(f"DEBUG: Activated BOM workbench: {name}")
+                    return True
+                except Exception:
+                    continue
+            # Heuristic: check available workbenches for containing 'BOM'
+            try:
+                for wb in FreeCADGui.listWorkbenches().keys():
+                    if 'bom' in wb.lower() or 'bill' in wb.lower():
+                        try:
+                            FreeCADGui.activateWorkbench(wb)
+                            print(f"DEBUG: Activated BOM-like workbench: {wb}")
+                            return True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+        except Exception:
+            pass
+        return False
+    
+    def _find_bom_command(self) -> str:
+        """Discover a BOM command to run. Returns command name or empty string."""
+        try:
+            cmds = list(FreeCADGui.listCommands())
+            # Prioritize likely creators/exporters
+            preferred_prefixes = ['BOM_', 'BOM', 'BillOfMaterials', 'Create_BOM', 'Export_BOM']
+            preferred_keywords = ['export', 'create', 'generate']
+            # Exact prefix search
+            for p in preferred_prefixes:
+                for c in cmds:
+                    if c.startswith(p):
+                        return c
+            # Keyword search
+            lc = [(c, c.lower()) for c in cmds]
+            for c, l in lc:
+                if 'bom' in l and any(k in l for k in preferred_keywords):
+                    return c
+        except Exception:
+            pass
+        return ''
+    
+    def _run_bom_command_after_close(self, command_name: str):
+        """Safely close our task panel, run BOM command, and auto-reopen chat when done."""
+        try:
+            # Defer closure to avoid Qt crashes
+            def _do_close():
+                try:
+                    print("DEBUG: Closing Co-Pilot panel before running BOM command")
+                    try:
+                        FreeCADGui.Control.closeDialog()
+                    except Exception as e:
+                        print(f"DEBUG: closeDialog error (ignored): {e}")
+                except Exception:
+                    pass
+            
+            def _run_cmd():
+                try:
+                    print(f"DEBUG: Running BOM command: {command_name}")
+                    FreeCADGui.runCommand(command_name)
+                    # Start watcher to auto-reopen our chat panel after BOM task panel closes
+                    self._start_restore_chat_watch_for_bom()
+                except Exception as e:
+                    print(f"DEBUG: Failed to run BOM command: {e}")
+                    # Fallback to local BOM
+                    summary_text = self._generate_local_bom()
+                    self.add_assistant_message(summary_text)
+            
+            QtCore.QTimer.singleShot(0, _do_close)
+            QtCore.QTimer.singleShot(250, _run_cmd)
+        except Exception as e:
+            print(f"DEBUG: _run_bom_command_after_close error: {e}")
+            # Fallback to local BOM
+            summary_text = self._generate_local_bom()
+            self.add_assistant_message(summary_text)
+    
+    def _start_restore_chat_watch_for_bom(self):
+        """Poll for task panel vacancy; when free, reopen Standalone Co-Pilot panel."""
+        try:
+            # Avoid multiple watchers
+            if hasattr(self, '_bom_restore_chat_pending') and self._bom_restore_chat_pending:
+                return
+            self._bom_restore_chat_pending = True
+            
+            def _poll():
+                try:
+                    active = None
+                    try:
+                        active = FreeCADGui.Control.activeDialog()
+                    except Exception:
+                        active = None
+                    if not active:
+                        print("DEBUG: BOM task panel closed; reopening Co-Pilot chat panel")
+                        try:
+                            # Use global function already present in macro
+                            show_standalone_copilot()
+                        except Exception as e:
+                            print(f"DEBUG: Failed to re-show Co-Pilot: {e}")
+                        self._bom_restore_chat_pending = False
+                        return
+                except Exception:
+                    self._bom_restore_chat_pending = False
+                    return
+                # Re-arm
+                QtCore.QTimer.singleShot(400, _poll)
+            
+            QtCore.QTimer.singleShot(600, _poll)
+        except Exception as e:
+            print(f"DEBUG: _start_restore_chat_watch_for_bom error: {e}")
+            self._bom_restore_chat_pending = False
+    
+    def _generate_local_bom(self) -> str:
+        """Create a simple BOM from the active document and return formatted text."""
+        try:
+            doc = FreeCAD.ActiveDocument
+            items = {}
+            def _key_for(obj):
+                try:
+                    # Prefer Part Number-like property if present
+                    if hasattr(obj, 'PartNumber') and obj.PartNumber:
+                        return f"{obj.PartNumber}"
+                except Exception:
+                    pass
+                return obj.Label or obj.Name
+            
+            for obj in doc.Objects:
+                try:
+                    # Skip hidden construction helpers if needed
+                    if hasattr(obj, 'Visibility') and obj.Visibility is False:
+                        pass
+                    k = _key_for(obj)
+                    if k not in items:
+                        mat = ''
+                        try:
+                            if hasattr(obj, 'Material') and obj.Material:
+                                mat = str(obj.Material)
+                            elif hasattr(obj, 'MaterialName') and obj.MaterialName:
+                                mat = str(obj.MaterialName)
+                        except Exception:
+                            mat = ''
+                        items[k] = {
+                            'label': obj.Label,
+                            'name': obj.Name,
+                            'type': getattr(obj, 'TypeId', ''),
+                            'qty': 0,
+                            'material': mat
+                        }
+                    items[k]['qty'] += 1
+                except Exception:
+                    continue
+            
+            lines = []
+            total_qty = sum(v['qty'] for v in items.values())
+            lines.append("=== BILL OF MATERIALS (Local) ===")
+            lines.append(f"Unique items: {len(items)} | Total qty: {total_qty}")
+            lines.append("")
+            lines.append("Item, Qty, Type, Material, Label")
+            count = 0
+            for k, v in sorted(items.items(), key=lambda x: x[0]):
+                lines.append(f"{k}, {v['qty']}, {v['type']}, {v['material']}, {v['label']}")
+                count += 1
+                if count >= 25:
+                    lines.append("... (truncated)")
+                    break
+            
+            return "\n".join(lines)
+        except Exception as e:
+            return f"❌ Failed to generate local BOM: {e}"
     
     def on_dfm_clicked(self):
         """Handle DFM analysis button click with advanced options"""
