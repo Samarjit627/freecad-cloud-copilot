@@ -6435,8 +6435,9 @@ class StandaloneCoPilot(QtWidgets.QWidget):
     def _activate_bom_workbench(self) -> bool:
         """Attempt to activate the Bill of Materials workbench. Returns True if activated."""
         try:
+            # Prefer the exact ID observed on this system
             candidates = [
-                'BOM', 'BOMWorkbench', 'BillOfMaterials', 'BillOfMaterialsWB', 'BOM WB'
+                'BillOfMaterialsWB', 'BOM', 'BOMWorkbench', 'BillOfMaterials', 'BOM WB'
             ]
             for name in candidates:
                 try:
@@ -6465,18 +6466,29 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         """Discover a BOM command to run. Returns command name or empty string."""
         try:
             cmds = list(FreeCADGui.listCommands())
-            # Prioritize likely creators/exporters
-            preferred_prefixes = ['BOM_', 'BOM', 'BillOfMaterials', 'Create_BOM', 'Export_BOM']
-            preferred_keywords = ['export', 'create', 'generate']
-            # Exact prefix search
+            # Explicit preference order based on detected commands on this system
+            preferred_exact = [
+                'CreateBOM_Overall', 'CreateBOM_Total', 'CreateBOM_Summary',
+                'CreateBOM_PartsOnly', 'CreateBOM_1stLevel', 'CreateBOM_Raw',
+                'CreateBOM_Total_MIXED', 'CreateBOM_Summary_MIXED', 'CreateBOM_PartsOnly_MIXED', 'CreateBOM_Raw_MIXED'
+            ]
+            for c in preferred_exact:
+                if c in cmds:
+                    print(f"DEBUG: Selected BOM command (exact): {c}")
+                    return c
+            # Prefix search fallbacks
+            preferred_prefixes = ['CreateBOM_', 'BOM_', 'BOM', 'BillOfMaterials', 'Create_BOM', 'Export_BOM']
             for p in preferred_prefixes:
                 for c in cmds:
                     if c.startswith(p):
+                        print(f"DEBUG: Selected BOM command (prefix {p}): {c}")
                         return c
+            preferred_keywords = ['export', 'create', 'generate']
             # Keyword search
             lc = [(c, c.lower()) for c in cmds]
             for c, l in lc:
                 if 'bom' in l and any(k in l for k in preferred_keywords):
+                    print(f"DEBUG: Selected BOM command (keyword): {c}")
                     return c
         except Exception:
             pass
@@ -6509,7 +6521,8 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     self.add_assistant_message(summary_text)
             
             QtCore.QTimer.singleShot(0, _do_close)
-            QtCore.QTimer.singleShot(250, _run_cmd)
+            # macOS/Qt can need a bit more delay for safe panel teardown
+            QtCore.QTimer.singleShot(600, _run_cmd)
         except Exception as e:
             print(f"DEBUG: _run_bom_command_after_close error: {e}")
             # Fallback to local BOM
