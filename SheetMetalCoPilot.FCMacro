@@ -1,0 +1,33 @@
+# Launcher macro to run the standalone Sheet Metal CoPilot located under macro/SheetMetalCoPilot.FCMacro
+# This lets it appear in FreeCAD's Macro dialog when the user macros location is the project root.
+
+import os
+import sys
+import importlib.machinery
+import importlib.util
+
+_here = os.path.dirname(__file__)
+_target = os.path.join(_here, 'macro', 'SheetMetalCoPilot.FCMacro')
+
+if not os.path.exists(_target):
+    raise RuntimeError('Could not find macro/macro/SheetMetalCoPilot.FCMacro')
+
+# Load the target macro as a module
+loader = importlib.machinery.SourceFileLoader('SheetMetalCoPilot_impl', _target)
+spec = importlib.util.spec_from_loader(loader.name, loader)
+mod = importlib.util.module_from_spec(spec)
+loader.exec_module(mod)
+
+# Run if available
+if hasattr(mod, 'run'):
+    mod.run()
+else:
+    # Fallback: if no run() is provided, try showing the prompt via a known entry
+    if hasattr(mod, '_SheetMetalPrompt'):
+        import FreeCADGui
+        dlg = mod._SheetMetalPrompt(FreeCADGui.getMainWindow())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+    else:
+        raise RuntimeError('Loaded SheetMetalCoPilot macro but could not find an entry point to run.')

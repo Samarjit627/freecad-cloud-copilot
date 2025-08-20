@@ -1,0 +1,63 @@
+{
+  "currency": "INR",
+  "gst_percent": 18,
+  "rounding": {
+    "digits": 2
+  },
+  "materials": {
+    "PLA": {
+      "unit": "kg",
+      "rate": 1200,
+      "density_g_cm3": 1.24
+    },
+    "ABS": {
+      "unit": "kg",
+      "rate": 1000,
+      "density_g_cm3": 1.04
+    },
+    "Nylon": {
+      "unit": "kg",
+      "rate": 1800,
+      "density_g_cm3": 1.15
+    },
+    "Aluminum_6061": {
+      "unit": "kg",
+      "rate": 650,
+      "density_g_cm3": 2.7
+    },
+    "SS304": {
+      "unit": "kg",
+      "rate": 220,
+      "density_g_cm3": 8.0
+    },
+    "Generic": {
+      "unit": "kg",
+      "rate": 500,
+      "density_g_cm3": 1.2
+    }
+  },
+  "process": {
+    "enable": true,
+    "default": "3d_printing",
+    "3d_printing": {
+      "by_volume_cm3": {
+        "PLA": 8.0,
+        "ABS": 10.0,
+        "Nylon": 15.0,
+        "Generic": 12.0
+      }
+    },
+    "cnc_machining": {
+      "enable": false,
+      "by_time_min": {
+        "default": 60.0
+      },
+      "setup_fee": 300.0
+    },
+    "sheet_metal": {
+      "enable": false,
+      "laser_cut_perimeter_mm": 0.5,
+      "bend_per_bend": 15.0
+    }
+  }
+}

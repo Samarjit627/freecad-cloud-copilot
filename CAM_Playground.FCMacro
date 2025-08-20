@@ -1,0 +1,464 @@
+# -*- coding: utf-8 -*-
+"""
+CAM_Playground.FCMacro
+
+Safe sandbox macro for CAM (Path) read-only analysis.
+- Does NOT modify the current document.
+- Probes environment and analyzes selected solids.
+- Uses cam/path_integration.py from this repo.
+
+How to run:
+- FreeCAD: Macro -> Macros... -> Add this file -> Execute
+"""
+
+import sys
+from PySide import QtGui, QtCore
+
+# Ensure repo root is on path (adjust if needed)
+REPO_ROOT = "/Users/samarjit/CascadeProjects/freecad-cloud-copilot"
+if REPO_ROOT not in sys.path:
+    sys.path.append(REPO_ROOT)
+
+try:
+    from cam import path_integration as cam
+except Exception as e:
+    QtGui.QMessageBox.critical(None, "CAM Playground", f"Failed to import cam/path_integration.py\n{e}")
+    raise
+
+try:
+    import FreeCAD as App
+    import FreeCADGui as Gui
+except Exception as e:
+    QtGui.QMessageBox.critical(None, "CAM Playground", f"FreeCAD modules unavailable\n{e}")
+    raise
+
+
+class CamPlayground(QtGui.QDialog):
+    def __init__(self, parent=None):
+        super(CamPlayground, self).__init__(parent)
+        self.setWindowTitle("CAM Playground (Read-only)")
+        self.resize(640, 480)
+
+        self.btnProbe = QtGui.QPushButton("Probe Environment")
+        self.btnAnalyze = QtGui.QPushButton("Analyze Selected/Doc (Read-only)")
+        self.btnCreateDoc = QtGui.QPushButton("Create CAM Doc (Copy Selected)")
+        self.btnCreateJob = QtGui.QPushButton("Create CAM Job (Profile)")
+        self.btnClose = QtGui.QPushButton("Close")
+
+        self.output = QtGui.QPlainTextEdit()
+        self.output.setReadOnly(True)
+
+        btns = QtGui.QHBoxLayout()
+        btns.addWidget(self.btnProbe)
+        btns.addWidget(self.btnAnalyze)
+        btns.addWidget(self.btnCreateDoc)
+        btns.addWidget(self.btnCreateJob)
+        btns.addStretch(1)
+        btns.addWidget(self.btnClose)
+
+        layout = QtGui.QVBoxLayout(self)
+        layout.addLayout(btns)
+        layout.addWidget(self.output)
+
+        self.btnProbe.clicked.connect(self.on_probe)
+        self.btnAnalyze.clicked.connect(self.on_analyze)
+        self.btnCreateDoc.clicked.connect(self.on_create_cam_doc)
+        self.btnCreateJob.clicked.connect(self.on_create_job_profile)
+        self.btnClose.clicked.connect(self.close)
+
+    def write(self, text):
+        self.output.appendPlainText(text)
+
+    def on_probe(self):
+        try:
+            env = cam.probe_environment()
+            self.output.clear()
+            self.write("=== CAM Environment ===")
+            for k, v in env.items():
+                self.write(f"{k}: {v}")
+        except Exception as e:
+            QtGui.QMessageBox.critical(self, "Probe Error", str(e))
+
+    def on_analyze(self):
+        try:
+            doc = App.ActiveDocument
+            # If the user has a selection, pass selected object names; otherwise analyze entire doc
+            sel = Gui.Selection.getSelection()
+            obj_names = [o.Name for o in sel] if sel else None
+            result = cam.analyze_part(doc, obj_names=obj_names)
+            self.output.clear()
+            self.write("=== CAM Analysis (Read-only) ===")
+            for k in ["success","message","selected_objects","solids","suggestions","candidate_ops","warnings"]:
+                self.write(f"{k}: {result.get(k)}")
+        except Exception as e:
+            QtGui.QMessageBox.critical(self, "Analyze Error", str(e))
+
+    def on_create_cam_doc(self):
+        """Create a new document and copy the selected solid for CAM job preparation.
+        This is non-destructive: the original document is untouched.
+        """
+        try:
+            import Part
+            src_doc = App.ActiveDocument
+            if not src_doc:
+                QtGui.QMessageBox.information(self, "CAM", "No active document.")
+                return
+            sel = Gui.Selection.getSelection()
+            if not sel:
+                QtGui.QMessageBox.information(self, "CAM", "Select a solid object first.")
+                return
+            src_obj = sel[0]
+            shape = getattr(src_obj, "Shape", None)
+            if not shape or not getattr(shape, "Solids", []):
+                QtGui.QMessageBox.information(self, "CAM", "Selected object is not a solid.")
+                return
+
+            new_name = f"CAM_{src_doc.Label or src_doc.Name}"
+            dst_doc = App.newDocument(new_name)
+            copied = dst_doc.addObject("Part::Feature", "Workpiece")
+            copied.Shape = shape.copy()
+            dst_doc.recompute()
+
+            self.output.clear()
+            self.write("=== CAM Doc Created ===")
+            self.write(f"Source: {src_doc.Label or src_doc.Name} -> New Doc: {dst_doc.Label or dst_doc.Name}")
+            self.write(f"Copied object: {src_obj.Name} -> {copied.Name}")
+            self.write("Next: we can attempt scripted Job/Op creation depending on your FreeCAD Path version.")
+            self.write("This step intentionally avoids creating Jobs/Toolpaths to remain version-safe.")
+        except Exception as e:
+            QtGui.QMessageBox.critical(self, "Create CAM Doc Error", str(e))
+
+    def _ensure_tool_controller(self, doc, job=None):
+        """Create or find a basic 6mm endmill ToolController.
+        Returns the ToolController or None. Will attempt GUI fallback if API creation fails.
+        """
+        try:
+            # Reuse if one exists
+            for obj in doc.Objects:
+                if obj.TypeId.startswith('Path::ToolController'):
+                    return obj
+
+            from PathScripts import PathToolController as PTC  # type: ignore
+            tc = doc.addObject('Path::ToolController', 'TC_6mm')
+            # Try multiple tool creation strategies for version compatibility
+            created = False
+            try:
+                from PathScripts import PathToolBit  # type: ignore
+                # Factory name variants differ by version
+                factory = getattr(PathToolBit, 'Factory', None)
+                if factory:
+                    make = getattr(factory, 'createEndMill', None) or getattr(factory, 'CreateEndMill', None)
+                    if make:
+                        tool = make(diameter=6.0, name='EM6') if make.__code__.co_argcount >= 1 else make()
+                        try:
+                            tc.Tool = tool
+                            created = True
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+            if not created:
+                # Minimal fallback: some versions allow setting Diameter directly
+                try:
+                    tc.ToolDiameter = 6.0
+                    created = True
+                except Exception:
+                    pass
+
+            doc.recompute()
+            if created:
+                # Apply reasonable defaults if properties exist
+                for name, value in [
+                    ('SpindleSpeed', 12000),
+                    ('HorizFeed', 500.0),
+                    ('VertFeed', 200.0),
+                    ('ToolDiameter', 6.0),
+                ]:
+                    try:
+                        setattr(tc, name, value)
+                    except Exception:
+                        pass
+                return tc
+            # GUI fallback: try to add a ToolController under the active Job
+            try:
+                # Try to identify/select the job
+                if job is None:
+                    for o in doc.Objects:
+                        if getattr(o, 'TypeId', '').startswith('Path::Job'):
+                            job = o
+                            break
+                if job is not None:
+                    Gui.Selection.clearSelection()
+                    Gui.Selection.addSelection(doc.Name, job.Name)
+                self._activate_cam_workbench()
+                # Common command variants
+                cmd, err = self._run_first_command([
+                    'Path_ToolControllerCreate', 'CAM_ToolControllerCreate', 'Path_CreateToolController', 'Path_AddToolController',
+                ])
+                if err is None:
+                    # Re-scan for a ToolController
+                    for obj in doc.Objects:
+                        if obj.TypeId.startswith('Path::ToolController'):
+                            return obj
+            except Exception:
+                pass
+            return None
+        except Exception:
+            return None
+
+    def _activate_cam_workbench(self):
+        """Try to activate a CAM/Path workbench so GUI commands are registered."""
+        try:
+            wb = getattr(Gui, 'activeWorkbench', lambda: None)()
+            if wb and ('Path' in wb.__class__.__name__ or 'CAM' in wb.__class__.__name__):
+                return True
+        except Exception:
+            pass
+        names = []
+        try:
+            names = list(getattr(Gui, 'listWorkbenches', lambda: {})().keys())
+        except Exception:
+            names = []
+        for cand in ['PathWorkbench', 'CAMWorkbench', 'Path', 'CAM']:
+            if cand in names:
+                try:
+                    Gui.activateWorkbench(cand)
+                    return True
+                except Exception:
+                    continue
+        # Best-effort: try any workbench containing Path/CAM substrings
+        for n in names:
+            if ('Path' in n) or ('CAM' in n):
+                try:
+                    Gui.activateWorkbench(n)
+                    return True
+                except Exception:
+                    continue
+        return False
+
+    def _run_first_command(self, candidates):
+        """Try running the first available GUI command from the candidate list.
+        Returns (cmd_name, error_or_none).
+        """
+        try:
+            avail = set(getattr(Gui, 'listCommands', lambda: [])())
+        except Exception:
+            avail = set()
+        for name in candidates:
+            if name in avail:
+                try:
+                    Gui.runCommand(name, 0)
+                    return name, None
+                except Exception as e:
+                    return name, e
+        # If nothing matched, try activating the CAM workbench, refresh, and retry
+        self._activate_cam_workbench()
+        try:
+            avail = set(getattr(Gui, 'listCommands', lambda: [])())
+        except Exception:
+            avail = set()
+        for name in candidates:
+            if name in avail:
+                try:
+                    Gui.runCommand(name, 0)
+                    return name, None
+                except Exception as e:
+                    return name, e
+        # As last resort, discover likely commands by substring
+        discovered = [c for c in avail if (c.startswith('Path') or c.startswith('CAM')) and any(k in c for k in ['Job','Profile'])]
+        for name in discovered:
+            try:
+                Gui.runCommand(name, 0)
+                return name, None
+            except Exception:
+                continue
+        return None, RuntimeError(f"No matching command found among: {candidates}; discovered: {discovered}")
+
+    def on_create_job_profile(self):
+        """Create a Path Job and a simple Profile op in the CAM document.
+        Robust fallbacks are used; if op creation fails, at least the Job is created.
+        """
+        # Import PathJob using robust submodule import (FreeCAD 1.0+ often requires PathScripts.PathJob)
+        import importlib
+        PathJob = None
+        try:
+            PathJob = importlib.import_module('PathScripts.PathJob')  # type: ignore
+        except Exception:
+            try:
+                # Older naming
+                PathJob = importlib.import_module('Path.PathJob')  # type: ignore
+            except Exception as e:
+                # Fallback to GUI command workflow
+                PathJob = None
+                module_error = e
+
+        doc = App.ActiveDocument
+        if not doc:
+            QtGui.QMessageBox.information(self, "CAM", "No active CAM document. Use 'Create CAM Doc' first.")
+            return
+        wp = getattr(doc, 'Workpiece', None)
+        if wp is None:
+            # Try to find a single solid feature named Workpiece or any Part::Feature
+            for o in doc.Objects:
+                if o.Name == 'Workpiece':
+                    wp = o
+                    break
+            if wp is None:
+                QtGui.QMessageBox.information(self, "CAM", "No Workpiece found. Use 'Create CAM Doc' first.")
+                return
+
+        messages = []
+        try:
+            job = None
+            # Try Python API first
+            import importlib
+            try:
+                Path = importlib.import_module('Path')
+                jobmod = None
+                for name in ['Path.Main.Job', 'Path.Job', 'Path.Base.Job']:
+                    try:
+                        jobmod = importlib.import_module(name)
+                        break
+                    except Exception:
+                        continue
+                if jobmod:
+                    try:
+                        job = jobmod.Create(['Model','Workpiece'], None)
+                    except Exception:
+                        job = jobmod.Create(['Model', wp.Name], None)
+                    messages.append("Job created (Python API)")
+                else:
+                    raise ImportError("Path Job API not found")
+            except Exception as module_error:
+                # GUI fallback
+                try:
+                    Gui.Selection.clearSelection()
+                    Gui.Selection.addSelection(doc.Name, wp.Name)
+                    self._activate_cam_workbench()
+                    try:
+                        avail_cmds = list(getattr(Gui, 'listCommands', lambda: [])())
+                    except Exception:
+                        avail_cmds = []
+                    cmd, err = self._run_first_command([
+                        'Path_NewJob', 'CAM_NewJob', 'PathJob_New', 'Path_CreateJob', 'Path_JobCreate', 'Path_ToolControllerCreateJob'
+                    ])
+                    if err:
+                        raise err
+                    messages.append(f"Job created (GUI: {cmd})")
+                    messages.append(f"Debug: commands count={len(avail_cmds)}")
+                except Exception as e:
+                    raise RuntimeError(f"Job creation failed via GUI: {e}; original import error: {module_error}")
+
+            # Ensure a ToolController exists
+            tc = self._ensure_tool_controller(doc, job)
+            if tc:
+                try:
+                    grp = list(getattr(job, 'Group', []) or [])
+                    if tc not in grp:
+                        grp.append(tc)
+                        job.Group = grp
+                    messages.append("ToolController ready (6mm endmill)")
+                except Exception:
+                    pass
+            else:
+                messages.append("ToolController creation failed; proceeding without explicit tool")
+
+            # Create a Profile operation using faces/edges automatically
+            op_created = False
+            if PathJob is not None:
+                try:
+                    PF = importlib.import_module('PathScripts.PathProfileFaces')  # type: ignore
+                    op = getattr(PF, 'Create')('Profile', job)
+                    # Attach tool controller if available
+                    if tc:
+                        for attr in ['ToolController', 'ActiveToolController', 'ToolControllerName']:
+                            try:
+                                setattr(op, attr, tc if 'Name' not in attr else tc.Name)
+                                break
+                            except Exception:
+                                continue
+                    try:
+                        op.Base = [(wp, [])]
+                    except Exception:
+                        pass
+                    op_created = True
+                    messages.append("Profile op created (faces)")
+                except Exception:
+                    try:
+                        PE = importlib.import_module('PathScripts.PathProfileEdges')  # type: ignore
+                        op = getattr(PE, 'Create')('Profile', job)
+                        if tc:
+                            for attr in ['ToolController', 'ActiveToolController', 'ToolControllerName']:
+                                try:
+                                    setattr(op, attr, tc if 'Name' not in attr else tc.Name)
+                                    break
+                                except Exception:
+                                    continue
+                        try:
+                            op.Base = [(wp, [])]
+                        except Exception:
+                            pass
+                        op_created = True
+                        messages.append("Profile op created (edges)")
+                    except Exception as e:
+                        messages.append(f"Profile creation failed: {e}")
+            else:
+                # GUI fallback for profile
+                try:
+                    Gui.Selection.clearSelection()
+                    Gui.Selection.addSelection(doc.Name, wp.Name)
+                    # Activate workbench and try faces-based first, then edges, with multiple naming variants
+                    self._activate_cam_workbench()
+                    # Try Python API for Profile first
+                    created_py = False
+                    try:
+                        import importlib
+                        profmod = None
+                        for name in ['Path.Op.Profile', 'Path.Op.profile', 'Path.Op', 'Path.Main.Job']:
+                            try:
+                                profmod = importlib.import_module(name)
+                                break
+                            except Exception:
+                                continue
+                        if hasattr(profmod, 'Create'):
+                            # Some builds expose Path.Op.Profile.Create(job) or similar; best-effort
+                            try:
+                                profmod.Create()
+                                op_created = True
+                                created_py = True
+                                messages.append("Profile op created (Python API)")
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    if not created_py:
+                        cmd, err = self._run_first_command([
+                            'Path_ProfileFaces', 'CAM_ProfileFaces', 'Path_Profile', 'Path_ProfileEdges', 'CAM_ProfileEdges', 'Path_OpProfile', 'PathOp_Profile'
+                        ])
+                        if err:
+                            messages.append(f"Profile creation failed via GUI: {err}")
+                        else:
+                            op_created = True
+                            messages.append(f"Profile op created (GUI: {cmd})")
+                except Exception as e:
+                    messages.append(f"Profile creation failed via GUI: {e}")
+
+            doc.recompute()
+
+            self.output.clear()
+            self.write("=== CAM Job Result ===")
+            self.write("\n".join(messages))
+            if not op_created:
+                self.write("Tip: Even without an op, you can create one manually in the CAM workbench UI.")
+        except Exception as e:
+            QtGui.QMessageBox.critical(self, "Create Job Error", str(e))
+
+
+def run_dialog():
+    dlg = CamPlayground()
+    dlg.exec_()
+
+
+if __name__ == "__main__":
+    run_dialog()

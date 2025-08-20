@@ -333,14 +333,18 @@ class _DfmDocObserver(object):
     """
     def __init__(self):
         self._handler_installed = False
-        self._view = FreeCADGui.ActiveDocument.ActiveView
+        try:
+            adoc = getattr(FreeCADGui, 'ActiveDocument', None)
+            self._view = getattr(adoc, 'ActiveView', None) if adoc else None
+        except Exception:
+            self._view = None
 
         # Qt overlay tooltip widget
         global _DFM_TOOLTIP
         if _DFM_TOOLTIP is None:
             try:
                 # Try to parent it to the 3D view widget so it stays on top
-                parent_widget = self._view.getWidget()
+                parent_widget = self._view.getWidget() if self._view and hasattr(self._view, 'getWidget') else None
                 _DFM_TOOLTIP = _DfmTooltipController(parent=parent_widget)
             except Exception as e:
                 FreeCAD.Console.PrintWarning(f"[DFM] Could not get 3D view widget: {e}, using no parent\n")
@@ -348,12 +352,14 @@ class _DfmDocObserver(object):
                 _DFM_TOOLTIP = _DfmTooltipController(parent=None)
 
         # Install event callback once
-        if not self._handler_installed:
+        if not self._handler_installed and self._view is not None:
             try:
                 self._view.addEventCallback("SoEvent", self._on_event)
                 self._handler_installed = True
             except Exception as e:
                 FreeCAD.Console.PrintWarning(f"[DFM] Could not install event callback: {e}\n")
+        elif self._view is None:
+            FreeCAD.Console.PrintMessage("[DFM] Skipping hover tooltip wiring: no ActiveView available.\n")
 
     def slotChangedObject(self, obj, prop):
         try:
@@ -385,6 +391,9 @@ class _DfmDocObserver(object):
         Left click: pin/unpin tooltip.
         """
         try:
+            # If no valid view, ignore events
+            if not getattr(self, '_view', None):
+                return
             etype = info.get("Type", "")
             pos = info.get("Position")  # Qt coords relative to view
             if pos is None:
@@ -407,7 +416,10 @@ class _DfmDocObserver(object):
                         obj = FreeCAD.ActiveDocument.getObject(obj_name)
                         if obj and hasattr(obj, "IssueTooltip"):
                             # Translate view coords to global screen coords for widget placement
-                            g = view.getWidget().mapToGlobal(QtCore.QPoint(pos[0], pos[1]))
+                            widget = view.getWidget() if hasattr(view, 'getWidget') else None
+                            if not widget:
+                                return
+                            g = widget.mapToGlobal(QtCore.QPoint(pos[0], pos[1]))
                             _DFM_TOOLTIP.show_text(obj.IssueTooltip, g)
                             return
                 # If not over an issue overlay, hide if not pinned
@@ -440,6 +452,10 @@ def disable_auto_sync_and_tooltips():
     FreeCAD.Console.PrintMessage("[DFM] Auto-sync + 3D tooltips disabled.\n")
 
 # ---------- PUBLIC API ----------
+import sys as _sys
+# Disable interactive 3D tooltip system by default on macOS to avoid Qt crashes
+DFM_TOOLTIPS_ENABLED_DEFAULT = False if _sys.platform == 'darwin' else True
+
 def dfm_draw_per_issue_overlays(obj_name, issues, radius_mm=3.0, clear=True,
                                 lin_def=0.1, ang_def=0.5):
     """
@@ -447,7 +463,14 @@ def dfm_draw_per_issue_overlays(obj_name, issues, radius_mm=3.0, clear=True,
     assigns per-issue tooltip text, and enables hover tooltips.
     """
     out = dfm_visualize_per_issue(obj_name, issues, radius_mm, clear, lin_def, ang_def)
-    enable_auto_sync_and_tooltips()
+    # Only enable hover/click tooltips if platform supports it safely
+    try:
+        if DFM_TOOLTIPS_ENABLED_DEFAULT:
+            enable_auto_sync_and_tooltips()
+        else:
+            FreeCAD.Console.PrintMessage("[DFM] Tooltips disabled by default on this platform to ensure stability.\n")
+    except Exception as _e:
+        FreeCAD.Console.PrintWarning(f"[DFM] Tooltip system unavailable: {_e}\n")
     return out
 
 def dfm_toggle_overlays(obj_name, visible=True):
@@ -6228,7 +6251,7 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Create group box for manufacturing features
         mfg_group = QtWidgets.QGroupBox("Cloud Manufacturing Features")
         mfg_layout = QtWidgets.QVBoxLayout()
-        
+
     def on_analyze_clicked(self):
         """Handle analyze button click - now runs full DFM analysis with professional overlays"""
         self.add_system_message("Running DFM analysis with professional overlays...")
@@ -6348,19 +6371,39 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # DFM Analysis button
         self.dfm_button = QtWidgets.QPushButton("Advanced DFM Analysis")
         self.dfm_button.setToolTip("Analyze design for manufacturability using industry-grade DFM engine")
-        self.dfm_button.clicked.connect(self.on_dfm_clicked)
+        # Guard against missing handler in some builds; fall back to on_analyze_clicked
+        handler = getattr(self, 'on_dfm_clicked', None)
+        if not callable(handler):
+            handler = getattr(self, 'on_analyze_clicked', None)
+        if callable(handler):
+            self.dfm_button.clicked.connect(handler)
+        else:
+            # As last resort, disable the button to avoid runtime errors
+            self.dfm_button.setEnabled(False)
         button_grid.addWidget(self.dfm_button, 0, 0)
         
         # Cost Estimation button
         self.cost_button = QtWidgets.QPushButton("Cost Estimation")
         self.cost_button.setToolTip("Estimate manufacturing costs")
-        self.cost_button.clicked.connect(self.on_cost_clicked)
+        cost_handler = getattr(self, 'on_cost_clicked', None)
+        if not callable(cost_handler):
+            cost_handler = getattr(self, 'on_analyze_clicked', None)
+        if callable(cost_handler):
+            self.cost_button.clicked.connect(cost_handler)
+        else:
+            self.cost_button.setEnabled(False)
         button_grid.addWidget(self.cost_button, 0, 1)
         
         # Tool Recommendations button
         self.tools_button = QtWidgets.QPushButton("Tool Recommendations")
         self.tools_button.setToolTip("Get tool and machining recommendations")
-        self.tools_button.clicked.connect(self.on_tools_clicked)
+        tools_handler = getattr(self, 'on_tools_clicked', None)
+        if not callable(tools_handler):
+            tools_handler = None  # no obvious fallback
+        if callable(tools_handler):
+            self.tools_button.clicked.connect(tools_handler)
+        else:
+            self.tools_button.setEnabled(False)
         button_grid.addWidget(self.tools_button, 1, 0)
         
         # BOM button replaces Compare Methods
@@ -6373,7 +6416,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Initially hidden - only shown after DFM analysis completes
         self.show_problems_button = QtWidgets.QPushButton("Show Problem Areas")
         self.show_problems_button.setToolTip("Visualize manufacturing problem areas with colored overlays on the CAD model")
-        self.show_problems_button.clicked.connect(self.on_show_problems_clicked)
+        show_handler = getattr(self, 'on_show_problems_clicked', None)
+        if callable(show_handler):
+            self.show_problems_button.clicked.connect(show_handler)
+        else:
+            self.show_problems_button.setEnabled(False)
         self.show_problems_button.setVisible(False)  # Hidden by default
         button_grid.addWidget(self.show_problems_button, 2, 0)
         
@@ -6381,7 +6428,11 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         # Initially hidden - only shown after problem areas are displayed
         self.hide_problems_button = QtWidgets.QPushButton("Hide Problem Areas")
         self.hide_problems_button.setToolTip("Remove manufacturing problem area overlays from the CAD model")
-        self.hide_problems_button.clicked.connect(self.on_hide_problems_clicked)
+        hide_handler = getattr(self, 'on_hide_problems_clicked', None)
+        if callable(hide_handler):
+            self.hide_problems_button.clicked.connect(hide_handler)
+        else:
+            self.hide_problems_button.setEnabled(False)
         self.hide_problems_button.setVisible(False)  # Hidden by default
         button_grid.addWidget(self.hide_problems_button, 2, 1)
         
@@ -6403,16 +6454,29 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         layout.addWidget(mfg_group)
     
     def on_bom_clicked(self):
-        """Handle BOM button click: prefer BOM Workbench; fallback to local BOM"""
+        """Handle BOM button click: show custom BOM window (INR), fallback to WB/local on error"""
         try:
             # Basic guard: active document required for meaningful BOM
             if not FreeCAD.ActiveDocument:
                 self.add_system_message("No active document found")
                 self.add_assistant_message("Please open or create a model before generating a BOM.")
                 return
-            
-            self.add_system_message("Preparing Bill of Materials...")
-            
+
+            self.add_system_message("Preparing Bill of Materials (custom BOM window)...")
+
+            # New: Try custom floating window first (isolated UI)
+            try:
+                self._show_bom_window()
+                return
+            except Exception as e_custom:
+                print(f"DEBUG: Custom BOM window failed, falling back: {e_custom}")
+
+            # Track existing BOM/Spreadsheet objects so we can detect new output
+            try:
+                self._bom_sheets_before = self._list_spreadsheet_names()
+            except Exception:
+                self._bom_sheets_before = set()
+
             # Try BOM Workbench first
             if self._activate_bom_workbench():
                 cmd = self._find_bom_command()
@@ -6431,6 +6495,602 @@ class StandaloneCoPilot(QtWidgets.QWidget):
         except Exception as e:
             self.add_system_message(f"Error generating BOM: {str(e)}")
             traceback.print_exc()
+
+    # ==============================
+    # Custom BOM Window (INR)
+    # ==============================
+    def _show_bom_window(self):
+        """Build and show the custom BOM floating window with INR pricing"""
+        pricing = self._load_or_create_in_pricing()
+        items, totals = self._collect_bom_items_with_pricing(pricing)
+        # Ask user for required quantity (used to seed amortization and per-unit display)
+        try:
+            qty, ok = QtWidgets.QInputDialog.getInt(None, "BOM Quantity", "Required quantity for costing:", 1000, 1, 1000000, 1)
+            if not ok:
+                qty = 1000
+        except Exception:
+            qty = 1000
+        dlg = _BOMDialog(items, totals, pricing, initial_qty=qty)
+        dlg.setWindowTitle("Bill of Materials (INR)")
+        dlg.setWindowModality(QtCore.Qt.NonModal)
+        dlg.show()
+        # keep reference to avoid GC
+        self._bom_dialog_ref = dlg
+
+    def _load_or_create_in_pricing(self):
+        import os, json
+        root = os.path.dirname(os.path.abspath(__file__))
+        path = os.path.join(root, 'pricing_in.json')
+        if not os.path.exists(path):
+            data = {
+                "currency": "INR",
+                "gst_percent": 18,
+                "rounding": {"digits": 2},
+                "materials": {
+                    "PLA": {"unit": "kg", "rate": 1200, "density_g_cm3": 1.24},
+                    "ABS": {"unit": "kg", "rate": 1000, "density_g_cm3": 1.04},
+                    "Nylon": {"unit": "kg", "rate": 1800, "density_g_cm3": 1.15},
+                    "Aluminum_6061": {"unit": "kg", "rate": 650, "density_g_cm3": 2.70},
+                    "SS304": {"unit": "kg", "rate": 220, "density_g_cm3": 8.00},
+                    "Generic": {"unit": "kg", "rate": 500, "density_g_cm3": 1.2}
+                },
+                "process": {
+                    "enable": True,
+                    "default": "3d_printing",
+                    "process_includes_material": True,
+                    "3d_printing": {
+                        "by_volume_cm3": {"PLA": 4.0, "ABS": 4.5, "Nylon": 6.0, "Generic": 4.0}
+                    },
+                    "cnc_machining": {
+                        "enable": False,
+                        "by_time_min": {"default": 60.0},
+                        "setup_fee": 300.0
+                    },
+                    "sheet_metal": {
+                        "enable": False,
+                        "laser_cut_perimeter_mm": 0.5,
+                        "bend_per_bend": 15.0
+                    }
+                }
+            }
+            with open(path, 'w') as f:
+                json.dump(data, f, indent=2)
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    def _collect_bom_items_with_pricing(self, pricing):
+        """Traverse document, aggregate items, compute INR pricing.
+        Returns (items, totals) where items is a list of dict rows.
+        """
+        doc = FreeCAD.ActiveDocument
+        items = {}
+        # Helper: find display name and material
+        def _display_name(o):
+            return getattr(o, 'Label', getattr(o, 'Name', 'Item'))
+        def _material_name(o):
+            # simple heuristic; use property if exists, else 'Generic'
+            try:
+                if hasattr(o, 'Material') and isinstance(o.Material, str) and o.Material:
+                    return o.Material
+                if hasattr(o, 'Material') and isinstance(o.Material, dict) and o.Material.get('Name'):
+                    return o.Material.get('Name')
+                if hasattr(o, 'ViewObject') and hasattr(o.ViewObject, 'Material') and o.ViewObject.Material:
+                    return str(o.ViewObject.Material)
+            except Exception:
+                pass
+            return 'Generic'
+        def _shape_volume_cm3(o):
+            try:
+                if hasattr(o, 'Shape') and o.Shape and hasattr(o.Shape, 'Volume'):
+                    # FreeCAD Volume is mm^3; convert to cm^3
+                    return float(o.Shape.Volume) / 1000.0
+            except Exception:
+                pass
+            return 0.0
+        def _mass_from_volume(vol_cm3, mat):
+            mcfg = pricing.get('materials', {}).get(mat) or pricing.get('materials', {}).get('Generic', {})
+            rho = float(mcfg.get('density_g_cm3', 1.2))
+            return (vol_cm3 * rho) / 1000.0  # kg
+        def _unit_cost_inr(o, qty, mat, vol_cm3, mass_kg):
+            # 1) per-part override
+            try:
+                if 'CostPerUnit_INR' in getattr(o, 'PropertiesList', []):
+                    val = getattr(o, 'CostPerUnit_INR', None)
+                    if isinstance(val, (int, float)) and val >= 0:
+                        return float(val), 'Override'
+            except Exception:
+                pass
+            # 2) material rate (INR/kg)
+            mat_cfg = pricing.get('materials', {}).get(mat) or pricing.get('materials', {}).get('Generic', {})
+            material_rate = float(mat_cfg.get('rate', 0.0))
+            material_cost = mass_kg * material_rate
+            note = 'Material'
+            # 3) process heuristic (default 3d printing by volume)
+            p_cfg = pricing.get('process', {})
+            if p_cfg.get('enable', True):
+                p_def = p_cfg.get('default', '3d_printing')
+                if p_def == '3d_printing':
+                    vol_table = p_cfg.get('3d_printing', {}).get('by_volume_cm3', {})
+                    rate = float(vol_table.get(mat, vol_table.get('Generic', 12.0)))
+                    process_cost = vol_cm3 * rate
+                    # If process includes material, use process_cost only; else add
+                    if bool(p_cfg.get('process_includes_material', True)):
+                        return process_cost, "3DPrint"
+                    else:
+                        return material_cost + process_cost, "Material+3DPrint"
+                # CNC/sheet metal can be expanded later safely
+            return material_cost, note
+
+        # Aggregate by document object identity (Name) to count quantities, including Links
+        for o in doc.Objects:
+            try:
+                # We will consider only visible solids/bodies/features/links for BOM
+                if not hasattr(o, 'ViewObject') or (hasattr(o.ViewObject, 'Visibility') and not o.ViewObject.Visibility):
+                    continue
+                # Skip groups/containers
+                if o.TypeId in ("App::DocumentObjectGroup",):
+                    continue
+                # Skip datum/planes/axes/origin and construction helpers
+                skip_typeids = {
+                    'PartDesign::Plane','PartDesign::Line','App::Plane','App::Line',
+                    'PartDesign::CoordinateSystem','App::Origin','PartDesign::Origin'
+                }
+                if getattr(o, 'TypeId', '') in skip_typeids:
+                    continue
+                name_lower = (getattr(o, 'Label', '') or getattr(o, 'Name', '') or '').lower()
+                if any(tok in name_lower for tok in [' xy', ' yz', ' xz', 'xy plane', 'yz plane', 'xz plane', 'datum', 'origin', 'x axis', 'y axis', 'z axis', 'plane']):
+                    continue
+                key = getattr(o, 'LinkedObject', None)
+                if key is not None:
+                    # Assembly link: use target object for grouping
+                    base = key
+                    base_name = getattr(base, 'Name', _display_name(o))
+                    ident = f"LINK::{base_name}"
+                else:
+                    ident = f"OBJ::{getattr(o, 'Name', _display_name(o))}"
+                entry = items.get(ident)
+                vol_cm3 = _shape_volume_cm3(o)
+                # Skip zero/near-zero volume items
+                if vol_cm3 <= 0.0:
+                    continue
+                mat = _material_name(o)
+                mass_kg = _mass_from_volume(vol_cm3, mat)
+                if not entry:
+                    entry = {
+                        'Part': _display_name(o),
+                        'Material': mat,
+                        'Volume': 0.0,
+                        'Mass': 0.0,
+                        'Quantity': 0,
+                        'Node': o,
+                    }
+                    items[ident] = entry
+                entry['Quantity'] += 1
+                # accumulate volume/mass per instance
+                entry['Volume'] += vol_cm3
+                entry['Mass'] += mass_kg
+            except Exception:
+                continue
+
+        # Compute pricing
+        rounding = int(pricing.get('rounding', {}).get('digits', 2))
+        rows = []
+        subtotal = 0.0
+        for ident, e in items.items():
+            qty = int(e['Quantity'])
+            mat = e['Material']
+            vol_cm3 = float(e['Volume'])
+            mass_kg = float(e['Mass'])
+            unit_cost, note = _unit_cost_inr(e['Node'], qty, mat, vol_cm3/qty if qty else vol_cm3, mass_kg/qty if qty else mass_kg)
+            ext = unit_cost * qty
+            subtotal += ext
+            rows.append({
+                'Part': e['Part'],
+                'Quantity': qty,
+                'Material': mat,
+                'Volume': round(vol_cm3, rounding),
+                'Mass': round(mass_kg, rounding),
+                'UnitCost': round(unit_cost, rounding),
+                'ExtendedCost': round(ext, rounding),
+                'Notes': note
+            })
+
+        gst_percent = float(pricing.get('gst_percent', 18))
+        gst_amount = subtotal * (gst_percent / 100.0)
+        grand_total = subtotal + gst_amount
+        totals = {
+            'currency': pricing.get('currency', 'INR'),
+            'subtotal': round(subtotal, rounding),
+            'gst_percent': gst_percent,
+            'gst_amount': round(gst_amount, rounding),
+            'grand_total': round(grand_total, rounding)
+        }
+        return rows, totals
+
+class _BOMDialog(QtWidgets.QDialog):
+    def __init__(self, items, totals, pricing, parent=None, initial_qty: int = 1):
+        super().__init__(parent)
+        self.items = items
+        self.totals = totals
+        self.pricing = pricing
+        self.setWindowFlags(self.windowFlags() | QtCore.Qt.Tool)
+        self.resize(900, 520)
+        # Map of group key to list of row indices for batch behavior
+        self._group_map = {}
+        for idx, it in enumerate(self.items):
+            gkey = it.get('Ident', it.get('Part'))
+            self._group_map.setdefault(gkey, []).append(idx)
+        # Default amortization quantity (for tooling processes)
+        self._amort_qty = max(1, int(initial_qty) if initial_qty else 1)
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QtWidgets.QVBoxLayout(self)
+        # Table
+        self.table = QtWidgets.QTableWidget(self)
+        headers = ["Part", "Quantity", "Process", "Material", "Volume", "Mass", "Unit Cost (₹)", "Extended Cost (₹)", "Notes"]
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        self.table.setRowCount(len(self.items))
+        processes = self._process_options()
+        materials = self._material_options()
+        for r, it in enumerate(self.items):
+            self._set(r, 0, it['Part'])
+            self._set(r, 1, str(it['Quantity']))
+            # Process combobox with heuristic default
+            proc_combo = QtWidgets.QComboBox()
+            proc_combo.addItems(processes)
+            # heuristic default: 3D Printing (FDM/FFF)
+            default_proc = it.get('BOM_Process') or '3D Printing (FDM/FFF)'
+            idx = proc_combo.findText(default_proc)
+            proc_combo.setCurrentIndex(max(0, idx))
+            self.table.setCellWidget(r, 2, proc_combo)
+            # Material combobox with detected default
+            mat_combo = QtWidgets.QComboBox()
+            mat_combo.addItems(materials)
+            default_mat = it.get('Material') or 'ABS'
+            midx = mat_combo.findText(default_mat)
+            if midx < 0:
+                midx = mat_combo.findText('Generic')
+            mat_combo.setCurrentIndex(max(0, midx))
+            self.table.setCellWidget(r, 3, mat_combo)
+            # Static columns
+            self._set(r, 4, str(it['Volume']))
+            self._set(r, 5, str(it['Mass']))
+            # Costs - recomputed below using current selections
+            self._set(r, 6, "0.0")
+            self._set(r, 7, "0.0")
+            self._set(r, 8, it.get('Notes',''))
+            # Connect signals for live recalc with batch behavior
+            proc_combo.currentTextChanged.connect(lambda _=None, row=r: self._on_row_changed(row))
+            mat_combo.currentTextChanged.connect(lambda _=None, row=r: self._on_row_changed(row))
+        self.table.resizeColumnsToContents()
+        v.addWidget(self.table)
+
+        # Controls + Totals
+        totals_box = QtWidgets.QGroupBox("Controls & Totals")
+        g = QtWidgets.QGridLayout()
+        # Amortization Quantity input
+        g.addWidget(QtWidgets.QLabel("Amortization Quantity:"), 0, 0)
+        self.amort_spin = QtWidgets.QSpinBox()
+        self.amort_spin.setRange(1, 1000000)
+        self.amort_spin.setValue(int(self._amort_qty))
+        self.amort_spin.valueChanged.connect(self._on_amort_changed)
+        g.addWidget(self.amort_spin, 0, 1)
+        g.addWidget(QtWidgets.QLabel("Subtotal (₹):"), 0, 2)
+        self.lbl_subtotal = QtWidgets.QLabel(str(self.totals['subtotal']))
+        g.addWidget(self.lbl_subtotal, 0, 3)
+        g.addWidget(QtWidgets.QLabel(f"GST {int(self.totals['gst_percent'])}% (₹):"), 1, 2)
+        self.lbl_gst = QtWidgets.QLabel(str(self.totals['gst_amount']))
+        g.addWidget(self.lbl_gst, 1, 3)
+        g.addWidget(QtWidgets.QLabel("Total (₹):"), 2, 2)
+        self.lbl_total = QtWidgets.QLabel(str(self.totals['grand_total']))
+        g.addWidget(self.lbl_total, 2, 3)
+        # Per-unit at selected quantity
+        g.addWidget(QtWidgets.QLabel("Per-Unit at Qty:"), 3, 2)
+        self.lbl_unit_at_qty = QtWidgets.QLabel("0.00")
+        g.addWidget(self.lbl_unit_at_qty, 3, 3)
+        totals_box.setLayout(g)
+        v.addWidget(totals_box)
+        # Initial compute AFTER totals labels exist
+        self._recompute_all_rows()
+
+        # Buttons
+        hb = QtWidgets.QHBoxLayout()
+        btn_csv = QtWidgets.QPushButton("Export CSV")
+        btn_xlsx = QtWidgets.QPushButton("Export XLSX")
+        btn_copy = QtWidgets.QPushButton("Copy Table")
+        btn_recompute = QtWidgets.QPushButton("Recompute")
+        btn_close = QtWidgets.QPushButton("Close")
+        hb.addWidget(btn_csv)
+        hb.addWidget(btn_xlsx)
+        hb.addWidget(btn_copy)
+        hb.addStretch(1)
+        hb.addWidget(btn_recompute)
+        hb.addWidget(btn_close)
+        v.addLayout(hb)
+
+        btn_csv.clicked.connect(self._export_csv)
+        btn_xlsx.clicked.connect(self._export_xlsx)
+        btn_copy.clicked.connect(self._copy_table)
+        btn_recompute.clicked.connect(self._recompute)
+        btn_close.clicked.connect(self.close)
+
+    def _set(self, r, c, text):
+        self.table.setItem(r, c, QtWidgets.QTableWidgetItem(text))
+
+    def _export_csv(self):
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save CSV", "bom.csv", "CSV Files (*.csv)")
+        if not path:
+            return
+        import csv
+        with open(path, 'w', newline='') as f:
+            w = csv.writer(f)
+            headers = ["Part", "Quantity", "Process", "Material", "Volume", "Mass", "Unit Cost (INR)", "Extended Cost (INR)", "Notes", "Amortization Qty"]
+            w.writerow(headers)
+            for r, it in enumerate(self.items):
+                proc = self._proc_at(r)
+                mat = self._mat_at(r)
+                w.writerow([it['Part'], it['Quantity'], proc, mat, it['Volume'], it['Mass'], self._val_at(r,6), self._val_at(r,7), it.get('Notes',''), self._amort_qty])
+
+    def _export_xlsx(self):
+        try:
+            import openpyxl  # noqa: F401
+        except Exception:
+            QtWidgets.QMessageBox.information(self, "XLSX Export", "XLSX export requires 'openpyxl'. Please install it (e.g., pip install openpyxl). Falling back to CSV is available.")
+            return
+        path, _ = QtWidgets.QFileDialog.getSaveFileName(self, "Save XLSX", "bom.xlsx", "Excel Files (*.xlsx)")
+        if not path:
+            return
+        from openpyxl import Workbook
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "BOM"
+        headers = ["Part", "Quantity", "Process", "Material", "Volume", "Mass", "Unit Cost (INR)", "Extended Cost (INR)", "Notes", "Amortization Qty"]
+        ws.append(headers)
+        for r, it in enumerate(self.items):
+            ws.append([it['Part'], it['Quantity'], self._proc_at(r), self._mat_at(r), it['Volume'], it['Mass'], self._val_at(r,6), self._val_at(r,7), it.get('Notes',''), self._amort_qty])
+        # Totals sheet
+        ws2 = wb.create_sheet("Totals")
+        ws2.append(["Subtotal (INR)", self.totals['subtotal']])
+        ws2.append([f"GST {int(self.totals['gst_percent'])}% (INR)", self.totals['gst_amount']])
+        ws2.append(["Total (INR)", self.totals['grand_total']])
+        wb.save(path)
+
+    def _copy_table(self):
+        text = []
+        headers = ["Part", "Quantity", "Process", "Material", "Volume", "Mass", "Unit Cost (INR)", "Extended Cost (INR)", "Notes", "Amortization Qty"]
+        text.append(",".join(headers))
+        for r, it in enumerate(self.items):
+            row = [str(it['Part']), str(it['Quantity']), self._proc_at(r), self._mat_at(r), str(it['Volume']), str(it['Mass']), self._val_at(r,6), self._val_at(r,7), str(it.get('Notes','')), str(self._amort_qty)]
+            text.append(",".join(row))
+        QtWidgets.QApplication.clipboard().setText("\n".join(text))
+
+    def _recompute(self):
+        # Reload pricing and re-collect
+        try:
+            parent_panel = None
+            # Try to locate active task panel if needed later; here we recompute based on document only
+            pricing = self.pricing  # reload file on demand if necessary
+            # Read fresh pricing file from disk in case user edited it
+            import os, json
+            root = os.path.dirname(os.path.abspath(__file__))
+            path = os.path.join(root, 'pricing_in.json')
+            try:
+                with open(path, 'r') as f:
+                    pricing = json.load(f)
+            except Exception:
+                pass
+            # Recollect items
+            panel = None
+            try:
+                import FreeCADGui
+                ad = getattr(FreeCADGui, 'Control', None)
+                panel = FreeCADGui.Control.activeDialog() if ad else None
+            except Exception:
+                panel = None
+            # Use a minimal collector to avoid tight coupling
+            doc = FreeCAD.ActiveDocument
+            # Simple bridge: re-run the same logic by constructing a transient collector
+            tmp_panel = panel if panel else object()
+            # We need StandaloneCoPilotTaskPanel collector; re-run via a helper instance is out of scope here.
+            # Instead, perform a minimal recompute using current table values (keeps UI responsive):
+            # For full recompute, close and reopen from BOM button.
+            QtWidgets.QMessageBox.information(self, "BOM", "Recompute by pressing the BOM button again to reflect model changes. Pricing file edits are picked up on next open.")
+        except Exception as e:
+            # Be graceful; advise user to reopen BOM
+            try:
+                QtWidgets.QMessageBox.warning(self, "BOM", f"Recompute failed: {e}. Please close and reopen the BOM window.")
+            except Exception:
+                pass
+
+    # Helpers for dropdown BOM
+    def _process_options(self):
+        # Aggregate a broad catalog; allow override via pricing config later
+        return [
+            # 3D Printing
+            '3D Printing (FDM/FFF)','3D Printing (SLA)','3D Printing (DLP)','3D Printing (SLS)','3D Printing (MJF)',
+            'Metal Printing (DMLS/SLM)','Metal Printing (EBM)','Binder Jet + Sinter','DED/WAAM',
+            # Machining
+            'CNC 3-Axis Milling','CNC 5-Axis Milling','CNC Turning','Mill-Turn','Wire EDM',
+            # Sheet Metal
+            'Laser Cut + Bend','Waterjet + Bend','Plasma + Bend','Turret Punching','Progressive Stamping','Blanking','Deep Drawing',
+            # Casting
+            'Sand Casting','Gravity Die Casting','Pressure Die Casting','Investment Casting',
+            # Molding/Forming
+            'Injection Molding','Compression Molding','Transfer Molding','Blow Molding','Rotational Molding','Thermoforming','RIM (PU)',
+            # Wood
+            'CNC Wood Routing','Wood Laser Cutting','Wood Turning',
+            # Rubber
+            'Rubber Injection','Rubber Compression','Rubber Transfer',
+            # Composites
+            'Composites Hand Layup','Vacuum Bagging','VARTM Infusion','Prepreg + Autoclave','Filament Winding','Pultrusion'
+        ]
+
+    def _material_options(self):
+        return [
+            # Plastics
+            'ABS','PLA','PETG','PC','PA12','PA6','PA-CF','ASA','PP','POM','PMMA','PVC','TPU 95A','TPE','PEI ULTEM 9085','PPS','PEEK','CF-PEEK','PC-ABS','HIPS','Nylon-GF','Nylon-CF','PET','HDPE',
+            # Metals
+            'Aluminum_6061','Aluminum_6063','Aluminum_7075','Aluminum_2024','Aluminum_5083','SS304','SS316L','SS17-4PH','IS2062','ToolSteel_D2','ToolSteel_H13','Copper_C110','Brass_CZ121','Bronze_C932','Titanium_Ti-6Al-4V','Inconel_718','GI','CRCA',
+            # Wood
+            'MDF','Plywood','Birch_Plywood','Teak','Pine',
+            # Rubber
+            'NBR','EPDM','Silicone','Neoprene','Viton','SBR',
+            # Composites
+            'GFRP','CFRP','Kevlar_Epoxy',
+            'Generic'
+        ]
+
+    def _proc_at(self, row:int) -> str:
+        w = self.table.cellWidget(row, 2)
+        return w.currentText() if isinstance(w, QtWidgets.QComboBox) else ''
+
+    def _mat_at(self, row:int) -> str:
+        w = self.table.cellWidget(row, 3)
+        return w.currentText() if isinstance(w, QtWidgets.QComboBox) else ''
+
+    def _val_at(self, row:int, col:int) -> str:
+        it = self.table.item(row, col)
+        return it.text() if it else ''
+
+    def _on_amort_changed(self, val:int):
+        self._amort_qty = max(1, int(val))
+        self._recompute_all_rows()
+
+    def _on_row_changed(self, row:int):
+        # Batch apply to identical parts
+        gkey = self.items[row].get('Ident', self.items[row].get('Part'))
+        rows = self._group_map.get(gkey, [row])
+        src_proc = self._proc_at(row)
+        src_mat = self._mat_at(row)
+        for r in rows:
+            # set selections
+            pw = self.table.cellWidget(r, 2)
+            mw = self.table.cellWidget(r, 3)
+            if isinstance(pw, QtWidgets.QComboBox):
+                idx = pw.findText(src_proc)
+                if idx >= 0:
+                    pw.blockSignals(True); pw.setCurrentIndex(idx); pw.blockSignals(False)
+            if isinstance(mw, QtWidgets.QComboBox):
+                idx = mw.findText(src_mat)
+                if idx >= 0:
+                    mw.blockSignals(True); mw.setCurrentIndex(idx); mw.blockSignals(False)
+        # Persist on FreeCAD object if possible
+        try:
+            node = self.items[row].get('Node')
+            if node:
+                for prop, val in [('BOM_Process', src_proc), ('BOM_Material', src_mat)]:
+                    try:
+                        if not hasattr(node, prop):
+                            node.addProperty('App::PropertyString', prop, 'BOM', 'BOM selection')
+                        setattr(node, prop, val)
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        self._recompute_all_rows()
+
+    def _recompute_all_rows(self):
+        subtotal = 0.0
+        for r, it in enumerate(self.items):
+            qty = float(it.get('Quantity', 1))
+            vol = float(it.get('Volume', 0))
+            mass = float(it.get('Mass', 0))
+            proc = self._proc_at(r)
+            mat = self._mat_at(r)
+            unit, note = self._price_by_process(proc, mat, vol, mass, self._amort_qty)
+            ext = unit * qty
+            self.table.item(r, 6).setText(f"{unit:.2f}")
+            self.table.item(r, 7).setText(f"{ext:.2f}")
+            # Show breakdown in notes and tooltip
+            self.table.item(r, 8).setText(str(note))
+            for c in range(self.table.columnCount()):
+                it_cell = self.table.item(r, c)
+                if it_cell:
+                    it_cell.setToolTip(str(note))
+            subtotal += ext
+            # store note if wanted
+            # self.table.item(r, 8).setText(note)
+        gstp = float(self.pricing.get('gst_percent', 18))
+        gst = round(subtotal * gstp/100.0, 2)
+        total = round(subtotal + gst, 2)
+        self.lbl_subtotal.setText(f"{subtotal:.2f}")
+        self.lbl_gst.setText(f"{gst:.2f}")
+        self.lbl_total.setText(f"{total:.2f}")
+        # Per-unit at selected quantity (total divided by amortization quantity)
+        try:
+            per_unit = total / float(self._amort_qty)
+        except Exception:
+            per_unit = total
+        self.lbl_unit_at_qty.setText(f"{per_unit:.2f}")
+
+    def _price_by_process(self, proc:str, mat:str, vol_cm3:float, mass_kg:float, amort_qty:int):
+        # Category mapping
+        p = proc.lower()
+        if 'printing' in p or 'mjf' in p or 'sls' in p or 'binder' in p or 'dmls' in p or 'slm' in p or 'ebm' in p:
+            table = self.pricing.get('process', {}).get('3d_printing', {}).get('by_volume_cm3', {})
+            rate = float(table.get(mat, table.get('Generic', 4.0)))
+            unit = vol_cm3 * rate
+            note = f"3D Printing | vol {vol_cm3:.2f} cm³ × ₹{rate:.2f}/cm³ = ₹{unit:.2f} (material included)"
+            return unit, note
+        if 'wire edm' in p:
+            rate = float(self.pricing.get('edm_rate_inr_per_min', 120))
+            tmin = max(1.0, vol_cm3**0.33 * 2)  # crude edge-length heuristic
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate',0))
+            unit = tmin * rate + mass_kg*mat_rate
+            note = f"Wire EDM | time {tmin:.1f} min × ₹{rate:.0f}/min + mass {mass_kg:.3f} kg × ₹{mat_rate:.0f}/kg = ₹{unit:.2f}"
+            return unit, note
+        if 'cnc' in p or 'turn' in p or 'mill' in p:
+            rate = float(self.pricing.get('cnc_rate_inr_per_min', 60))
+            setup = float(self.pricing.get('cnc_setup_inr', 300))
+            tmin = max(2.0, vol_cm3/200.0)  # heuristic
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 500))
+            unit = tmin*rate + setup/ max(1, amort_qty) + mass_kg*mat_rate
+            note = f"CNC | time {tmin:.1f} × ₹{rate:.0f} + setup ₹{setup:.0f}/{amort_qty} + material {mass_kg:.3f}×₹{mat_rate:.0f} = ₹{unit:.2f}"
+            return unit, note
+        if 'laser' in p or 'waterjet' in p or 'plasma' in p or 'punch' in p or 'stamping' in p or 'blanking' in p or 'drawing' in p:
+            cut_rate = float(self.pricing.get('sheet_cut_inr_per_m2', 120))
+            bend_fee = float(self.pricing.get('sheet_bend_inr', 40))
+            setup = float(self.pricing.get('sheet_setup_inr', 250))
+            area_m2 = max(0.001, (vol_cm3/10.0) / 1000.0)  # assume thickness 1mm for area estimate
+            bends = 2
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 500))
+            unit = area_m2*cut_rate + bends*bend_fee + setup/ max(1, amort_qty) + mass_kg*mat_rate
+            note = f"Sheet Metal | area {area_m2:.3f}m²×₹{cut_rate:.0f} + {bends} bends×₹{bend_fee:.0f} + setup ₹{setup:.0f}/{amort_qty} + material {mass_kg:.3f}×₹{mat_rate:.0f} = ₹{unit:.2f}"
+            return unit, note
+        if 'injection' in p or 'compression' in p or 'transfer' in p or 'die casting' in p or 'gravity' in p or 'investment' in p or 'blow' in p or 'rotational' in p or 'thermoforming' in p or 'rim' in p:
+            cycle_rate = float(self.pricing.get('molding_rate_inr_per_min', 80))
+            tool_cost = float(self.pricing.get('tooling_cost_inr', 50000))
+            cycle_min = max(0.5, vol_cm3/300.0)
+            scrap = 0.1
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 500))
+            variable = cycle_min*cycle_rate + (mass_kg*(1+scrap))*mat_rate
+            amort = tool_cost / max(1, amort_qty)
+            unit = variable + amort
+            note = (
+                f"Molding/Casting | cycle {cycle_min:.2f}×₹{cycle_rate:.0f} + material {mass_kg:.3f}×₹{mat_rate:.0f} (+{int(scrap*100)}% scrap) + tooling ₹{tool_cost:.0f}/{amort_qty} = ₹{unit:.2f}"
+            )
+            return unit, note
+        if 'wood' in p:
+            rate = float(self.pricing.get('wood_route_inr_per_min', 40))
+            tmin = max(1.0, vol_cm3/300.0)
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 300))
+            unit = tmin*rate + mass_kg*mat_rate
+            note = f"Wood | time {tmin:.1f}×₹{rate:.0f} + material {mass_kg:.3f}×₹{mat_rate:.0f} = ₹{unit:.2f}"
+            return unit, note
+        if 'composite' in p or 'prepreg' in p or 'autoclave' in p or 'infusion' in p or 'pultrusion' in p or 'winding' in p:
+            labor = float(self.pricing.get('composite_labor_inr_per_hr', 600))
+            hours = max(0.5, vol_cm3/2000.0)
+            mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 1500))
+            unit = hours*(labor/60.0) + mass_kg*mat_rate
+            note = f"Composites | labor {hours:.2f}h×₹{labor:.0f}/h + material {mass_kg:.3f}×₹{mat_rate:.0f} = ₹{unit:.2f}"
+            return unit, note
+        # Fallback: material only
+        mat_rate = float(self.pricing.get('materials',{}).get(mat,{}).get('rate', 500))
+        unit = mass_kg*mat_rate
+        note = f"Material-only | {mass_kg:.3f} kg × ₹{mat_rate:.0f}/kg = ₹{unit:.2f}"
+        return unit, note
     
     def _activate_bom_workbench(self) -> bool:
         """Attempt to activate the Bill of Materials workbench. Returns True if activated."""
@@ -6551,6 +7211,22 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                             show_standalone_copilot()
                         except Exception as e:
                             print(f"DEBUG: Failed to re-show Co-Pilot: {e}")
+                        # Detect whether a spreadsheet was created; if not, create a local one
+                        try:
+                            before = getattr(self, '_bom_sheets_before', set())
+                            now = self._list_spreadsheet_names()
+                            created = list(now - before)
+                            if created:
+                                print(f"DEBUG: BOM spreadsheet(s) created by WB: {created}")
+                                # Optionally, summarize
+                                self.add_assistant_message("BOM Workbench created spreadsheet: " + ", ".join(created))
+                            else:
+                                print("DEBUG: No spreadsheet detected from WB; creating local BOM spreadsheet")
+                                sheet = self._create_local_bom_spreadsheet()
+                                if sheet:
+                                    self.add_assistant_message(f"Local BOM spreadsheet created: {sheet.Label} (double-click in tree to open)")
+                        except Exception as e2:
+                            print(f"DEBUG: BOM post-close spreadsheet check failed: {e2}")
                         self._bom_restore_chat_pending = False
                         return
                 except Exception:
@@ -6558,56 +7234,6 @@ class StandaloneCoPilot(QtWidgets.QWidget):
                     return
                 # Re-arm
                 QtCore.QTimer.singleShot(400, _poll)
-            
-            QtCore.QTimer.singleShot(600, _poll)
-        except Exception as e:
-            print(f"DEBUG: _start_restore_chat_watch_for_bom error: {e}")
-            self._bom_restore_chat_pending = False
-    
-    def _generate_local_bom(self) -> str:
-        """Create a simple BOM from the active document and return formatted text."""
-        try:
-            doc = FreeCAD.ActiveDocument
-            items = {}
-            def _key_for(obj):
-                try:
-                    # Prefer Part Number-like property if present
-                    if hasattr(obj, 'PartNumber') and obj.PartNumber:
-                        return f"{obj.PartNumber}"
-                except Exception:
-                    pass
-                return obj.Label or obj.Name
-            
-            for obj in doc.Objects:
-                try:
-                    # Skip hidden construction helpers if needed
-                    if hasattr(obj, 'Visibility') and obj.Visibility is False:
-                        pass
-                    k = _key_for(obj)
-                    if k not in items:
-                        mat = ''
-                        try:
-                            if hasattr(obj, 'Material') and obj.Material:
-                                mat = str(obj.Material)
-                            elif hasattr(obj, 'MaterialName') and obj.MaterialName:
-                                mat = str(obj.MaterialName)
-                        except Exception:
-                            mat = ''
-                        items[k] = {
-                            'label': obj.Label,
-                            'name': obj.Name,
-                            'type': getattr(obj, 'TypeId', ''),
-                            'qty': 0,
-                            'material': mat
-                        }
-                    items[k]['qty'] += 1
-                except Exception:
-                    continue
-            
-            lines = []
-            total_qty = sum(v['qty'] for v in items.values())
-            lines.append("=== BILL OF MATERIALS (Local) ===")
-            lines.append(f"Unique items: {len(items)} | Total qty: {total_qty}")
             lines.append("")
             lines.append("Item, Qty, Type, Material, Label")
             count = 0
