@@ -1,0 +1,22 @@
+# MoldFlow-Lite v0.2 Launcher
+# Keeps main macros untouched. Appears in your current Macro folder and opens the v0.2 panel.
+import os, sys
+import FreeCAD as App
+import FreeCADGui as Gui
+
+# Resolve the path to the real macro
+here = os.path.dirname(__file__)
+real_macro = os.path.join(here, 'macro', 'MoldFlowLite_v0_2.FCMacro')
+if not os.path.exists(real_macro):
+    raise FileNotFoundError('Expected macro not found: ' + real_macro)
+
+# Execute the actual macro file in this interpreter, then call launch()
+ns = {}
+with open(real_macro, 'r', encoding='utf-8') as f:
+    code = f.read()
+exec(compile(code, real_macro, 'exec'), ns, ns)
+
+if 'launch' in ns:
+    ns['launch']()
+else:
+    raise RuntimeError('launch() not found in MoldFlowLite_v0_2.FCMacro')
